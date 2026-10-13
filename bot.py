@@ -334,15 +334,21 @@ async def on_voice_state_update(member, before, after):
 
 
 # ---------- commands (work as !cmd and /cmd) ----------
-@bot.hybrid_command(name="join", description="Join your voice channel")
-@commands.guild_only()
-async def join(ctx: commands.Context):
+async def join_author_voice(ctx: commands.Context) -> tuple[bool, str]:
+    """Helper to join the author's voice channel. Returns (ok, message).
+
+    Handles all permission checks, connection attempts, and error handling.
+    Defers the interaction immediately before connecting.
+    """
+    # Early validation (no defer yet)
     if not ctx.author.voice or not ctx.author.voice.channel:
-        return await ctx.send("Join a voice channel first.")
+        return False, "Join a voice channel first."
     channel = ctx.author.voice.channel
     perms = channel.permissions_for(ctx.guild.me)
     if not (perms.connect and perms.speak):
-        return await ctx.send(f"Missing Connect/Speak permission in {channel.name}.")
+        return False, f"Missing Connect/Speak permission in {channel.name}."
+
+    # Now defer (this is the expensive operation)
     await ctx.defer()
     try:
         if ctx.voice_client:
@@ -350,12 +356,21 @@ async def join(ctx: commands.Context):
         else:
             await channel.connect()
     except discord.Forbidden:
-        return await ctx.send("Forbidden: cannot join that channel.")
+        return False, "Forbidden: cannot join that channel."
     except (discord.ClientException, asyncio.TimeoutError) as e:
         log.exception("join failed")
-        return await ctx.send(f"Join failed: {e}")
+        return False, f"Join failed: {e}"
+
     ensure_audio(ctx.guild.id)
-    await ctx.send(f"Joined **{channel.name}**." + ("" if engine.ready else " TTS engine NOT loaded; check logs."))
+    msg = f"Joined **{channel.name}**." + ("" if engine.ready else " TTS engine NOT loaded; check logs.")
+    return True, msg
+
+
+@bot.hybrid_command(name="join", description="Join your voice channel")
+@commands.guild_only()
+async def join(ctx: commands.Context):
+    ok, msg = await join_author_voice(ctx)
+    await ctx.send(msg)
 
 
 @bot.hybrid_command(name="leave", description="Leave voice, clear queue and watch list")
@@ -367,11 +382,24 @@ async def leave(ctx: commands.Context):
     await ctx.send("Left. Queue cleared, watch list flushed." if had_vc else "Not in voice. Watch list flushed.")
 
 
-@bot.hybrid_command(name="watch", description="Read this user's messages aloud")
+@bot.hybrid_command(name="watch", description="Read this user's messages aloud, optionally join voice")
 @commands.guild_only()
 async def watch(ctx: commands.Context, member: discord.Member):
+    # Always add to watch list first
     await store.mutate(ctx.guild.id, "add", member.id)
-    await ctx.send(f"Watching **{member.display_name}**.")
+    reply = f"Watching **{member.display_name}**."
+
+    # Try to auto-join if not connected and author in voice
+    if not ctx.voice_client:  # not connected
+        if ctx.author.voice and ctx.author.voice.channel:  # author in voice
+            ok, join_msg = await join_author_voice(ctx)
+            reply += f" {join_msg}"
+        else:
+            # Author not in a voice channel
+            reply += f" Run `{PREFIX}join` from a voice channel to start reading."
+    # else: already connected, don't try to join
+
+    await ctx.send(reply, allowed_mentions=discord.AllowedMentions.none())
 
 
 @bot.hybrid_command(name="stop", description="Stop reading this user's messages")
