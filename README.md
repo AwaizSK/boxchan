@@ -121,10 +121,17 @@ Local testing: each dev should create their own dev bot application and run `scr
 ### Upgrading an existing deployment
 The GUI token is gone and the unit changed (Tailscale ordering, no `gui_token` credential, `WEBUI_HOST` replaced by `WEBUI_HOSTS`):
 ```bash
+# If this host had the old auto-deploy watcher, remove it:
+systemctl list-unit-files | grep tts_bot_watcher   # check if it exists
+# If present, run:
+sudo systemctl disable --now tts_bot_watcher.service
+sudo rm -f /etc/systemd/system/tts_bot_watcher.service
+sudo systemctl daemon-reload
+# Then proceed with the upgrade:
 sudo scripts/setup_system.sh             # 1) installs the new unit (or: copy tts_bot.service to /etc/systemd/system/ && sudo systemctl daemon-reload)
 sudo scripts/deploy.sh                   # 2) ship the code, restart
 sudo shred -u /etc/tts-bot/gui_token     # 3) an existing gui_token is no longer used; delete it (after the new unit is live)
 ```
-`deploy.sh` alone ships new code with the OLD unit (which still requires the `gui_token` credential file), so re-run `setup_system.sh` first. `deploy.sh` refuses symlinks or non-regular files in the repo's `*.py`, `static/`, `models/`.
+The watcher would auto-deploy any code that landed in the repo as root with no review gate (decision D42). `deploy.sh` alone ships new code with the OLD unit (which still requires the `gui_token` credential file), so re-run `setup_system.sh` first. `deploy.sh` refuses symlinks or non-regular files in the repo's `*.py`, `static/`, `models/`.
 
 Known boundary: anyone who can deploy code can read the token (the code runs with it). Review changes before `deploy.sh`.
