@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 
 from config_store import ConfigStore, atomic_write_json
 from tts_engine import TTSEngine, clean_discord_text
+from webui import load_gui_token, make_app, start_webui
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -53,6 +54,8 @@ MAX_CHARS = int(os.getenv("MAX_CHARS", "300"))
 MAX_QUEUE = int(os.getenv("MAX_QUEUE", "20"))
 STATE_FILE = os.getenv("STATE_FILE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json"))
 CONFIG_FILE = os.getenv("CONFIG_FILE", os.path.join(os.path.dirname(STATE_FILE), "config.json"))
+WEBUI_HOST = os.getenv("WEBUI_HOST", "127.0.0.1")
+WEBUI_PORT = int(os.getenv("WEBUI_PORT", "8765"))
 RECONNECT_WAIT = 10.0   # s to wait for voice reconnect before dropping a job
 PLAY_TIMEOUT = 180.0    # safety: max s a single clip may block the worker
 
@@ -141,6 +144,7 @@ bot = TTSBot(command_prefix=PREFIX, intents=intents, help_command=None)
 audio: dict[int, GuildAudio] = {}
 _shutting_down = False
 _watcher_task: asyncio.Task | None = None
+_webui_runner = None
 
 
 def _rm(path: str) -> None:
@@ -515,6 +519,20 @@ async def on_guild_remove(guild):
 
 
 # ---------- lifecycle ----------
+async def maybe_start_webui(cfg, ctl, host: str, port: int):
+    """Start the web UI; return its runner, or None if disabled/failed. Never raises."""
+    token = load_gui_token()
+    if not token:
+        log.warning("Web UI disabled: no usable GUI token (see scripts/gen_gui_token.sh)")
+        return None
+    try:
+        runner = await start_webui(make_app(cfg, ctl, token), host, port)
+    except (ValueError, OSError):
+        log.exception("Web UI failed to start on %s:%s; continuing without it", host, port)
+        return None
+    return runner
+
+
 async def shutdown(b: commands.Bot) -> None:
     global _shutting_down
     if _shutting_down:
@@ -526,6 +544,11 @@ async def shutdown(b: commands.Bot) -> None:
     for guild in list(b.guilds):
         if guild.voice_client or guild.id in audio:
             await teardown(guild)
+    if _webui_runner:
+        try:
+            await _webui_runner.cleanup()
+        except Exception:
+            log.exception("web UI cleanup failed")
     engine.close()
     await b.close()
 
@@ -541,7 +564,8 @@ async def main() -> None:
         loop.add_signal_handler(sig, lambda: asyncio.create_task(shutdown(bot)))
     global _watcher_task
     _watcher_task = asyncio.create_task(config_watcher(), name="config-watcher")
-    # WEBUI hook: Task 5 starts the web server here (uses `controller` and `config`)
+    global _webui_runner
+    _webui_runner = await maybe_start_webui(config, controller, WEBUI_HOST, WEBUI_PORT)
     async with bot:
         await bot.start(TOKEN)
 

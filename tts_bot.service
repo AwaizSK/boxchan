@@ -12,10 +12,16 @@ WorkingDirectory=/opt/tts-bot
 ExecStart=/opt/tts-bot/env/bin/python bot.py
 # Token: root:root 600 file, readable only by systemd; exposed to the process as $CREDENTIALS_DIRECTORY/discord_token
 LoadCredential=discord_token:/etc/tts-bot/token
+# GUI bearer token (create with: sudo scripts/gen_gui_token.sh --system). The file MUST exist or systemd refuses to start the unit; a token < 24 chars disables the UI.
+LoadCredential=gui_token:/etc/tts-bot/gui_token
 StateDirectory=tts-bot
 # Non-secret settings, e.g. TTS_CHANNEL_ID=123456789012345678 (create with: echo 'TTS_CHANNEL_ID=<id>' | sudo tee /etc/tts-bot/bot.env)
 EnvironmentFile=/etc/tts-bot/bot.env
 Environment=STATE_FILE=/var/lib/tts-bot/state.json
+Environment=CONFIG_FILE=/var/lib/tts-bot/config.json
+# Web UI binds to loopback only; reach it via SSH tunnel: ssh -L 8765:127.0.0.1:8765 <host>
+Environment=WEBUI_HOST=127.0.0.1
+Environment=WEBUI_PORT=8765
 Environment=PIPER_MODEL_PATH=/opt/tts-bot/models/en_US-lessac-medium.onnx
 Environment=PIPER_CONFIG_PATH=/opt/tts-bot/models/en_US-lessac-medium.onnx.json
 Environment=PYTHONUNBUFFERED=1

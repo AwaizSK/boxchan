@@ -9,11 +9,37 @@ APP=/opt/tts-bot
 PY="$APP/env/bin/python"
 
 [ -x "$PY" ] || { echo "Run scripts/setup_system.sh first."; exit 1; }
-"$PY" -m py_compile "$SRC/bot.py" "$SRC/tts_engine.py"
+[ -f /etc/tts-bot/gui_token ] || echo "WARNING: /etc/tts-bot/gui_token missing; unit will fail to start (run scripts/gen_gui_token.sh --system)."
 
-install -m 644 -o root -g root "$SRC/bot.py" "$SRC/tts_engine.py" "$SRC/requirements.txt" "$APP/"
-install -d -m 755 -o root -g root "$APP/models"
-install -m 644 -o root -g root "$SRC"/models/*.onnx "$SRC"/models/*.onnx.json "$APP/models/"
+shopt -s nullglob
+pyfiles=("$SRC"/*.py)
+staticfiles=("$SRC"/static/*)
+models=("$SRC"/models/*.onnx "$SRC"/models/*.onnx.json)
+shopt -u nullglob
+[ "${#pyfiles[@]}" -gt 0 ] || { echo "No *.py files found in $SRC"; exit 1; }
+[ "${#staticfiles[@]}" -gt 0 ] || { echo "No files found in $SRC/static"; exit 1; }
+[ "${#models[@]}" -gt 0 ] || { echo "No model files found in $SRC/models"; exit 1; }
+
+# Compile everything before touching /opt (output to a throwaway dir, no __pycache__ in the repo)
+chk="$(mktemp -d)"
+trap 'rm -rf "$chk"' EXIT
+for f in "${pyfiles[@]}"; do
+  "$PY" -c 'import py_compile, sys; py_compile.compile(sys.argv[1], cfile=sys.argv[2], doraise=True)' "$f" "$chk/$(basename "$f")c"
+done
+
+install -d -m 755 -o root -g root "$APP" "$APP/models" "$APP/static"
+install -m 644 -o root -g root "${pyfiles[@]}" "$SRC/requirements.txt" "$APP/"
+install -m 644 -o root -g root "${staticfiles[@]}" "$APP/static/"
+install -m 644 -o root -g root "${models[@]}" "$APP/models/"
+
+# Remove deployed files that no longer exist in the repo
+for f in "$APP"/*.py; do
+  [ -e "$SRC/$(basename "$f")" ] || { echo "removing stale $f"; rm -f "$f"; }
+done
+for f in "$APP"/static/*; do
+  [ -e "$f" ] || continue
+  [ -e "$SRC/static/$(basename "$f")" ] || { echo "removing stale $f"; rm -rf "$f"; }
+done
 rm -rf "$APP/__pycache__"
 
 systemctl restart tts_bot

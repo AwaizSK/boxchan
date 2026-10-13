@@ -39,7 +39,30 @@ Every command works as prefix (`COMMAND_PREFIX`, default `!`) and as slash comma
 - `status` — watched users, voice channel, queue depth, CUDA state
 
 ## Channel lock
-Bot reads messages and accepts commands only in the text channel(s) from `TTS_CHANNEL_ID`. `join` follows whoever runs it into their voice channel. Production: `echo 'TTS_CHANNEL_ID=<id>' | sudo tee /etc/tts-bot/bot.env`, then `sudo systemctl restart tts_bot`.
+The bot reads messages and accepts commands only in the text channel chosen per guild. `config.json` (`CONFIG_FILE`, default next to `state.json`; `/var/lib/tts-bot/config.json` in production) is the source of truth and is edited from the Web UI. `TTS_CHANNEL_ID` is only a first-boot seed: it populates a guild with no entry yet and is ignored afterwards. `join` follows whoever runs it into their voice channel.
+
+## Web UI
+A small page to pick which text channel the bot listens to, pause/resume it, and skip or clear the queue, per guild. Changes apply live; no restart.
+
+Start:
+```bash
+scripts/gen_gui_token.sh              # dev: ~/.config/tts-bot/gui_token; prints the token ONCE
+sudo scripts/gen_gui_token.sh --system  # prod: /etc/tts-bot/gui_token (root:root 600); --rotate to replace
+ssh -L 8765:127.0.0.1:8765 <host>     # tunnel (not needed for a local dev run)
+```
+Open `http://127.0.0.1:8765`, enter the token and a display name (shown to other editors). Settings: `WEBUI_HOST` (default `127.0.0.1`), `WEBUI_PORT` (default `8765`), `WEBUI_TOKEN_FILE`. Token lookup: `$CREDENTIALS_DIRECTORY/gui_token`, the token file, then `WEBUI_TOKEN`. A token shorter than 24 chars (or none) disables the GUI with a log warning; the bot still runs. If the port cannot be bound the error is logged and the bot runs without the GUI. In production the unit requires `/etc/tts-bot/gui_token` to exist (`LoadCredential`), so generate it before the first `deploy.sh`.
+
+Keyboard: `/` focus search, Up/Down move, Enter select channel, Esc clear search / leave it.
+
+Multiple editors: every change carries the config revision it was based on. If someone else changed it first the server answers 409 and your view is refreshed; edits by others arrive live over SSE with a toast naming the editor.
+
+Pause: the bot stops reading messages for that guild (nothing new is queued). Commands (`!join`, `!skip`, ...) still work in the chosen channel, and clips already queued finish unless you press Clear/Skip.
+
+Security notes:
+- Bearer token compared in constant time; strong CSP, no cookies. Plain HTTP: keep it on loopback and reach it through the SSH tunnel. Do not expose it directly.
+- Failed-auth throttle is per client IP (`request.remote`): 5 bad requests / 60 s, then 429. Behind a reverse proxy every client shares the proxy's IP, and any local process can lock everyone out of the GUI with 5 bad requests per minute (the bot itself is unaffected).
+- If you do put a proxy in front, disable response buffering for `/api/events` (SSE); the server sends `X-Accel-Buffering: no` but the proxy must honor it.
+- Anyone with the token can change the bot's channel. Rotate with `--rotate` and restart the service.
 
 ## Behavior
 - Per-guild `asyncio.Queue` (`MAX_QUEUE`, default 20) and worker. Full queue: message gets a ⏳ reaction and a log line.
@@ -62,7 +85,8 @@ Roles: devs edit the repo (group `devteam`); an admin with real sudo deploys and
 ```bash
 sudo scripts/setup_system.sh            # service user, /opt/tts-bot (root-owned), sudoers, unit
 sudo scripts/install_token.sh --system  # token -> /etc/tts-bot/token (root:root 600)
-sudo scripts/deploy.sh                  # copy reviewed code to /opt/tts-bot + restart
+sudo scripts/gen_gui_token.sh --system  # web UI token -> /etc/tts-bot/gui_token (required by the unit)
+sudo scripts/deploy.sh                  # byte-compile, copy *.py + static/ + models to /opt/tts-bot, prune stale files, restart
 sudo systemctl enable tts_bot
 ```
 Devs (no password) can: `sudo systemctl start|stop|restart tts_bot`, `systemctl status tts_bot`, `journalctl -u tts_bot` (after re-login for the `systemd-journal` group). They cannot read the token or change deployed code.
