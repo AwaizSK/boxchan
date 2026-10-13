@@ -1,0 +1,12 @@
+.env
+.env.*
+!.env.example
+*.swp
+state.json
+config.json
+__pycache__/
+*.pyc
+models/*.onnx
+models/*.onnx.json
+.superpowers/
+.claude/settings.local.json

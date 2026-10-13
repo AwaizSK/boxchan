@@ -1,0 +1,36 @@
+[Unit]
+Description=Discord Piper TTS bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ttsbot
+Group=ttsbot
+# Root-owned code + interpreter; installed by scripts/setup_system.sh and scripts/deploy.sh
+WorkingDirectory=/opt/tts-bot
+ExecStart=/opt/tts-bot/env/bin/python bot.py
+# Token: root:root 600 file, readable only by systemd; exposed to the process as $CREDENTIALS_DIRECTORY/discord_token
+LoadCredential=discord_token:/etc/tts-bot/token
+StateDirectory=tts-bot
+# Non-secret settings, e.g. TTS_CHANNEL_ID=123456789012345678 (create with: echo 'TTS_CHANNEL_ID=<id>' | sudo tee /etc/tts-bot/bot.env)
+EnvironmentFile=/etc/tts-bot/bot.env
+Environment=STATE_FILE=/var/lib/tts-bot/state.json
+Environment=PIPER_MODEL_PATH=/opt/tts-bot/models/en_US-lessac-medium.onnx
+Environment=PIPER_CONFIG_PATH=/opt/tts-bot/models/en_US-lessac-medium.onnx.json
+Environment=PYTHONUNBUFFERED=1
+Environment=LD_LIBRARY_PATH=/opt/tts-bot/env/lib
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=20
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target
