@@ -91,6 +91,17 @@ class LoadTests(EngineBase):
         self.assertEqual(self.piper.calls, [("a", True), ("a", False)])
         self.assertTrue(any("falling back to CPU" in m for m in cm.output))
 
+    def test_first_load_cpu_fallback_is_allowed_and_reported(self):
+        """Startup fallback to CPU stays allowed (only a GPU->CPU *swap* is refused)."""
+        self.piper.plan["a"] = {"cuda_fails": True}
+        self.assertFalse(self.engine.cuda_active)
+        with self.assertLogs("tts_engine", "INFO"):
+            self.assertTrue(self.engine.load())
+        self.assertIn(("a", False), self.piper.calls)  # the CPU fallback build was attempted
+        self.assertTrue(self.engine.ready)
+        self.assertFalse(self.engine.cuda_active)
+        self.assertFalse(self.engine.state.cuda_active)
+
     def test_load_cpu_when_provider_missing(self):
         self.providers = ["CPUExecutionProvider"]
         with self.assertLogs("tts_engine", "INFO"):
@@ -189,8 +200,7 @@ class ReloadTests(EngineBase):
 
     async def test_cpu_to_cpu_swap_allowed(self):
         """CPU-to-CPU swaps are allowed (initial load may be CPU if CUDA unavailable)."""
-        # Set up so CUDA is unavailable (force CPU-only)
-        self.engine._backend = lambda: (["CPUExecutionProvider"], self.piper)
+        self.providers = ["CPUExecutionProvider"]  # CUDA provider absent: the fake backend reads this
         self.load_a()
         self.assertFalse(self.engine.cuda_active)
         self.assertEqual(self.engine.voice.tag, "a")
