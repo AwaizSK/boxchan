@@ -183,7 +183,40 @@ function insertAtCursor(value, start, end, ins) {
 function counterText(n) { return n + '/' + MSG_MAX; }
 function counterState(n) { return n > MSG_MAX ? 'over' : n >= 1900 ? 'near' : ''; }
 
-function pingSummary(names) { return names.length ? 'Will ping: ' + names.join(', ') : 'No pings'; }
+// Extract mention targets from final text (after substituteTags).
+// Returns array of {id, label, username, known} for unique mentions found in the text.
+function pingTargets(finalText, chips) {
+  const byId = new Map((chips || []).map((c) => [c.id, c]));
+  const result = [];
+  const seen = new Set();
+  const mentionRe = /<@!?(\d+)>/g;
+  let m;
+  while ((m = mentionRe.exec(finalText))) {
+    const id = m[1];
+    if (!seen.has(id)) {
+      seen.add(id);
+      const chip = byId.get(id);
+      result.push({
+        id: id,
+        label: chip ? chip.label : null,
+        username: chip ? chip.username : null,
+        known: !!chip
+      });
+    }
+  }
+  return result;
+}
+
+function pingSummary(targets) {
+  // targets is an array of {id, label, username, known}
+  if (!Array.isArray(targets)) return 'No pings';  // legacy compatibility
+  if (!targets.length) return 'No pings';
+  const names = targets.map((t) => {
+    if (!t.known) return 'unknown user ' + t.id;
+    return '@' + t.label + ' (@' + t.username + ')';
+  });
+  return 'Will ping: ' + names.join(', ');
+}
 
 // Why Send is disabled right now ('' = it can send).
 function messageBlocker(live, hasChannel, content, busy) {
@@ -216,7 +249,7 @@ function mergeVoiceSummary(prev, incoming, { seqAtRequest, seqNow, live }) {
 if (typeof module !== 'undefined') {
   module.exports = { shouldApplySnapshot, normalizeEditor, shouldRollback, createSSEParser, matchChannel, relTime, backoffDelay, groupChannels,
     voiceTitle, voiceWarning, sayBlocker, voiceSwitchText, mergeVoiceSummary,
-    segmentText, substituteTags, activeTagIds, uniqueLabel, insertAtCursor, counterText, counterState, pingSummary, messageBlocker, cpLen, MSG_MAX, READY_PRESET };
+    segmentText, substituteTags, activeTagIds, uniqueLabel, insertAtCursor, counterText, counterState, pingTargets, pingSummary, messageBlocker, cpLen, MSG_MAX, READY_PRESET };
 }
 
 /* ---------- app ---------- */
@@ -705,21 +738,10 @@ if (typeof document !== 'undefined') (function () {
         }
       }
     }
-    const tagById = new Map(M.tags.map((t) => [t.id, t.label]));
-    const pingNames = [];
-    const seenPing = new Set();
-    const mentionRe = /<@!?([0-9]{1,20})>/g;
-    let pm;
-    while ((pm = mentionRe.exec(content))) {
-      const pid = pm[1];
-      if (!seenPing.has(pid)) {
-        seenPing.add(pid);
-        pingNames.push(tagById.get(pid) || ('user ' + pid));
-      }
-    }
+    const targets = pingTargets(content, M.tags);
     const live = S.conn === 'live' && !!S.cfg;
     const why = messageBlocker(live, hasChannel(), content, M.busy || M.cool);
-    $('m-ping').textContent = pingSummary(pingNames);
+    $('m-ping').textContent = pingSummary(targets);
     $('m-why').textContent = M.busy || M.cool ? '' : why;
     $('m-send').disabled = !!why;
     $('m-search').disabled = !hasChannel();
@@ -777,7 +799,7 @@ if (typeof document !== 'undefined') (function () {
 
   function pickMember(m) {
     let t = M.tags.find((x) => x.id === m.id);
-    if (!t) { t = { id: m.id, label: uniqueLabel(m.name, m.username, m.id, M.tags) }; M.tags.push(t); }
+    if (!t) { t = { id: m.id, label: uniqueLabel(m.name, m.username, m.id, M.tags), name: m.name, username: m.username }; M.tags.push(t); }
     const ta = $('m-text');
     const r = insertAtCursor(ta.value, ta.selectionStart, ta.selectionEnd, '@' + t.label);
     ta.value = r.value;

@@ -1,7 +1,7 @@
 const assert = require('assert');
 const { shouldApplySnapshot, normalizeEditor, shouldRollback, createSSEParser, matchChannel, relTime, backoffDelay, groupChannels,
   voiceTitle, voiceWarning, sayBlocker, voiceSwitchText, mergeVoiceSummary,
-  segmentText, substituteTags, activeTagIds, uniqueLabel, insertAtCursor, counterText, counterState, pingSummary, messageBlocker,
+  segmentText, substituteTags, activeTagIds, uniqueLabel, insertAtCursor, counterText, counterState, pingTargets, pingSummary, messageBlocker,
   cpLen, READY_PRESET } = require('../static/app.js');
 
 const got = [];
@@ -112,8 +112,17 @@ assert.strictEqual(counterState(1900), 'near');
 assert.strictEqual(counterState(2000), 'near');
 assert.strictEqual(counterState(2001), 'over');
 assert.strictEqual(cpLen('a\u{1F600}b'), 3);
+// pingTargets and pingSummary with new format
+const chips1 = [{ id: '5', label: 'Alice', username: 'alice123' }, { id: '6', label: 'Bob', username: 'bob99' }];
+assert.deepStrictEqual(pingTargets('<@5> hi', chips1), [{ id: '5', label: 'Alice', username: 'alice123', known: true }]);
+assert.deepStrictEqual(pingTargets('<@5> <@5>', chips1), [{ id: '5', label: 'Alice', username: 'alice123', known: true }]);
+assert.deepStrictEqual(pingTargets('<@!6> x <@5>', chips1), [{ id: '6', label: 'Bob', username: 'bob99', known: true }, { id: '5', label: 'Alice', username: 'alice123', known: true }]);
+assert.deepStrictEqual(pingTargets('', []), []);
+assert.deepStrictEqual(pingTargets('<@999>', []), [{ id: '999', label: null, username: null, known: false }]);
+assert.deepStrictEqual(pingTargets('x@<@5> hi', chips1), [{ id: '5', label: 'Alice', username: 'alice123', known: true }]);
 assert.strictEqual(pingSummary([]), 'No pings');
-assert.strictEqual(pingSummary(['A', 'B']), 'Will ping: A, B');
+assert.strictEqual(pingSummary([{ id: '5', label: 'Alice', username: 'alice123', known: true }]), 'Will ping: @Alice (@alice123)');
+assert.strictEqual(pingSummary([{ id: '5', label: 'Alice', username: 'alice123', known: true }, { id: '999', label: null, username: null, known: false }]), 'Will ping: @Alice (@alice123), unknown user 999');
 // send blocker
 assert.strictEqual(messageBlocker(false, true, 'x', false), 'Offline');
 assert.strictEqual(messageBlocker(true, false, 'x', false), 'No channel configured');
