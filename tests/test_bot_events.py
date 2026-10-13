@@ -247,5 +247,82 @@ class ChannelRelayTest(BotTestBase):
             self.config.hub.unsubscribe(q)
 
 
+class ReconnectVoiceTest(BotTestBase):
+    def patch_world(self, guilds):
+        for p in (mock.patch.object(type(bot.bot), "guilds", new_callable=mock.PropertyMock,
+                                    return_value=guilds),
+                  mock.patch.object(type(bot.bot), "user", new_callable=mock.PropertyMock,
+                                    return_value=mock.MagicMock(id=42)),
+                  mock.patch.object(bot, "SEED_CHANNEL_IDS", set()),
+                  mock.patch.object(bot, "_initial_ready", False)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    async def test_reconnects_and_announces_on_ready(self):
+        vch = mock.MagicMock(spec=discord.VoiceChannel)
+        vch.id, vch.name = 50, "Voice Lounge"
+        vch.connect = mock.AsyncMock()
+        vch.permissions_for.return_value = mock.MagicMock(connect=True, speak=True)
+
+        tch = text_channel(10)
+        tch.permissions_for.return_value = mock.MagicMock(send_messages=True)
+        tch.send = mock.AsyncMock()
+
+        g = make_guild(1, [tch, vch], vc=None)
+        g.me = mock.MagicMock()
+        await self.config.set_channel(1, 10, expected_rev=None, editor="t")
+        bot.store.voice_channels[1] = 50
+
+        self.patch_world([g])
+        await bot.on_ready()
+
+        vch.connect.assert_awaited_once()
+        self.assertIn(1, bot.audio)
+        self.assertEqual(bot.audio[1].queue.get_nowait(), "Updated and reconnected.")
+        tch.send.assert_awaited_once_with("Updated and reconnected to **Voice Lounge**.")
+
+    async def test_reconnect_clears_channel_if_missing(self):
+        g = make_guild(1, [], vc=None)
+        g.me = mock.MagicMock()
+        bot.store.voice_channels[1] = 999
+        self.patch_world([g])
+
+        await bot.on_ready()
+        self.assertIsNone(bot.store.get_voice_channel(1))
+
+    async def test_reconnect_clears_channel_if_unpermitted(self):
+        vch = mock.MagicMock(spec=discord.VoiceChannel)
+        vch.id, vch.name = 50, "Voice Lounge"
+        vch.connect = mock.AsyncMock()
+        vch.permissions_for.return_value = mock.MagicMock(connect=False, speak=False)
+
+        g = make_guild(1, [vch], vc=None)
+        g.me = mock.MagicMock()
+        bot.store.voice_channels[1] = 50
+        self.patch_world([g])
+
+        await bot.on_ready()
+        vch.connect.assert_not_awaited()
+        self.assertIsNone(bot.store.get_voice_channel(1))
+
+    async def test_voice_state_update_tracks_channel(self):
+        g = make_guild(1)
+        vch = mock.MagicMock(spec=discord.VoiceChannel)
+        vch.id = 60
+        bot_member = mock.MagicMock()
+        bot_member.id = 42
+        bot_member.guild = g
+
+        with mock.patch.object(type(bot.bot), "user", new_callable=mock.PropertyMock,
+                               return_value=mock.MagicMock(id=42)):
+            # Bot joins/moves to channel 60
+            await bot.on_voice_state_update(bot_member, mock.MagicMock(), mock.MagicMock(channel=vch))
+            self.assertEqual(bot.store.get_voice_channel(1), 60)
+
+            # Bot disconnects
+            await bot.on_voice_state_update(bot_member, mock.MagicMock(), mock.MagicMock(channel=None))
+            self.assertIsNone(bot.store.get_voice_channel(1))
+
+
 if __name__ == "__main__":
     unittest.main()

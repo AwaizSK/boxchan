@@ -103,16 +103,18 @@ engine = TTSEngine(MODEL_PATH, CONFIG_PATH)
 
 # ---------- persistent state ----------
 class WatchStore:
-    """guild_id -> set(user_id); mutations serialized by asyncio.Lock."""
+    """guild_id -> set(user_id) + guild_id -> voice_channel_id; mutations serialized by asyncio.Lock."""
 
     def __init__(self, path: str):
         self.path = path
         self.data: dict[int, set[int]] = {}
+        self.voice_channels: dict[int, int] = {}
         self.lock = asyncio.Lock()
         try:
             with open(path) as f:
                 raw = json.load(f)
             self.data = {int(g): {int(u) for u in us} for g, us in raw.get("watched", {}).items()}
+            self.voice_channels = {int(g): int(vc) for g, vc in raw.get("voice_channels", {}).items() if vc}
         except FileNotFoundError:
             pass
         except Exception:
@@ -121,8 +123,26 @@ class WatchStore:
     def is_watched(self, guild_id: int, user_id: int) -> bool:
         return user_id in self.data.get(guild_id, ())
 
+    def get_voice_channel(self, guild_id: int) -> int | None:
+        return self.voice_channels.get(guild_id)
+
     def snapshot(self) -> dict:
-        return {"watched": {str(g): sorted(u) for g, u in self.data.items() if u}}
+        snap = {"watched": {str(g): sorted(u) for g, u in self.data.items() if u}}
+        if self.voice_channels:
+            snap["voice_channels"] = {str(g): vc for g, vc in self.voice_channels.items() if vc}
+        return snap
+
+    async def set_voice_channel(self, guild_id: int, channel_id: int | None) -> None:
+        async with self.lock:
+            if channel_id:
+                self.voice_channels[guild_id] = channel_id
+            else:
+                self.voice_channels.pop(guild_id, None)
+            snap = self.snapshot()
+            try:
+                await asyncio.to_thread(atomic_write_json, snap, self.path)
+            except Exception:
+                log.exception("state save failed")
 
     async def mutate(self, guild_id: int, op: str, user_id: int | None = None) -> None:
         async with self.lock:
@@ -164,6 +184,7 @@ class TTSBot(commands.Bot):
 bot = TTSBot(command_prefix=PREFIX, intents=intents, help_command=None)
 audio: dict[int, GuildAudio] = {}
 _shutting_down = False
+_initial_ready = False
 _watcher_task: asyncio.Task | None = None
 _webui_runner = None
 
@@ -275,8 +296,47 @@ async def only_tts_channel(ctx: commands.Context) -> bool:
     return True
 
 
+async def reconnect_voice_channels():
+    for guild in bot.guilds:
+        vc_id = store.get_voice_channel(guild.id)
+        if not vc_id:
+            continue
+        if guild.voice_client and guild.voice_client.is_connected():
+            continue
+        vchannel = guild.get_channel(vc_id)
+        if not isinstance(vchannel, discord.VoiceChannel):
+            log.warning("Saved voice channel %s not found in guild %s; clearing", vc_id, guild.id)
+            await store.set_voice_channel(guild.id, None)
+            continue
+        me = guild.me or guild.get_member(bot.user.id)
+        perms = vchannel.permissions_for(me) if me else None
+        if not perms or not (perms.connect and perms.speak):
+            log.warning("Missing Connect/Speak permissions in voice channel %s in guild %s", vchannel.name, guild.id)
+            await store.set_voice_channel(guild.id, None)
+            continue
+        try:
+            log.info("Reconnecting to voice channel %s (%s) in guild %s", vchannel.name, vchannel.id, guild.id)
+            await vchannel.connect()
+            ga = ensure_audio(guild.id)
+            try:
+                ga.queue.put_nowait("Updated and reconnected.")
+            except Exception:
+                pass
+
+            txt_cid = config.channel_for(guild.id)
+            txt_ch = guild.get_channel(txt_cid) if txt_cid else None
+            msg = f"Updated and reconnected to **{vchannel.name}**."
+            if txt_ch and isinstance(txt_ch, discord.TextChannel) and me and txt_ch.permissions_for(me).send_messages:
+                await txt_ch.send(msg)
+            elif me and vchannel.permissions_for(me).send_messages:
+                await vchannel.send(msg)
+        except Exception:
+            log.exception("Failed to reconnect to voice channel %s in guild %s", vc_id, guild.id)
+
+
 @bot.event
 async def on_ready():
+    global _initial_ready
     for guild in bot.guilds:  # env TTS_CHANNEL_ID is a first-run seed only
         for cid in sorted(SEED_CHANNEL_IDS):
             if isinstance(guild.get_channel(cid), discord.TextChannel):
@@ -291,6 +351,10 @@ async def on_ready():
              bot.user, bot.user.id, PREFIX,
              {g: c for g, e in config.snapshot()["guilds"].items() if (c := e["channel_id"])},
              engine.ready, engine.cuda_active)
+
+    if not _initial_ready:
+        _initial_ready = True
+        await reconnect_voice_channels()
 
 
 @bot.event
@@ -326,12 +390,19 @@ async def on_voice_state_update(member, before, after):
     guild = member.guild
     vc = guild.voice_client
     if member.id == bot.user.id:
-        if after.channel is None and guild.id in audio:  # kicked / dropped for good
-            await teardown(guild)
+        if _shutting_down:
+            return
+        if after.channel is None:  # kicked / dropped for good
+            await store.set_voice_channel(guild.id, None)
+            if guild.id in audio:
+                await teardown(guild)
+        else:
+            await store.set_voice_channel(guild.id, after.channel.id)
         return
     if vc and vc.channel and before.channel == vc.channel and not any(not m.bot for m in vc.channel.members):
         log.info("auto-leave guild %s (empty)", guild.id)
         await store.mutate(guild.id, "clear")
+        await store.set_voice_channel(guild.id, None)
         await teardown(guild)
 
 
@@ -370,6 +441,7 @@ async def join_author_voice(ctx: commands.Context) -> tuple[bool, str]:
         return False, f"Join failed: {e}"
 
     ensure_audio(ctx.guild.id)
+    await store.set_voice_channel(ctx.guild.id, channel.id)
     msg = f"Joined **{channel.name}**." + ("" if engine.ready else " TTS engine NOT loaded; check logs.")
     return True, msg
 
@@ -385,6 +457,7 @@ async def join(ctx: commands.Context):
 @commands.guild_only()
 async def leave(ctx: commands.Context):
     await store.mutate(ctx.guild.id, "clear")
+    await store.set_voice_channel(ctx.guild.id, None)
     had_vc = ctx.voice_client is not None
     await teardown(ctx.guild)
     await ctx.send("Left. Queue cleared, watch list flushed." if had_vc else "Not in voice. Watch list flushed.")
@@ -927,10 +1000,11 @@ async def maybe_start_webui(cfg, ctl, port: int):
 
 
 async def shutdown(b: commands.Bot) -> None:
-    global _shutting_down
+    global _shutting_down, _initial_ready
     if _shutting_down:
         return
     _shutting_down = True
+    _initial_ready = False
     log.info("Shutting down")
     if _watcher_task:
         _watcher_task.cancel()
