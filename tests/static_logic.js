@@ -1,5 +1,5 @@
 const assert = require('assert');
-const { createSSEParser, matchChannel, relTime, backoffDelay, groupChannels } = require('../static/app.js');
+const { normalizeEditor, shouldRollback, createSSEParser, matchChannel, relTime, backoffDelay, groupChannels } = require('../static/app.js');
 
 const got = [];
 const feed = createSSEParser((n, d) => got.push([n, d]));
@@ -26,4 +26,9 @@ assert.ok(backoffDelay(10, 0.999) <= 12000 && backoffDelay(0, 0) >= 800);
 
 const g = groupChannels([{ category: null, id: 1 }, { category: 'A', id: 2 }, { category: null, id: 3 }]);
 assert.deepStrictEqual(g.map((x) => [x.name, x.channels.length]), [[null, 2], ['A', 1]]);
+assert.strictEqual(normalizeEditor('  a \t b\u0000c  '), 'a bc');
+assert.strictEqual(normalizeEditor('\u7530\u4e2d'), '\u7530\u4e2d');
+assert.strictEqual(normalizeEditor('z'.repeat(60)).length, 40);
+assert.strictEqual(shouldRollback('5', '5'), true);
+assert.strictEqual(shouldRollback('7', '5'), false);
 console.log('ok');

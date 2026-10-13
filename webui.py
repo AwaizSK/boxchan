@@ -6,6 +6,7 @@ import logging
 import os
 import time
 import unicodedata
+from urllib.parse import unquote
 
 from aiohttp import web
 
@@ -170,7 +171,7 @@ def make_app(config, controller, token: str, *, status_interval: float = 3.0,
         return int(gid)
 
     def editor_of(request):
-        ed = sanitize_editor(request.headers.get("X-Editor"))
+        ed = sanitize_editor(unquote(request.headers.get("X-Editor") or ""))
         if ed is None:
             raise web.HTTPBadRequest(text=json.dumps({"error": "editor_required"}),
                                      content_type="application/json")

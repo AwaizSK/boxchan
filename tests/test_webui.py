@@ -195,6 +195,21 @@ class WriteTests(Base):
         self.assertTrue(by.startswith("ab c"))
         self.assertEqual(len(by), 40)
 
+    async def test_editor_percent_encoded(self):
+        from urllib.parse import quote
+        r = await self.put_channel({"channel_id": "10", "rev": None},
+                                   headers={**AUTH, "X-Editor": quote("\u7530\u4e2d \U0001F600 Jos\u00e9")})
+        self.assertEqual(r.status, 200)
+        self.assertEqual((await r.json())["snapshot"]["updated_by"], "\u7530\u4e2d \U0001F600 Jos\u00e9")
+        r = await self.put_channel({"channel_id": "11", "rev": None},
+                                   headers={**AUTH, "X-Editor": "al%00ic%07e%1B"})
+        self.assertEqual((await r.json())["snapshot"]["updated_by"], "alice")
+        r = await self.put_channel({"channel_id": "10", "rev": None}, headers={**AUTH, "X-Editor": "bob"})
+        self.assertEqual((await r.json())["snapshot"]["updated_by"], "bob")
+        for bad in ("100%", "%zz", "%E4%B8", "%"):
+            r = await self.put_channel({"channel_id": "11", "rev": None}, headers={**AUTH, "X-Editor": "x" + bad})
+            self.assertIn(r.status, (200, 400), bad)
+
     def test_sanitize(self):
         self.assertEqual(webui.sanitize_editor("  x\n\ty\x00 "), "x y")
         self.assertIsNone(webui.sanitize_editor("\x01\x02"))

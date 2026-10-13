@@ -65,8 +65,21 @@ function groupChannels(channels) {
   return groups;
 }
 
+// Mirror of server-side sanitize_editor: collapse whitespace, drop control chars, trim, max 40.
+function normalizeEditor(v) {
+  let s = String(v == null ? '' : v).split(/\s+/).join(' ');
+  s = s.replace(/[\p{C}]/gu, '');
+  s = s.split(/\s+/).join(' ').trim();
+  return Array.from(s).slice(0, 40).join('').trim();
+}
+
+// Roll back an optimistic channel change only if nothing newer replaced it.
+function shouldRollback(currentId, optimisticId) {
+  return currentId === optimisticId;
+}
+
 if (typeof module !== 'undefined') {
-  module.exports = { createSSEParser, matchChannel, relTime, backoffDelay, groupChannels };
+  module.exports = { normalizeEditor, shouldRollback, createSSEParser, matchChannel, relTime, backoffDelay, groupChannels };
 }
 
 /* ---------- app ---------- */
@@ -138,7 +151,7 @@ if (typeof document !== 'undefined') (function () {
   }
 
   async function api(method, path, body) {
-    const headers = { Authorization: 'Bearer ' + S.token, 'X-Editor': S.editor };
+    const headers = { Authorization: 'Bearer ' + S.token, 'X-Editor': encodeURIComponent(S.editor) };
     const init = { method, headers };
     if (body !== undefined) { headers['Content-Type'] = 'application/json'; init.body = JSON.stringify(body); }
     const r = await fetch(path, init);
@@ -178,7 +191,9 @@ if (typeof document !== 'undefined') (function () {
   }
 
   async function refetch() {
-    try { applyState(await api('GET', '/api/state')); } catch (e) { /* surfaced via auth or reconnect */ }
+    try { applyState(await api('GET', '/api/state')); } catch (e) {
+      if (e.status !== 401 && e.status !== 429) toast('Could not load state: ' + e.message, { error: true });
+    }
   }
 
   /* --- rendering --- */
@@ -332,12 +347,12 @@ if (typeof document !== 'undefined') (function () {
     if (!id || S.busy || S.conn !== 'live' || !S.cfg) return;
     const prev = gcfg().channel_id;
     if (id === prev) return;
-    const prevRev = S.cfg.rev;
+    const prevRev = S.cfg.rev, gid = S.gid;
     S.busy = true;
-    S.cfg.guilds[S.gid] = { ...gcfg(), channel_id: id };   // optimistic
+    S.cfg.guilds[gid] = { ...gcfg(), channel_id: id };   // optimistic
     renderConfig();
     try {
-      const d = await api('PUT', '/api/guilds/' + S.gid + '/channel', { channel_id: id, rev: prevRev });
+      const d = await api('PUT', '/api/guilds/' + gid + '/channel', { channel_id: id, rev: prevRev });
       applySnapshot(d.snapshot, true);
       if (!opts.silent) {
         toast('Switched to ' + (chName(id) || 'channel') + (prev && chName(prev) ? ' (was ' + chName(prev) + ')' : ''),
@@ -348,8 +363,11 @@ if (typeof document !== 'undefined') (function () {
         applySnapshot(e.body.snapshot, true);
         toast('Changed by ' + (e.body.snapshot.updated_by || 'someone') + ' — your change was not applied', { error: true });
       } else if (e.status !== 401 && e.status !== 429) {
-        S.cfg.guilds[S.gid] = { ...gcfg(), channel_id: prev };
-        renderConfig();
+        const cur = S.cfg && S.cfg.guilds[gid];
+        if (cur && shouldRollback(cur.channel_id, id)) {
+          S.cfg.guilds[gid] = { ...cur, channel_id: prev };
+          renderConfig();
+        }
         toast('Could not switch channel: ' + e.message, { error: true });
       }
     } finally {
@@ -399,7 +417,7 @@ if (typeof document !== 'undefined') (function () {
     } else if (name === 'config') {
       const ch = d.change || {};
       applySnapshot(d.snapshot, false);
-      const mine = d.snapshot.updated_by === S.editor;
+      const mine = d.snapshot.updated_by === normalizeEditor(S.editor);
       if (ch.guild_id === S.gid && !mine) {
         if (ch.field === 'channel_id') {
           flash(ch.new);
@@ -473,8 +491,9 @@ if (typeof document !== 'undefined') (function () {
     if (tok) { S.token = tok; store.set(sessionStorage, 'token', tok); }
     if (!S.token) { $('auth-msg').textContent = 'A token is required.'; return; }
     if (!name) { $('auth-msg').textContent = 'A name is required.'; return; }
-    S.editor = name;
-    store.set(localStorage, 'editor', name);
+    S.editor = normalizeEditor(name);
+    if (!S.editor) { $('auth-msg').textContent = 'A name is required.'; return; }
+    store.set(localStorage, 'editor', S.editor);
     S.started = false;
     start();
   });
