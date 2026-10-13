@@ -27,6 +27,31 @@ class ParseMentionsTests(unittest.TestCase):
     def test_malformed_tokens_ignored(self):
         self.assertEqual(parse_mentions("<@abc> <@> <@ 5> <#5> <@٥٥>"), [])
 
+    def test_exactly_10_mentions_ok(self):
+        content = " ".join(f"<@{i}>" for i in range(10))
+        result = parse_mentions(content)
+        self.assertEqual(result, list(range(10)))
+
+    def test_11_distinct_mentions_rejected(self):
+        content = " ".join(f"<@{i}>" for i in range(11))
+        with self.assertRaises(MessageError) as cm:
+            parse_mentions(content)
+        self.assertEqual(cm.exception.code, "bad_mention")
+
+    def test_duplicates_count_as_one(self):
+        # 10 distinct ids + duplicates = still valid if <= 10 distinct
+        content = "<@1> <@2> <@3> <@4> <@5> <@6> <@7> <@8> <@9> <@10> <@1> <@2>"
+        result = parse_mentions(content)
+        self.assertEqual(len(result), 10)
+        self.assertEqual(result, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+
+    def test_11_distinct_with_duplicates_rejected(self):
+        # 11 distinct ids + duplicates = rejected
+        content = "<@1> <@2> <@3> <@4> <@5> <@6> <@7> <@8> <@9> <@10> <@11> <@1> <@2>"
+        with self.assertRaises(MessageError) as cm:
+            parse_mentions(content)
+        self.assertEqual(cm.exception.code, "bad_mention")
+
 
 class SendLimiterTests(unittest.TestCase):
     def setUp(self):

@@ -26,12 +26,15 @@ class MessageError(Exception):
 def parse_mentions(content: str) -> list[int]:
     """User ids from `<@id>` / `<@!id>` tokens, first-seen order, de-duplicated.
     Role tokens `<@&id>` raise MessageError('bad_mention') (rejected, never silently stripped).
-    The literal text @everyone / @here is allowed but can never ping (allowed_mentions)."""
+    The literal text @everyone / @here is allowed but can never ping (allowed_mentions).
+    More than 10 distinct mentions raise MessageError('bad_mention')."""
     if ROLE_MENTION_RE.search(content):
         raise MessageError("bad_mention")
     seen: dict[int, None] = {}
     for m in USER_MENTION_RE.finditer(content):
         seen.setdefault(int(m.group(1)), None)
+    if len(seen) > 10:
+        raise MessageError("bad_mention")
     return list(seen)
 
 
