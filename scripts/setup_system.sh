@@ -15,6 +15,7 @@ CONF=/etc/tts-bot
 CONDA="${CONDA:-/home/jb/miniconda3/bin/conda}"
 GROUP="${TEAM_GROUP:-devteam}"
 
+[ -f "$CONF/gui_token" ] || { echo "$CONF/gui_token missing; the unit would fail to start. Run: sudo $SRC/scripts/gen_gui_token.sh --system, then re-run this script."; exit 1; }
 getent group "$GROUP" >/dev/null || { echo "group $GROUP missing"; exit 1; }
 [ -x "$CONDA" ] || { echo "conda not found at $CONDA (set CONDA=...)"; exit 1; }
 
@@ -52,13 +53,11 @@ for u in $(getent group "$GROUP" | cut -d: -f4 | tr ',' ' '); do
   usermod -aG systemd-journal "$u"
 done
 
-[ -f "$CONF/gui_token" ] || { echo "$CONF/gui_token missing; the unit would fail to start. Run: sudo $SRC/scripts/gen_gui_token.sh --system, then re-run this script."; exit 1; }
 install -m 644 -o root -g root "$SRC/tts_bot.service" /etc/systemd/system/tts_bot.service
 systemctl daemon-reload
 
 echo
 echo "Next:"
 echo "  1) sudo $SRC/scripts/install_token.sh --system"
-echo "  2) sudo $SRC/scripts/gen_gui_token.sh --system   (web UI token; unit will not start without the file)"
-echo "  3) sudo $SRC/scripts/deploy.sh"
-echo "  4) sudo systemctl enable tts_bot"
+echo "  2) sudo $SRC/scripts/deploy.sh"
+echo "  3) sudo systemctl enable tts_bot"

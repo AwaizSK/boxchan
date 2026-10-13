@@ -83,9 +83,9 @@ python bot.py
 ## Team deployment (production)
 Roles: devs edit the repo (group `devteam`); an admin with real sudo deploys and holds the token.
 ```bash
+sudo scripts/gen_gui_token.sh --system  # web UI token -> /etc/tts-bot/gui_token (required by the unit; setup refuses without it)
 sudo scripts/setup_system.sh            # service user, /opt/tts-bot (root-owned), sudoers, unit
 sudo scripts/install_token.sh --system  # token -> /etc/tts-bot/token (root:root 600)
-sudo scripts/gen_gui_token.sh --system  # web UI token -> /etc/tts-bot/gui_token (required by the unit)
 sudo scripts/deploy.sh                  # byte-compile, copy *.py + static/ + models to /opt/tts-bot, prune stale files, restart
 sudo systemctl enable tts_bot
 ```
