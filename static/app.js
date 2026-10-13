@@ -120,6 +120,10 @@ const MSG_MAX = 2000;
 const READY_PRESET = "The voice bot is ready to use! Join a voice channel, type !join here, and I'll read watched users' messages aloud.";
 const cpLen = (s) => Array.from(String(s)).length;
 
+// Split text into plain and tagged parts. Only the exact "@label" of a tagged chip matches
+// (longest label first, single pass, not glued to word characters); nothing is ever guessed.
+// There is no lookbehind (Safari < 16.4): the character before a match is checked by hand,
+// stepping back over a surrogate pair so an astral letter counts as one code point.
 function segmentText(text, tags) {
   const list = (tags || []).filter((t) => t && t.label).sort((a, b) => b.label.length - a.label.length);
   text = String(text);
@@ -132,13 +136,13 @@ function segmentText(text, tags) {
   const out = [];
   let last = 0, m;
   while ((m = re.exec(text))) {
-    let pc = '';
+    let prev = '';
     if (m.index > 0) {
       const code = text.charCodeAt(m.index - 1);
-      if (code >= 0xDC00 && code <= 0xDFFF && m.index >= 2) pc = text.slice(m.index - 2, m.index);
-      else pc = text.slice(m.index - 1, m.index);
+      if (code >= 0xDC00 && code <= 0xDFFF && m.index >= 2) prev = text.slice(m.index - 2, m.index);
+      else prev = text.slice(m.index - 1, m.index);
     }
-    if (pc && isWord(pc)) continue;
+    if (prev && isWord(prev)) continue;
     if (m.index > last) out.push({ text: text.slice(last, m.index), tag: null });
     out.push({ text: m[0], tag: by.get(m[0]) });
     last = m.index + m[0].length;
@@ -177,33 +181,61 @@ function insertAtCursor(value, start, end, ins) {
   return { value: text + post, pos: text.length };
 }
 
-
 function counterText(n) { return n + '/' + MSG_MAX; }
 function counterState(n) { return n > MSG_MAX ? 'over' : n >= 1900 ? 'near' : ''; }
 
-function shouldApplyMembers(rg, cg, rs, cs) { return rg === cg && rs === cs; }
-function resetMemberCache(M) { M.members = []; M.hi = -1; M.gid = ''; M.q = null; M.memberSeq++; }
+// Only apply a member-search response if the server and request sequence still match
+// (a newer request or a server switch makes it stale).
+function shouldApplyMembers(reqGid, curGid, reqSeq, curSeq) {
+  return reqGid === curGid && reqSeq === curSeq;
+}
 
-function pingTargets(t, c) {
-  const m = new Map((c || []).map((x) => [x.id, x])), r = [], s = new Set(), e = /<@!?([0-9]{1,20})>/g;
-  let n;
-  while ((n = e.exec(t))) {
-    const i = n[1];
-    if (!s.has(i)) { s.add(i); const h = m.get(i); r.push({ id: i, label: h ? h.label : null, username: h ? h.username : null, known: !!h }); }
+// Forget the member picker cache; bumping memberSeq invalidates any request in flight.
+function resetMemberCache(M) {
+  M.members = [];
+  M.hi = -1;
+  M.gid = '';
+  M.q = null;
+  M.memberSeq++;
+}
+
+// The users a message will ping, in order of first appearance, one entry per id.
+// finalText is the content as sent ("<@id>" tokens); chips is the tag list [{id, label, username}].
+// Returns [{ id, label, username, known }]; known = a chip exists for the id.
+function pingTargets(finalText, chips) {
+  const byId = new Map((chips || []).map((chip) => [chip.id, chip]));
+  const targets = [];
+  const seen = new Set();
+  const re = /<@!?([0-9]{1,20})>/g;
+  let m;
+  while ((m = re.exec(finalText))) {
+    const id = m[1];
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const chip = byId.get(id);
+    targets.push({
+      id: id,
+      label: chip ? chip.label : null,
+      username: chip ? chip.username : null,
+      known: !!chip,
+    });
   }
-  return r;
+  return targets;
 }
 
-function chipText(c) {
-  if (!c.username) return '@' + c.label;
-  if (c.label.includes('(' + c.username + ')')) return '@' + c.label;
-  return '@' + c.label + ' (@' + c.username + ')';
+// How a chip is shown: "@label (@username)", or just "@label" when there is no username or the
+// label already carries it (a disambiguated "Bob (bob99)").
+function chipText(chip) {
+  if (!chip.username) return '@' + chip.label;
+  if (chip.label.includes('(' + chip.username + ')')) return '@' + chip.label;
+  return '@' + chip.label + ' (@' + chip.username + ')';
 }
 
-function pingSummary(t) {
-  if (!t.length) return 'No pings';
-  const n = t.map((x) => !x.known ? 'unknown user ' + x.id : chipText(x));
-  return 'Will ping: ' + n.join(', ');
+// targets is the output of pingTargets.
+function pingSummary(targets) {
+  if (!targets.length) return 'No pings';
+  const names = targets.map((t) => (t.known ? chipText(t) : 'unknown user ' + t.id));
+  return 'Will ping: ' + names.join(', ');
 }
 
 // Why Send is disabled right now ('' = it can send).
