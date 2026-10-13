@@ -60,7 +60,7 @@ Pause: the bot stops reading messages for that guild (nothing new is queued). Co
 
 Security notes:
 - Bearer token compared in constant time; strong CSP, no cookies. Plain HTTP: keep it on loopback and reach it through the SSH tunnel. Do not expose it directly.
-- Failed-auth throttle is per client IP (`request.remote`): 5 bad requests / 60 s, then 429. Behind a reverse proxy every client shares the proxy's IP, and any local process can lock everyone out of the GUI with 5 bad requests per minute (the bot itself is unaffected).
+- Failed-auth throttle is per client IP (`request.remote`): 5 invalid or missing credentials / 60 s, then further invalid attempts get 429 for 60 s. A valid token is always accepted (even while the IP is blocked) and never counted, so a mistyped token or stale tabs cannot lock out working sessions. A local process (or everyone behind a shared proxy IP) can still make invalid attempts return 429, but cannot lock out valid tokens.
 - If you do put a proxy in front, disable response buffering for `/api/events` (SSE); the server sends `X-Accel-Buffering: no` but the proxy must honor it.
 - Anyone with the token can change the bot's channel. Rotate with `--rotate` and restart the service.
 

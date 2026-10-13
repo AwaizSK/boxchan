@@ -94,13 +94,13 @@ Key points the diagram encodes: one process and one event loop; the web UI never
 | `POST /api/guilds/{gid}/clear` | Bearer + `X-Editor` | `{"cleared": int}` |
 | `GET /api/events` | Bearer | SSE: `hello` (snapshot+guilds) on connect, then `config`, `channels`, `status` (only when changed), `: keepalive` comment every 15 s. |
 
-Error codes: 401 `unauthorized`, 429 `too_many_attempts`, 400 `editor_required` / `bad_request` / `bad_channel`, 404 (unknown or non-digit guild id; body is not JSON), 409 `conflict`, 413 for bodies > 4096 bytes (aiohttp `client_max_size`). Bad JSON, non-object body, or a `rev` that is not an int (bools rejected) -> 400 `bad_request`.
+Error codes: 401 `unauthorized`, 429 `too_many_attempts` (invalid credentials only), 500 `persist_failed` (config write raised `OSError`; no detail leaked), 400 `editor_required` / `bad_request` / `bad_channel`, 404 (unknown or non-digit guild id; body is not JSON), 409 `conflict`, 413 for bodies > 4096 bytes (aiohttp `client_max_size`). Bad JSON, non-object body, or a `rev` that is not an int (bools rejected) -> 400 `bad_request`.
 
 All IDs on the wire are strings (JS numbers lose precision above 2^53). `wire_snapshot`/`wire_event` convert `channel_id` and `change.guild_id/old/new`; internally the store uses ints.
 
 ### Event shapes
 - Hub `config` event (internal, ints): `{"type":"config","snapshot":{...},"change":{"guild_id":int,"field":"channel_id"|"enabled","old":..,"new":..}}`.
-- Hub `channels` event: `{"type":"channels","guild_id":"<str>"}` published by `bot.py` on channel create/delete/update and guild join/remove; the browser reacts by refetching `/api/state`.
+- Hub `channels` event: `{"type":"channels","guild_id":"<str>"|null}` published by `bot.py` on channel create/delete/update, guild join/remove/available, and (with `guild_id: null`) at the end of every `on_ready`, so a tab that connected during the restart window (empty guild cache) refetches. The browser reacts by refetching `/api/state`, coalesced (~250 ms trailing, one request in flight).
 - Snapshot: `{"rev","updated_by","updated_at","guilds":{"<gid>":{"channel_id":int|null,"enabled":bool}}}`.
 
 ---
@@ -153,7 +153,7 @@ Toggling `enabled` follows the same path but `config_watcher` ignores it (the qu
 
 **Atomic writes.** `atomic_write_json` creates a temp file in the same directory (`.cfg-*.tmp`), writes, flushes, `fsync`s, then `os.replace`s over the target; on any failure the temp file is unlinked and the error re-raised. A crash leaves either the old or the new file, never a torn one. The same function backs `state.json` (the older private `save_state` was removed).
 
-**Load behavior.** Both stores tolerate a missing file (start empty) and a corrupt file (log the exception, start empty; the corrupt file is overwritten on the next write, no backup). `ConfigStore` never raises from its constructor.
+**Load behavior.** Both stores tolerate a missing file (start empty) and a corrupt file (log the exception, start empty). `ConfigStore` first renames an unreadable `config.json` to `config.json.corrupt` (best-effort, replaces an older `.corrupt`, never raises) so the next write cannot destroy it; `WatchStore` still overwrites a corrupt `state.json` with no backup. `ConfigStore` never raises from its constructor.
 
 **Persist failure.** `_mutate` restores in-memory state and rev and re-raises; nothing is published. `WatchStore.mutate` instead logs "state save failed" and keeps the in-memory change (memory ahead of disk until the next successful write).
 
@@ -203,7 +203,7 @@ Other state-changing behaviors: `leave` and auto-leave (no humans left in the bo
 - **Bearer auth** via `Authorization: Bearer <token>` header only, compared with `hmac.compare_digest`. No cookies means no CSRF surface. All `/api/*` routes need it; static files do not (they contain no secrets).
 - **Fail closed**: no usable token -> server not started (warning). `make_app` raises `ValueError` for an empty or < 24 char token, so a programming or config error can never produce an open server. A guild without a configured channel reads nothing.
 - **CSP** on every response: `default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`, plus `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `Cache-Control: no-store` for `/api/*` and `no-cache` for static. The UI uses `textContent`/DOM APIs only (channel names are attacker-influenced); `tests/test_static.py` forbids `innerHTML`, `eval`, inline handlers/styles and external URLs.
-- **Auth throttle**: 5 failures within 60 s from one `request.remote` -> 429 for 60 s. The block applies before the token check, so a blocked IP is refused even with a valid token. See the caveats in section 9.
+- **Auth throttle**: the token is verified first. A valid token is always accepted, even while its IP is blocked, and is never counted. Only invalid or missing credentials count: 5 within 60 s from one `request.remote` block that IP for 60 s, during which invalid attempts get 429 (`too_many_attempts`) and are not counted further. The client shows a toast on 429 and keeps its token and stream. See the caveats in section 9.
 - **Body limit** 4096 bytes. Guild ids and channel ids must be ASCII digits; `is_text_channel` confirms the channel exists in that guild and the bot can view it.
 - **Editor attribution** (`X-Editor`) is self-declared: it names who changed what in the UI and logs; it is not authentication. The client percent-encodes it (`encodeURIComponent`) because a raw non-Latin-1 name would make `fetch` throw; the server `unquote`s then sanitizes (strip control chars, collapse whitespace, truncate to 40, reject empty).
 - **Never crash the bot**: `maybe_start_webui` wraps token loading, `make_app` and the bind; any failure (bad token, bad port, port in use) logs and the bot continues without the GUI. `parse_port` falls back to 8765 on an invalid or out-of-range `WEBUI_PORT`.
@@ -285,7 +285,7 @@ Format: **Decision** / Why / Alternatives rejected / Cost if wrong.
 - See section 6. **Cost:** a disconnecting client may leave a completed write the user did not see confirmed (harmless; the SSE event/refetch shows it).
 
 ### D14. Per-IP auth throttle keyed on `request.remote`
-- **Why:** cheap brute-force limit with no dependencies. **Cost:** behind a reverse proxy all clients share one IP; any local process can lock the GUI out with 5 bad requests per 60 s (the bot itself is unaffected). Valid tokens are also refused while blocked. Throttle dicts are not pruned (entries only per distinct IP).
+- **Why:** cheap brute-force limit with no dependencies. **Cost:** behind a reverse proxy (or the SSH tunnel) all clients share one IP, so a local process can make invalid attempts return 429 for everyone sharing that IP; it cannot lock out valid tokens, because the (288-bit) token is checked before the block and valid requests are never counted (final-review fix F2). Throttle dicts are not pruned (entries only per distinct IP).
 
 ### D15. Unconfigured guild reads nothing
 - **Why:** fail closed; a bot invited to a new server must not start reading channels. `is_listen_channel`/`is_command_channel` return false without an entry. Slash replies say "No channel configured - set one in the web UI."
@@ -356,9 +356,9 @@ Format: **Decision** / Why / Alternatives rejected / Cost if wrong.
 - **`join` follows the caller.** Running `join` elsewhere moves the bot (`move_to`); it is not tied to the text channel's guild beyond membership.
 - **Voice state is lost on restart.** After a restart/deploy the bot is not in voice; someone must `!join` again. The watch list persists but `leave`/auto-leave flush it.
 - **SSE through proxies needs buffering off.** Nginx honors `X-Accel-Buffering: no`; other proxies need explicit config. Symptom: UI stuck on "Connecting" or updates arrive in bursts.
-- **Reverse proxy and the throttle.** All clients share the proxy IP; five bad requests lock everyone out for a minute (D14).
+- **Reverse proxy and the throttle.** All clients share the proxy IP; five bad requests make invalid attempts on that IP return 429 for a minute; valid tokens are unaffected (D14).
 - **`WEBUI_TOKEN_FILE` has no `~` expansion** (`load_gui_token` uses it verbatim), unlike `DISCORD_TOKEN_FILE` which is `expanduser`ed. Use an absolute path.
-- **`EnvironmentFile=/etc/tts-bot/bot.env` has no `-` prefix**, so the file must exist (it may be empty) or the unit fails to start. No script creates it; the unit comment shows how.
+- **`EnvironmentFile=-/etc/tts-bot/bot.env` is optional** (leading `-`): a fresh install starts without it. It only carries a first-boot `TTS_CHANNEL_ID` seed. No script creates it; the unit comment shows how.
 - **Unit refuses to start without `/etc/tts-bot/gui_token`** (D18). A too-short token does not stop the unit; it just disables the GUI.
 - **Upgrading: `deploy.sh` alone ships new code with the OLD unit.** The old unit lacks `LoadCredential=gui_token`, `CONFIG_FILE` and `WEBUI_*`, so the GUI silently stays disabled and `config.json` lands in the default location. Generate the token first, re-run `setup_system.sh` (or copy the unit and `daemon-reload`), then deploy.
 - **Config rollback vs disk.** `_mutate` catches `BaseException`: if a caller is cancelled while the thread-offloaded write is in flight, memory rolls back while the write may still land (disk ahead of memory). The web layer's `asyncio.shield` closes this for HTTP callers; `seed_channel` in `on_ready` is not shielded (acceptable; runs once).
@@ -366,7 +366,7 @@ Format: **Decision** / Why / Alternatives rejected / Cost if wrong.
 - **Editor-name comparison.** The "X switched to ..." toast is suppressed when the event's `updated_by` equals the local `normalizeEditor(editor)`; two people using the same name will not see each other's toasts.
 - **`known_guild` calls `controller.guilds_view()`** (all guilds' channels) on every write request; fine for a handful of guilds.
 - **Static files are read at app creation.** Editing `static/*` requires a bot restart (deploy restarts it anyway).
-- **Tests import `bot.py`**, which runs side effects (token lookup, opus load, `Bot` construction). `test_controller.py` and `test_wiring.py` set env vars before import for that reason. `DISCORD_TOKEN` must be unset or well-formed.
+- **Tests import `bot.py`**, which runs side effects (token lookup, opus load, `Bot` construction). Tests import it through `tests/botimport.py`, which sets the env vars first and patches `dotenv.load_dotenv` out for the import, so the repo `.env` (and a developer's real token) never reaches the test process. Import `botimport` before `bot`.
 - **Stale state in `__pycache__`.** `deploy.sh` removes `/opt/tts-bot/__pycache__`; the repo is compiled to a throwaway dir during validation.
 
 ---
@@ -381,7 +381,7 @@ sudo scripts/install_token.sh --system   # 3) prompts for the Discord token (hid
 sudo scripts/deploy.sh                   # 4) validate, snapshot, install, restart
 sudo systemctl enable tts_bot            # 5)
 ```
-Also create `/etc/tts-bot/bot.env` (may be empty; can hold `TTS_CHANNEL_ID=<id>` for first-boot seeding) because the unit requires it. Put the Piper voice (`.onnx` + `.onnx.json`) in `models/` first; `deploy.sh` refuses when no model files exist. Review `scripts/` before running any of this as root (section 7).
+Optionally create `/etc/tts-bot/bot.env` (can hold `TTS_CHANNEL_ID=<id>` for first-boot seeding; the unit starts fine without it). Put the Piper voice (`.onnx` + `.onnx.json`) in `models/` first; `deploy.sh` refuses when no model files exist. Review `scripts/` before running any of this as root (section 7).
 
 ### Upgrade an existing deployment
 Generate the GUI token first, re-run `setup_system.sh` (or copy `tts_bot.service` to `/etc/systemd/system/` and `sudo systemctl daemon-reload`), then `deploy.sh`.
@@ -404,11 +404,11 @@ Open the GUI (`ssh -L 8765:127.0.0.1:8765 <host>`, then `http://127.0.0.1:8765`)
 ### Common failures
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| Unit fails to start immediately | `/etc/tts-bot/gui_token` or `/etc/tts-bot/bot.env` missing | create them (section 10 install order) |
+| Unit fails to start immediately | `/etc/tts-bot/gui_token` missing (`bot.env` is optional) | create it (section 10 install order) |
 | "Web UI disabled: no usable GUI token" | token missing/short (< 24) or unreadable | `gen_gui_token.sh --system --rotate`, restart |
 | GUI works locally, not remotely | loopback bind | SSH tunnel or TLS proxy (disable buffering) |
 | GUI keeps "Reconnecting" behind a proxy | response buffering | `proxy_buffering off` for `/api/events` |
-| 429 in the GUI | 5 bad auth requests within 60 s from that IP | wait 60 s; fix token; check for local scanners |
+| 429 toast in the GUI | 5 invalid auth requests within 60 s from that IP (a valid token still works) | wait 60 s; fix the token; check for local scanners |
 | Bot silent, no errors | guild has no channel / paused / user not watched / not joined / Message Content intent off | check GUI, `!status`, Portal intents |
 | "CUDAExecutionProvider unavailable" | CPU `onnxruntime` installed over GPU build, or CUDA libs not on `LD_LIBRARY_PATH` | section 8 D20, D28 |
 | "Token malformed" at start | quotes/prefix/newline in token file | re-run `install_token.sh` |
@@ -429,12 +429,13 @@ bash tests/test_deploy_validation.sh                                    # deploy
 
 | File | Covers |
 |---|---|
-| `tests/test_config_store.py` | atomic write (no `.tmp` leftovers on success/failure), EventHub (fan-out, idempotent unsubscribe, drop-oldest), ConfigStore (rev/no-op, conflict leaves state untouched, `expected_rev=None`, round-trip, corrupt file, persist-failure rollback, truth table of `is_*`, event publishing, seed, 20 concurrent writes). |
-| `tests/test_webui.py` | auth (missing/wrong/right), throttle with injected clock, static headers/CSP, token never in bodies, PUT channel/enabled incl. persistence and hub events, conflict, bad inputs, editor required/sanitized/percent-encoded, skip/clear, handler cancellation mid-write stays consistent, SSE (hello, config, status only on change, keepalive, subscriber cleanup), header parsing, shutdown with an open SSE, token loader order and short tokens, start/cleanup. |
+| `tests/test_config_store.py` | atomic write (no `.tmp` leftovers on success/failure), EventHub (fan-out, idempotent unsubscribe, drop-oldest), ConfigStore (rev/no-op, conflict leaves state untouched, `expected_rev=None`, round-trip, corrupt file quarantined to `.corrupt`, persist-failure rollback, truth table of `is_*`, event publishing, seed, 20 concurrent writes). |
+| `tests/test_webui.py` | auth (missing/wrong/right), throttle with injected clock (valid token passes during a block and is not counted; invalid gets 429), persist failure -> JSON 500 `persist_failed`, static headers/CSP, token never in bodies, PUT channel/enabled incl. persistence and hub events, conflict, bad inputs, editor required/sanitized/percent-encoded, skip/clear, handler cancellation mid-write stays consistent, SSE (hello, config, status only on change, keepalive, subscriber cleanup), header parsing, shutdown with an open SSE, token loader order and short tokens, start/cleanup. |
 | `tests/test_controller.py` | `Controller` views and actions with fake guilds, `config_watcher` drain behavior (channel change drains; `enabled` change does not; other guilds and malformed events are survived). |
+| `tests/test_bot_events.py` | hot-swap path with fake objects: `on_message` (configured channel queues; paused, old channel after a swap, unconfigured guild, unwatched, bots, DMs do not; prefix goes to commands only), `only_tts_channel`, `on_command_error` slash reply, `on_ready` seeding (lowest matching id, skips existing, idempotent) and its `channels` event, channel-relay listeners, no `.env` loaded. |
 | `tests/test_wiring.py` | `maybe_start_webui` never raises (no/short token, bad `make_app`, out-of-range port, port in use, load error), `parse_port`, good token serves and cleans up. |
 | `tests/test_static.py` | static payload < 40 KB, CSP-safe content (no `innerHTML`/`eval`/inline handlers/external URLs), served bytes equal files, and runs `tests/static_logic.js` under node if available. |
-| `tests/static_logic.js` | pure JS helpers: SSE parser, `matchChannel`, `relTime`, `backoffDelay`, `groupChannels`, `normalizeEditor`, `shouldRollback`. |
+| `tests/static_logic.js` | pure JS helpers: SSE parser, `matchChannel`, `relTime`, `backoffDelay`, `groupChannels`, `normalizeEditor`, `shouldRollback`, `shouldApplySnapshot` (stale snapshots ignored). |
 | `tests/test_deploy_validation.sh` | deploy validator: clean tree accepted; symlinked dirs/files, in-repo symlinks, subdirectories, missing `.py` rejected. |
 
 **Not covered:** anything needing live Discord, a GPU, ffmpeg/voice, or a browser. `engine.synthesize`/playback/`audio_worker`/`on_message` end to end, the real systemd unit, `setup_system.sh`/`deploy.sh` as root, and DOM behavior of `app.js` (rendering, optimistic rollback wiring, keyboard handling) have no automated tests. The frontend was verified by node logic tests, static content checks and code review only. Run the manual smoke checklist in a real browser (and a real Discord test guild) before relying on it: sign-in prompt, token rejection, channel list/search/keyboard, select + toast + undo, pause/resume, skip/clear, two browsers (conflict toast, live toast), kill/restart the bot and watch reconnect, 360 px width, dark mode.
@@ -446,12 +447,12 @@ bash tests/test_deploy_validation.sh                                    # deploy
 - No live Discord, GPU or browser tests (section 11).
 - Editor names are self-declared attribution, not authentication; the token is the only gate and it is shared.
 - One channel per guild (plus pause).
-- Per-IP throttle caveats: shared behind a proxy; any local process can lock the GUI out; valid tokens refused while blocked; counters not pruned.
+- Per-IP throttle caveats: the IP is shared behind a proxy/tunnel, so a local process can make invalid attempts return 429 (valid tokens are never blocked); counters not pruned.
 - `WEBUI_TOKEN_FILE` has no `~` expansion; `load_gui_token` does not fall through to later sources when an earlier source holds a short token.
 - Deploy copies every root `*.py` (stray files ship) plus `static/*`, `models/*`, `requirements.txt`; `deploy.sh` and `setup_system.sh` run repo-supplied scripts as root (admin review required); a microsecond check/copy race is accepted; `setup_system.sh` resolves `SRC` with `pwd`, not `pwd -P`.
 - The GUI is down whenever the bot is down; all plain HTTP (tunnel or TLS proxy required for remote use).
 - The bot does not rejoin voice after a restart.
-- `config.json` and `state.json` corruption: starts empty, no backup.
+- `config.json` and `state.json` corruption: starts empty; only `config.json` is kept aside as `.corrupt` (one generation).
 - Minor, deferred review items: first-set-on-unknown-guild bumps rev; `RecursionError` on pathologically nested JSON gives 500; 404 bodies are not JSON; `on_guild_channel_update` is chatty; shutdown cancels `_watcher_task` without awaiting it; DM `NoPrivateMessage` is unreachable on the prefix path; clicks while a request is in flight are silently ignored by the UI.
 
 ---

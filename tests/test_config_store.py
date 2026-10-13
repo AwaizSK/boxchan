@@ -116,12 +116,29 @@ class ConfigStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(s2.channel_for(2), 30)
         self.assertFalse(s2.is_enabled(1))
 
-    async def test_corrupt_file_starts_empty(self):
+    async def test_corrupt_file_starts_empty_and_is_quarantined(self):
         with open(self.path, "w") as f:
             f.write("{not json")
-        s = ConfigStore(self.path)
+        with open(self.path + ".corrupt", "w") as f:
+            f.write("older")
+        with self.assertLogs("config_store", level="ERROR") as cm:
+            s = ConfigStore(self.path)
         self.assertEqual(s.rev, 0)
         self.assertEqual(s.snapshot()["guilds"], {})
+        self.assertFalse(os.path.exists(self.path))
+        with open(self.path + ".corrupt") as f:
+            self.assertEqual(f.read(), "{not json")
+        self.assertTrue(any("moved unreadable config" in m for m in cm.output))
+        await s.set_channel(1, 10, expected_rev=None, editor="a")  # new file written fine
+        self.assertTrue(os.path.exists(self.path))
+
+    async def test_quarantine_failure_never_raises(self):
+        with open(self.path, "w") as f:
+            f.write("{not json")
+        with mock.patch("config_store.os.replace", side_effect=PermissionError("no")):
+            with self.assertLogs("config_store", level="ERROR"):
+                s = ConfigStore(self.path)
+        self.assertEqual(s.rev, 0)
 
     async def test_persist_failure_rolls_back(self):
         s = ConfigStore(self.path)

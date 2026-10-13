@@ -93,7 +93,17 @@ class ConfigStore:
             pass
         except Exception:
             log.exception("could not load %s; starting with empty config", self.path)
+            self._quarantine()
             self.rev, self.updated_by, self.updated_at, self._guilds = 0, None, None, {}
+
+    def _quarantine(self) -> None:
+        """Best-effort: move an unreadable config aside so the next write cannot destroy it."""
+        dest = self.path + ".corrupt"
+        try:
+            os.replace(self.path, dest)
+            log.error("moved unreadable config to %s", dest)
+        except OSError:
+            log.exception("could not move unreadable config aside")
 
     def snapshot(self) -> dict:
         return {

@@ -53,6 +53,6 @@ No live Discord/GPU/browser tests exist; say so rather than claiming they passed
 - piper-tts is pinned to 1.2.0 (`synthesize_stream_raw`); CPU `onnxruntime` must stay uninstalled.
 - Prod layout: code root-owned `/opt/tts-bot`, state `/var/lib/tts-bot`, tokens in `/etc/tts-bot`.
   Anyone who can get code deployed can read the Discord token: review changes before deploy.
-- Unit refuses to start without `/etc/tts-bot/gui_token` (and `bot.env`); upgrading needs
+- Unit refuses to start without `/etc/tts-bot/gui_token` (`bot.env` is optional: `EnvironmentFile=-`, only a first-boot `TTS_CHANNEL_ID` seed); upgrading needs
   gen_gui_token -> setup_system -> deploy, not deploy alone.
 - Importing `bot.py` has side effects; tests set env vars (`STATE_FILE`, `CONFIG_FILE`, ...) first.
