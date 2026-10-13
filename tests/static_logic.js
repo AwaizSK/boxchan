@@ -1,7 +1,7 @@
 const assert = require('assert');
 const { shouldApplySnapshot, normalizeEditor, shouldRollback, createSSEParser, matchChannel, relTime, backoffDelay, groupChannels,
   voiceTitle, voiceWarning, sayBlocker, voiceSwitchText, mergeVoiceSummary,
-  segmentText, substituteTags, activeTagIds, uniqueLabel, insertAtCursor, counterText, counterState, pingTargets, pingSummary, chipText, messageBlocker,
+  segmentText, substituteTags, activeTagIds, uniqueLabel, insertAtCursor, counterText, counterState, shouldApplyMembers, pingTargets, pingSummary, chipText, messageBlocker,
   cpLen, READY_PRESET } = require('../static/app.js');
 
 const got = [];
@@ -155,6 +155,11 @@ assert.strictEqual(messageBlocker(true, true, 'x'.repeat(2001), false), 'Message
 assert.strictEqual(messageBlocker(true, true, 'x'.repeat(2000), false), '');
 assert.strictEqual(messageBlocker(true, true, 'x', true), 'Please wait…');
 assert.ok(READY_PRESET.startsWith('The voice bot is ready to use!') && cpLen(READY_PRESET) < 2000);
+// stale response guard: only apply members if guild and sequence match
+assert.strictEqual(shouldApplyMembers('gid1', 'gid1', 1, 1), true);
+assert.strictEqual(shouldApplyMembers('gid1', 'gid2', 1, 1), false);
+assert.strictEqual(shouldApplyMembers('gid1', 'gid1', 1, 2), false);
+assert.strictEqual(shouldApplyMembers('gid1', 'gid1', 2, 1), false);
 {
   const prev = { list: [{ name: 'old' }], current: 'b', configured: 'b', loading: true, cuda: true };
   const incoming = { voices: [{ name: 'a' }, { name: 'b' }], current: 'a', configured: null, loading: false, cuda: false };

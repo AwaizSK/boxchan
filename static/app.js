@@ -189,6 +189,11 @@ function insertAtCursor(value, start, end, ins) {
 function counterText(n) { return n + '/' + MSG_MAX; }
 function counterState(n) { return n > MSG_MAX ? 'over' : n >= 1900 ? 'near' : ''; }
 
+// Guard: only apply member search results if guild and request sequence still match (avoid stale responses).
+function shouldApplyMembers(reqGid, curGid, reqSeq, curSeq) {
+  return reqGid === curGid && reqSeq === curSeq;
+}
+
 function pingTargets(finalText, chips) {
   const byId = new Map((chips || []).map((c) => [c.id, c]));
   const result = [];
@@ -257,7 +262,7 @@ function mergeVoiceSummary(prev, incoming, { seqAtRequest, seqNow, live }) {
 if (typeof module !== 'undefined') {
   module.exports = { shouldApplySnapshot, normalizeEditor, shouldRollback, createSSEParser, matchChannel, relTime, backoffDelay, groupChannels,
     voiceTitle, voiceWarning, sayBlocker, voiceSwitchText, mergeVoiceSummary,
-    segmentText, substituteTags, activeTagIds, uniqueLabel, insertAtCursor, counterText, counterState, pingTargets, pingSummary, chipText, messageBlocker, cpLen, MSG_MAX, READY_PRESET };
+    segmentText, substituteTags, activeTagIds, uniqueLabel, insertAtCursor, counterText, counterState, shouldApplyMembers, pingTargets, pingSummary, chipText, messageBlocker, cpLen, MSG_MAX, READY_PRESET };
 }
 
 /* ---------- app ---------- */
@@ -297,7 +302,7 @@ if (typeof document !== 'undefined') (function () {
     vbusy: false,         // our own apply/say request in flight
     vsig: '',
   };
-  const M = { tags: [], members: [], hi: -1, inflight: false, again: false, timer: null, busy: false, cool: false, note: '', gid: '', q: null };
+  const M = { tags: [], members: [], hi: -1, inflight: false, again: false, timer: null, busy: false, cool: false, note: '', gid: '', q: null, memberSeq: 0 };
 
   /* --- toasts --- */
   function toast(msg, opts) {
@@ -788,15 +793,18 @@ if (typeof document !== 'undefined') (function () {
     const q = $('m-search').value.trim(), gid = S.gid;
     if (M.gid === gid && M.q === q) return;
     M.inflight = true; M.again = false;
+    const reqSeq = ++M.memberSeq;
     try {
       const d = await api('GET', '/api/guilds/' + gid + '/members?q=' + encodeURIComponent(q));
-      if (gid === S.gid) {
+      if (shouldApplyMembers(gid, S.gid, reqSeq, M.memberSeq)) {
         M.members = d.members || []; M.hi = M.members.length ? 0 : -1; M.gid = gid; M.q = q;
         M.note = d.truncated ? 'Showing the first 25 — type to narrow down' : (M.members.length ? '' : 'No matching members');
       }
     } catch (e) {
-      M.note = e.message === 'no_channel' ? 'No channel configured' : 'Could not load members';
-      M.members = [];
+      if (shouldApplyMembers(gid, S.gid, reqSeq, M.memberSeq)) {
+        M.note = e.message === 'no_channel' ? 'No channel configured' : 'Could not load members';
+        M.members = [];
+      }
     } finally {
       M.inflight = false;
       renderMessages();
