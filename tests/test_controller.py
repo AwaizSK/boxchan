@@ -9,7 +9,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import botimport  # noqa: F401,E402  (hermetic env + import of bot; must come first)
 import discord  # noqa: E402
 
-from messages import MessageError  # noqa: E402
+from messages import MessageError, SendLimiter  # noqa: E402
+from test_messages import Clock  # noqa: E402
 
 bot = botimport.bot
 
@@ -187,6 +188,11 @@ class ConfigWatcherTest(unittest.IsolatedAsyncioTestCase):
 
 
 class SendMessageTests(unittest.IsolatedAsyncioTestCase):
+    """Every test builds its own Controller with a fresh limiter on an injected clock, so
+    nothing depends on the shared global bot.controller or on test order."""
+
+    def fresh_controller(self):
+        return bot.Controller(limiter=SendLimiter(clock=Clock()))
 
     async def test_audit_forbidden_logged_with_reason_format(self):
         """Forbidden errors log with 'reason=forbidden' format, never message content."""
@@ -205,7 +211,7 @@ class SendMessageTests(unittest.IsolatedAsyncioTestCase):
             with mock.patch.object(bot.config, "channel_for", return_value=100):
                 with self.assertLogs("bot", "WARNING") as log_ctx:
                     with self.assertRaises(MessageError) as cm:
-                        await bot.controller.send_message(1, "ZZ-DISTINCT-CONTENT <@42>", "alice")
+                        await self.fresh_controller().send_message(1, "ZZ-DISTINCT-CONTENT <@42>", "alice")
                 self.assertEqual(cm.exception.code, "missing_permission")
 
         # Verify log contains exact format
@@ -225,8 +231,6 @@ class SendMessageTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_send_message_11_distinct_mentions_rejected(self):
         """Controller.send_message rejects 11 distinct mentions without calling send() or reserving rate limit."""
-        from messages import MessageError
-
         ch = mock.MagicMock(spec=discord.TextChannel)
         ch.id = 100
 
@@ -274,15 +278,13 @@ class SendMessageTests(unittest.IsolatedAsyncioTestCase):
 
         with mock.patch.object(bot.bot, "get_guild", return_value=guild):
             with mock.patch.object(bot.config, "channel_for", return_value=100):
-                result = await bot.controller.send_message(1, content, "alice")
+                result = await self.fresh_controller().send_message(1, content, "alice")
 
         self.assertEqual(result["ok"], True)
         ch.send.assert_awaited_once()
 
     async def test_guild_me_is_none_returns_no_channel_for_send(self):
         """When guild.me is None during outage, send_message raises no_channel."""
-        from messages import MessageError
-
         ch = mock.MagicMock(spec=discord.TextChannel)
         ch.id = 100
 
@@ -296,7 +298,7 @@ class SendMessageTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch.object(bot.bot, "get_guild", return_value=guild):
             with mock.patch.object(bot.config, "channel_for", return_value=100):
                 with self.assertRaises(MessageError) as cm:
-                    await bot.controller.send_message(1, "hi", "alice")
+                    await self.fresh_controller().send_message(1, "hi", "alice")
 
         self.assertEqual(cm.exception.code, "no_channel")
 
@@ -335,7 +337,7 @@ class MembersForTests(unittest.IsolatedAsyncioTestCase):
 
         with mock.patch.object(bot.bot, "get_guild", return_value=guild):
             with mock.patch.object(bot.config, "channel_for", return_value=100):
-                result = await bot.controller.members_for(1, "")
+                result = await bot.Controller().members_for(1, "")
 
         # Should have capped at 2000 permission checks (all without view), so 0 results
         self.assertEqual(len(result["members"]), 0)
@@ -389,7 +391,7 @@ class MembersForTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch.object(bot.bot, "get_guild", return_value=guild):
             with mock.patch.object(bot.config, "channel_for", return_value=100):
                 ticker_task = asyncio.create_task(ticker())
-                result = await bot.controller.members_for(1, "")
+                result = await bot.Controller().members_for(1, "")
                 ticker_task.cancel()
                 try:
                     await ticker_task
@@ -417,7 +419,7 @@ class MembersForTests(unittest.IsolatedAsyncioTestCase):
 
         with mock.patch.object(bot.bot, "get_guild", return_value=guild):
             with mock.patch.object(bot.config, "channel_for", return_value=100):
-                result = await bot.controller.members_for(1, "")
+                result = await bot.Controller().members_for(1, "")
 
         self.assertEqual(result["members"], [])
         self.assertFalse(result["truncated"])
