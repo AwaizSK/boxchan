@@ -153,13 +153,18 @@ if (typeof document !== 'undefined') (function () {
 
   // The server rejected our Host/Origin (allowlist). Retrying cannot help: say so once, stop the stream.
   let lastDenied = 0;
-  function hostDenied() {
+  const DENIED_TEXT = {
+    bad_host: 'This hostname is not allowed \u2014 add it to WEBUI_ALLOWED_HOSTS on the server',
+    bad_origin: 'Request blocked: this page\u2019s origin is not allowed \u2014 open the GUI via an allowed hostname (WEBUI_ALLOWED_HOSTS)',
+    bad_peer: 'This connection is not allowed (only loopback and Tailscale clients may connect)',
+  };
+  function hostDenied(code) {
     const now = Date.now();
     if (now - lastDenied < 10000) return;
     lastDenied = now;
-    toast('This hostname is not allowed \u2014 add it to WEBUI_ALLOWED_HOSTS on the server', { error: true, sticky: true });
+    toast(DENIED_TEXT[code] || DENIED_TEXT.bad_host, { error: true, sticky: true });
   }
-  const isDenied = (status, data) => status === 403 && !!data && (data.error === 'bad_host' || data.error === 'bad_origin');
+  const isDenied = (status, data) => status === 403 && !!data && (data.error === 'bad_host' || data.error === 'bad_origin' || data.error === 'bad_peer');
 
   const friendly = (e) => (e.message === 'persist_failed'
     ? 'the server could not save the change (storage error)' : e.message);
@@ -178,7 +183,7 @@ if (typeof document !== 'undefined') (function () {
     const r = await fetch(path, init);
     let data = null;
     try { data = await r.json(); } catch (e) { /* no body */ }
-    if (isDenied(r.status, data)) hostDenied();
+    if (isDenied(r.status, data)) hostDenied(data.error);
     if (!r.ok) throw new ApiError(r.status, data);
     return data;
   }
@@ -474,7 +479,7 @@ if (typeof document !== 'undefined') (function () {
     if (r.status === 403) {   // Host/Origin allowlist: retrying cannot help
       let d = null;
       try { d = await r.json(); } catch (e) { /* no body */ }
-      if (isDenied(403, d)) { hostDenied(); setConn('down'); return 'denied'; }
+      if (isDenied(403, d)) { hostDenied(d.error); setConn('down'); return 'denied'; }
     }
     if (!r.ok || !r.body) throw new Error('http_' + r.status);
     const dec = new TextDecoder();

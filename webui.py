@@ -7,7 +7,9 @@ import ipaddress
 import json
 import logging
 import os
+import re
 import subprocess
+import time
 import unicodedata
 from urllib.parse import unquote, urlsplit
 
@@ -19,6 +21,7 @@ log = logging.getLogger("webui")
 
 MAX_BODY = 4096
 RETRY_INTERVAL = 15.0
+ALLOWED_HOSTS_KEY = web.AppKey("allowed_hosts", set)
 SAFE_METHODS = frozenset({"GET", "HEAD"})
 # Bind policy: loopback, Tailscale CGNAT, Tailscale ULA. Nothing else may ever be listened on.
 BIND_NETWORKS = tuple(ipaddress.ip_network(n) for n in (
@@ -33,17 +36,37 @@ STATIC_FILES = (
 DEFAULT_STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
 
+def _in_policy(ip) -> bool:
+    return any(ip.version == n.version and ip in n for n in BIND_NETWORKS)
+
+
 def _normalize_ip(entry: str) -> str | None:
-    """Canonical text of `entry` if it is an IP literal inside the bind policy, else None."""
+    """Canonical text of `entry` if it is an IP literal inside the address policy, else None."""
     if "%" in entry:
         return None
     try:
         ip = ipaddress.ip_address(entry)
     except ValueError:
         return None
-    if any(ip.version == n.version and ip in n for n in BIND_NETWORKS):
-        return str(ip)
-    return None
+    return str(ip) if _in_policy(ip) else None
+
+
+def peer_allowed(peername) -> bool:
+    """Is this TCP peer (asyncio `peername`) loopback or Tailscale? Same ranges as the bind policy.
+    IPv4-mapped IPv6 peers are unwrapped first; a missing/odd peername is refused."""
+    try:
+        host = str(peername[0]).split("%")[0]
+        ip = ipaddress.ip_address(host)
+    except (TypeError, IndexError, ValueError):
+        return False
+    if ip.version == 6 and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return _in_policy(ip)
+
+
+def _peer_of(request):
+    t = request.transport
+    return t.get_extra_info("peername") if t is not None else None
 
 
 def validate_bind_hosts(hosts: list[str]) -> list[str]:
@@ -83,28 +106,45 @@ def parse_ip_addr(text: str) -> list[str]:
     return out
 
 
+_last_run_error = ""
+_detect_found: bool | None = None  # last detection outcome, so INFO logs fire only on change
+
+
 def _run(cmd: list[str]) -> str | None:
+    global _last_run_error
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=3, check=True)
     except (OSError, subprocess.SubprocessError) as e:
+        _last_run_error = f"{cmd[0]}: {type(e).__name__}"
         log.debug("%s failed: %s", cmd[0], e)
         return None
     return r.stdout
 
 
 def detect_tailscale_addrs() -> list[str]:
-    """Blocking. This host's Tailscale addresses, or [] (never raises)."""
+    """Blocking. This host's Tailscale addresses, or [] (never raises). Logs at INFO only when the
+    outcome changes (first call included), so periodic re-detection does not spam."""
+    global _detect_found, _last_run_error
+    addrs: list[str] = []
+    _last_run_error = ""
     try:
         for cmd, parse in ((["tailscale", "ip"], parse_tailscale_ip),
                            (["ip", "-o", "addr", "show", "dev", "tailscale0"], parse_ip_addr)):
             out = _run(cmd)
             addrs = parse(out) if out else []
             if addrs:
-                return addrs
-    except Exception:
+                break
+    except Exception as e:
+        _last_run_error = f"{type(e).__name__}"
         log.debug("tailscale address detection failed", exc_info=True)
-    log.info("no Tailscale address detected")
-    return []
+        addrs = []
+    if bool(addrs) != _detect_found:
+        _detect_found = bool(addrs)
+        if addrs:
+            log.info("Tailscale address(es) detected: %s", ", ".join(addrs))
+        else:
+            log.info("no Tailscale address detected%s", f" ({_last_run_error})" if _last_run_error else "")
+    return addrs
 
 
 def host_of(value: str) -> str | None:
@@ -128,15 +168,46 @@ def host_of(value: str) -> str | None:
         return h or None
 
 
+_HOSTNAME_RE = re.compile(r"^[a-z0-9]([a-z0-9._-]*[a-z0-9])?$")
+_BRACKET_RE = re.compile(r"^\[([0-9a-fA-F:.]+)\](:\d{1,5})?$")
+
+
+def _allowed_entry(item: str) -> str | None:
+    """Canonical host for one WEBUI_ALLOWED_HOSTS entry, or None if it is not a plain host[:port]."""
+    item = item.strip()
+    if not item or any(c.isspace() for c in item) or "://" in item or any(c in item for c in "*/\\@?#"):
+        return None
+    m = _BRACKET_RE.match(item)
+    if m:
+        try:
+            ip = ipaddress.ip_address(m.group(1))
+        except ValueError:
+            return None
+        return str(ip) if ip.version == 6 else None
+    if "[" in item or "]" in item or item.count(":") > 1:
+        return None
+    host, _, port = item.partition(":")
+    if _ and not (port.isdigit() and len(port) <= 5):
+        return None
+    host = host.lower().rstrip(".")
+    try:
+        return str(ipaddress.ip_address(host))
+    except ValueError:
+        pass
+    return host if _HOSTNAME_RE.match(host) else None
+
+
 def parse_allowed_hosts(raw: str | None) -> list[str]:
-    """WEBUI_ALLOWED_HOSTS: comma-separated hostnames, no wildcards (such entries are dropped)."""
+    """WEBUI_ALLOWED_HOSTS: comma-separated hostnames (optional :port, ignored). URLs, paths,
+    wildcards and malformed entries are dropped with a warning."""
     out = []
     for item in (raw or "").split(","):
         if not item.strip():
             continue
-        h = host_of(item)
-        if h is None or any(c in h for c in "*/@ \t"):
-            log.warning("ignoring invalid WEBUI_ALLOWED_HOSTS entry %r (hostnames only, no wildcards)", item.strip())
+        h = _allowed_entry(item)
+        if h is None:
+            log.warning("ignoring invalid WEBUI_ALLOWED_HOSTS entry %r (plain hostnames only: no URL, path or wildcard)",
+                        item.strip())
             continue
         out.append(h)
     return out
@@ -184,6 +255,7 @@ def make_app(config, controller, *, allowed_hosts, status_interval: float = 3.0,
     allowed = {"localhost", "127.0.0.1", "::1"}
     allowed.update(h for h in (host_of(x) for x in allowed_hosts) if h)
     streams: set[asyncio.Task] = set()
+    peer_logged: dict[str, float] = {}
     static_dir = static_dir or DEFAULT_STATIC_DIR
 
     @web.middleware
@@ -203,10 +275,29 @@ def make_app(config, controller, *, allowed_hosts, status_interval: float = 3.0,
         resp.headers["Cache-Control"] = "no-store" if request.path.startswith("/api/") else "no-cache"
 
     @web.middleware
+    async def peer_guard(request, handler):
+        # Runs first, on every route. A legitimate tailnet connection always has a tailnet source
+        # address; a LAN host abusing the weak-host model arrives with its LAN source address.
+        peer = _peer_of(request)
+        if not peer_allowed(peer):
+            ip = str(peer[0]) if peer else "?"
+            now = time.monotonic()
+            if now - peer_logged.get(ip, -1e9) > 60:
+                if len(peer_logged) > 256:
+                    peer_logged.clear()
+                peer_logged[ip] = now
+                log.warning("refused connection from non-loopback, non-Tailscale peer %s", ip)
+            return _err("bad_peer", 403)
+        return await handler(request)
+
+    @web.middleware
     async def host_guard(request, handler):
         # DNS-rebinding defense: a page on evil.example resolving to our IP sends Host: evil.example.
         if host_of(request.headers.get("Host", "")) not in allowed:
             return _err("bad_host", 403)
+        cross = request.headers.get("Sec-Fetch-Site", "").lower() == "cross-site"
+        if cross and request.path.startswith("/api/"):
+            return _err("bad_origin", 403)  # also GET: a no-cors cross-site fetch must not open SSE
         if request.method not in SAFE_METHODS:
             # Browsers always send Origin on cross-origin writes; curl/scripts send none, so absent is OK.
             origin = request.headers.get("Origin")
@@ -217,11 +308,11 @@ def make_app(config, controller, *, allowed_hosts, status_interval: float = 3.0,
                     oh = None
                 if oh not in allowed:
                     return _err("bad_origin", 403)
-            if request.headers.get("Sec-Fetch-Site", "").lower() == "cross-site":
+            if cross:
                 return _err("bad_origin", 403)
         return await handler(request)
 
-    app = web.Application(middlewares=[security_headers, host_guard], client_max_size=MAX_BODY)
+    app = web.Application(middlewares=[security_headers, peer_guard, host_guard], client_max_size=MAX_BODY)
 
     # --- static ---
     def static_handler(name, ctype):
@@ -237,6 +328,8 @@ def make_app(config, controller, *, allowed_hosts, status_interval: float = 3.0,
                 return web.Response(status=500, text="static file missing")
             return web.Response(body=body, content_type=ctype, charset="utf-8")
         return h
+
+    app[ALLOWED_HOSTS_KEY] = allowed  # mutable: start_webui adds late-detected Tailscale addresses
 
     for path, name, ctype in STATIC_FILES:
         app.router.add_get(path, static_handler(name, ctype))
@@ -390,11 +483,14 @@ class WebUIRunner(web.AppRunner):
 
     async def cleanup(self) -> None:
         t, self.retry_task = self.retry_task, None
-        if t:
-            t.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await t
-        await super().cleanup()
+        try:
+            if t:
+                t.cancel()
+                await asyncio.wait({t})
+                if not t.cancelled():
+                    t.exception()  # mark retrieved; the loop already logged it
+        finally:
+            await super().cleanup()
 
 
 async def _bind_site(runner: web.AppRunner, host: str, port: int) -> None:
@@ -406,23 +502,40 @@ async def _bind_site(runner: web.AppRunner, host: str, port: int) -> None:
         raise
 
 
-async def _retry_binds(runner, pending: list[str], port: int, interval: float) -> None:
-    while pending:
+async def _retry_binds(runner, pending: list[str], port: int, interval: float,
+                       detect, known: set[str], tailnet_found: bool) -> None:
+    """Retry failed binds; in auto mode (`detect` given) also re-detect Tailscale addresses until
+    one is found. Only cancellation ends the loop early; other errors are logged and retried."""
+    while pending or (detect is not None and not tailnet_found):
         await asyncio.sleep(interval)
-        for host in list(pending):
-            try:
-                await _bind_site(runner, host, port)
-            except OSError as e:
-                log.debug("web UI still cannot bind %s:%s (%s)", host, port, e)
-            else:
-                pending.remove(host)
-                log.info("web UI now listening on %s:%s", host, port)
+        try:
+            if detect is not None and not tailnet_found:
+                for addr in await asyncio.to_thread(detect):
+                    addr = _normalize_ip(addr)
+                    if addr and addr not in known:
+                        known.add(addr)
+                        pending.append(addr)
+                        tailnet_found = True
+                        runner.app[ALLOWED_HOSTS_KEY].add(host_of(addr))
+            for host in list(pending):
+                try:
+                    await _bind_site(runner, host, port)
+                except OSError as e:
+                    log.debug("web UI still cannot bind %s:%s (%s)", host, port, e)
+                else:
+                    pending.remove(host)
+                    log.info("web UI now listening on %s:%s", host, port)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("web UI bind retry failed; will try again")
 
 
 async def start_webui(app: web.Application, hosts: list[str], port: int, *,
-                      retry_interval: float = RETRY_INTERVAL) -> WebUIRunner:
+                      retry_interval: float = RETRY_INTERVAL, detect=None) -> WebUIRunner:
     """Bind every policy-compliant address independently; retry failed ones in the background.
-    Raises ValueError (policy) or OSError (nothing bound)."""
+    `detect` (auto mode only): blocking callable returning Tailscale addresses, re-run every
+    `retry_interval` until one is found. Raises ValueError (policy) or OSError (nothing bound)."""
     hosts = validate_bind_hosts(hosts)
     runner = WebUIRunner(app, shutdown_timeout=5.0)
     await runner.setup()
@@ -443,7 +556,9 @@ async def start_webui(app: web.Application, hosts: list[str], port: int, *,
     except BaseException:
         await runner.cleanup()
         raise
-    if pending:
-        runner.retry_task = asyncio.create_task(_retry_binds(runner, pending, port, retry_interval),
-                                                name="webui-bind-retry")
+    tailnet_found = any(not ipaddress.ip_address(h).is_loopback for h in hosts)
+    if pending or (detect is not None and not tailnet_found):
+        runner.retry_task = asyncio.create_task(
+            _retry_binds(runner, pending, port, retry_interval, detect, set(hosts), tailnet_found),
+            name="webui-bind-retry")
     return runner

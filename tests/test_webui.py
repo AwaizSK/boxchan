@@ -396,6 +396,10 @@ class BindPolicyTests(unittest.TestCase):
 
 
 class TailscaleParseTests(unittest.TestCase):
+    def setUp(self):
+        webui._detect_found = None
+        self.addCleanup(setattr, webui, "_detect_found", None)
+
     def test_tailscale_ip(self):
         p = webui.parse_tailscale_ip
         self.assertEqual(p("100.101.102.103\n"), ["100.101.102.103"])
@@ -418,19 +422,34 @@ class TailscaleParseTests(unittest.TestCase):
 
     def test_detect_prefers_tailscale_cli_then_ip(self):
         outs = {"tailscale": "100.64.0.5\n", "ip": "5: tailscale0 inet 100.64.0.6/32 scope global\n"}
-        with mock.patch.object(webui, "_run", side_effect=lambda cmd: outs[cmd[0]]):
+        with mock.patch.object(webui, "_run", side_effect=lambda cmd: outs[cmd[0]]), \
+                self.assertLogs("webui", "INFO"):
             self.assertEqual(webui.detect_tailscale_addrs(), ["100.64.0.5"])
-        outs["tailscale"] = None
-        with mock.patch.object(webui, "_run", side_effect=lambda cmd: outs[cmd[0]]):
+            outs["tailscale"] = None
             self.assertEqual(webui.detect_tailscale_addrs(), ["100.64.0.6"])
 
     def test_detect_failure_is_empty(self):
         with mock.patch.object(webui, "_run", return_value=None):
             with self.assertLogs("webui", "INFO"):
                 self.assertEqual(webui.detect_tailscale_addrs(), [])
+        webui._detect_found = None
         with mock.patch.object(webui, "_run", side_effect=RuntimeError("boom")):
-            with self.assertLogs("webui", "INFO"):
+            with self.assertLogs("webui", "INFO") as cm:
                 self.assertEqual(webui.detect_tailscale_addrs(), [])
+        self.assertIn("RuntimeError", "".join(cm.output))
+
+    def test_detect_logs_only_on_state_change(self):
+        with mock.patch.object(webui, "_run", return_value=None):
+            with self.assertLogs("webui", "INFO") as cm:
+                webui.detect_tailscale_addrs()
+                webui.detect_tailscale_addrs()
+                webui.detect_tailscale_addrs()
+            self.assertEqual(len(cm.output), 1)
+        with mock.patch.object(webui, "_run", return_value="100.64.0.5\n"):
+            with self.assertLogs("webui", "INFO") as cm:
+                webui.detect_tailscale_addrs()
+                webui.detect_tailscale_addrs()
+            self.assertEqual(len(cm.output), 1)
 
     def test_run_handles_missing_binary_and_timeout(self):
         import subprocess
@@ -456,7 +475,33 @@ class HostParseTests(unittest.TestCase):
             out = webui.parse_allowed_hosts(" Box.ts.net , ,*.ts.net,a b,other.example:8080")
         self.assertEqual(out, ["box.ts.net", "other.example"])
         self.assertEqual(len(cm.output), 2)
+
+    def test_parse_allowed_hosts_rejects_urls_and_malformed(self):
+        bad = ["https://gui.example.com", "gui.example.com/path", "http://[::1]:8765", "a b", "  x y",
+               "[::1", "::1]", "[::1]x", "[zzz]", "1:2:3", "fe80::1", "host:port", "host:123456",
+               "user@host", "host?x", "host#x", "-bad", "a..b!", "[1.2.3.4]"]
+        with self.assertLogs("webui", "WARNING") as cm:
+            out = webui.parse_allowed_hosts(",".join(bad))
+        self.assertEqual(out, [])
+        self.assertEqual(len(cm.output), len(bad))
+        self.assertNotIn("https", out)
+        self.assertEqual(webui.parse_allowed_hosts("[FD7A::1]:8765,100.64.0.9:80, Gui.Example.com."),
+                         ["fd7a::1", "100.64.0.9", "gui.example.com"])
         self.assertEqual(webui.parse_allowed_hosts(None), [])
+
+
+class PeerPolicyTests(unittest.TestCase):
+    def test_peer_allowed(self):
+        ok = [("127.0.0.1", 5), ("127.9.9.9", 5), ("::1", 5, 0, 0), ("100.64.0.1", 5), ("100.127.255.255", 5),
+              ("fd7a:115c:a1e0::1", 5, 0, 0), ("::ffff:127.0.0.1", 5, 0, 0), ("::ffff:100.100.1.1", 5, 0, 0),
+              ("::1%lo", 5, 0, 1)]
+        for p in ok:
+            self.assertTrue(webui.peer_allowed(p), p)
+        bad = [("192.168.1.5", 5), ("10.0.0.2", 5), ("100.128.0.1", 5), ("100.63.255.255", 5), ("8.8.8.8", 5),
+               ("fe80::1", 5, 0, 0), ("fd7b::1", 5, 0, 0), ("::ffff:192.168.1.5", 5, 0, 0), ("::", 5, 0, 0),
+               ("0.0.0.0", 5), ("example.com", 5), None, (), "", ("", 5)]
+        for p in bad:
+            self.assertFalse(webui.peer_allowed(p), p)
 
 
 class HostOriginTests(unittest.IsolatedAsyncioTestCase):
@@ -542,10 +587,61 @@ class HostOriginTests(unittest.IsolatedAsyncioTestCase):
             r = await put({"Sec-Fetch-Site": site})
             self.assertEqual(r.status, 200, site)
 
-    async def test_origin_not_checked_on_get(self):
-        r = await self.client.get("/api/state", headers={"Origin": "http://evil.example",
-                                                         "Sec-Fetch-Site": "cross-site"})
+    async def test_origin_header_not_checked_on_get(self):
+        r = await self.client.get("/api/state", headers={"Origin": "http://evil.example"})
         self.assertEqual(r.status, 200)
+
+    async def test_cross_site_fetch_metadata_blocked_on_api_get(self):
+        for path in ("/api/state", "/api/events"):
+            r = await self.client.get(path, headers={"Sec-Fetch-Site": "cross-site"})
+            self.assertEqual(r.status, 403, path)
+            self.assertEqual(await r.json(), {"error": "bad_origin"})
+        self.assertEqual(self.config.hub.subscriber_count, 0)
+        for site in ("same-origin", "none", "same-site"):
+            r = await self.client.get("/api/state", headers={"Sec-Fetch-Site": site})
+            self.assertEqual(r.status, 200, site)
+        r = await self.client.get("/")  # static pages are navigations, not guarded by fetch metadata
+        self.assertEqual(r.status, 200)
+
+    async def test_peer_guard(self):
+        for peer, ok in ((("192.168.1.5", 4000), False), (("::ffff:192.168.1.5", 4000, 0, 0), False),
+                         (None, False), (("100.64.0.9", 4000), True), (("::ffff:100.64.0.9", 4000, 0, 0), True),
+                         (("fd7a:115c:a1e0::5", 4000, 0, 0), True), (("127.0.0.1", 4000), True)):
+            with mock.patch.object(webui, "_peer_of", return_value=peer):
+                if not ok:
+                    ctx = self.assertLogs("webui", "WARNING")
+                    ctx.__enter__()
+                for path in ("/", "/app.js", "/api/state", "/api/events", "/nope"):
+                    if not ok:
+                        r = await self.client.get(path)
+                        self.assertEqual(r.status, 403, (peer, path))
+                        self.assertEqual(await r.json(), {"error": "bad_peer"})
+                        self.assertEqual(r.headers["X-Content-Type-Options"], "nosniff")
+                        self.assertIn("default-src 'none'", r.headers["Content-Security-Policy"])
+                    else:
+                        r = await self.client.get(path, headers={"Host": "localhost"})
+                        self.assertNotEqual(r.status, 403, (peer, path))
+                        r.close()
+                if not ok:
+                    ctx.__exit__(None, None, None)
+        self.assertEqual(self.config.hub.subscriber_count, 0)
+
+    async def test_peer_checked_before_host_and_write_checks(self):
+        with mock.patch.object(webui, "_peer_of", return_value=("192.168.1.5", 1)):
+            with self.assertLogs("webui", "WARNING"):
+                r = await self.client.put("/api/guilds/1/enabled", json={"enabled": False, "rev": None},
+                                          headers={"Host": "evil.example", "Origin": "http://evil.example"})
+            self.assertEqual(await r.json(), {"error": "bad_peer"})
+        self.assertTrue(self.config.is_enabled(1))
+
+    async def test_peer_refusals_logged_once_per_peer(self):
+        with mock.patch.object(webui, "_peer_of", return_value=("192.168.1.5", 1)):
+            with self.assertLogs("webui", "WARNING") as cm:
+                for _ in range(5):
+                    await self.client.get("/api/state")
+        self.assertEqual(len(cm.output), 1)
+        self.assertIn("192.168.1.5", cm.output[0])
+        self.assertNotIn("/api/state", cm.output[0])
 
     async def test_bad_origin_does_not_change_state(self):
         r = await self.client.put("/api/guilds/1/enabled", json={"enabled": False, "rev": None},
@@ -626,6 +722,96 @@ class StartTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(r.status, 200)
             finally:
                 await runner.cleanup()
+
+    async def test_auto_mode_redetects_tailnet_and_allows_host(self):
+        port = free_port()
+        found = []
+        calls = []
+
+        def detect():
+            calls.append(1)
+            return list(found)
+
+        real = webui._bind_site
+        bound = []
+
+        async def fake(runner, host, p):
+            if host == "100.64.0.5":
+                bound.append(host)
+                host, p = "127.0.0.1", port + 1
+            await real(runner, host, p)
+
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(webui, "_bind_site", fake):
+            app = self.app(d)
+            with self.assertLogs("webui", "INFO"):
+                runner = await webui.start_webui(app, ["127.0.0.1"], port, retry_interval=0.02, detect=detect)
+            try:
+                self.assertIsNotNone(runner.retry_task)
+                for _ in range(20):
+                    await asyncio.sleep(0.02)
+                self.assertGreaterEqual(len(calls), 2)
+                self.assertFalse(runner.retry_task.done())
+                found.append("100.64.0.5")
+                with self.assertLogs("webui", "INFO"):
+                    for _ in range(100):
+                        if runner.retry_task.done():
+                            break
+                        await asyncio.sleep(0.02)
+                self.assertTrue(runner.retry_task.done())
+                self.assertEqual(bound, ["100.64.0.5"])   # bound exactly once, no duplicates
+                self.assertIn("100.64.0.5", app[webui.ALLOWED_HOSTS_KEY])
+                n = len(calls)
+                await asyncio.sleep(0.1)
+                self.assertEqual(len(calls), n)           # detection stops once found
+            finally:
+                await runner.cleanup()
+
+    async def test_explicit_mode_has_no_redetection(self):
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertLogs("webui", "INFO"):
+                runner = await webui.start_webui(self.app(d), ["127.0.0.1"], 0, retry_interval=0.02)
+            self.assertIsNone(runner.retry_task)
+            await runner.cleanup()
+
+    async def test_retry_loop_survives_errors(self):
+        n = []
+
+        def detect():
+            n.append(1)
+            if len(n) < 3:
+                raise RuntimeError("flaky")
+            return []
+
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertLogs("webui", "INFO"):
+                runner = await webui.start_webui(self.app(d), ["127.0.0.1"], 0, retry_interval=0.02, detect=detect)
+            try:
+                with self.assertLogs("webui", "ERROR") as cm:
+                    for _ in range(100):
+                        if len(n) >= 4:
+                            break
+                        await asyncio.sleep(0.02)
+                self.assertFalse(runner.retry_task.done())
+                self.assertTrue(any("retry failed" in m for m in cm.output))
+            finally:
+                await runner.cleanup()
+
+    async def test_cleanup_closes_sites_even_if_retry_task_died(self):
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertLogs("webui", "INFO"):
+                runner = await webui.start_webui(self.app(d), ["127.0.0.1"], 0)
+            port = runner.addresses[0][1]
+
+            async def boom():
+                raise RuntimeError("dead")
+
+            runner.retry_task = asyncio.create_task(boom())
+            await asyncio.sleep(0.01)
+            await runner.cleanup()
+            self.assertEqual(runner.addresses, [])
+            with self.assertRaises(aiohttp.ClientConnectorError):
+                async with aiohttp.ClientSession() as sess:
+                    await sess.get(f"http://127.0.0.1:{port}/api/state")
 
     async def test_all_fail_raises_and_leaves_nothing(self):
         async def fail(runner, host, p):

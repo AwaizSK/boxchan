@@ -546,12 +546,14 @@ async def maybe_start_webui(cfg, ctl, port: int):
     Tailscale address. Host allowlist: loopback names + those addresses + WEBUI_ALLOWED_HOSTS."""
     try:
         raw = (os.getenv("WEBUI_HOSTS") or "").strip()
+        auto = not raw
         if raw:
             hosts = validate_bind_hosts([h for h in raw.split(",") if h.strip()])
         else:
             hosts = validate_bind_hosts(["127.0.0.1"] + await asyncio.to_thread(detect_tailscale_addrs))
         allowed = hosts + parse_allowed_hosts(os.getenv("WEBUI_ALLOWED_HOSTS"))
-        runner = await start_webui(make_app(cfg, ctl, allowed_hosts=allowed), hosts, port)
+        runner = await start_webui(make_app(cfg, ctl, allowed_hosts=allowed), hosts, port,
+                                    detect=detect_tailscale_addrs if auto else None)
     except ValueError as e:
         log.error("Web UI disabled: %s", e)
         return None

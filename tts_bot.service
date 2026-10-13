@@ -18,8 +18,11 @@ EnvironmentFile=-/etc/tts-bot/bot.env
 Environment=STATE_FILE=/var/lib/tts-bot/state.json
 Environment=CONFIG_FILE=/var/lib/tts-bot/config.json
 # Web UI has NO login: the network is the boundary. It binds loopback + this host's Tailscale address(es)
-# (auto-detected; never LAN) and only answers Host names on the allowlist. Secure it with Tailscale ACLs.
-# Optional overrides (loopback / Tailscale addresses only, comma-separated; anything else disables the GUI):
+# (auto-detected, re-checked every 15 s until found). Linux answers on any local address for any interface, so the
+# app also refuses connections whose SOURCE address is not loopback/Tailscale (bad_peer) and only answers allowlisted
+# Host names. Secure it with Tailscale ACLs; also recommended: host firewall rules (see docs/ARCHITECTURE.md runbook).
+# Optional overrides (loopback / Tailscale addresses only, comma-separated; anything else disables the GUI).
+# Explicit mode retries only the listed addresses (no re-detection); always include 127.0.0.1 in the list:
 #Environment=WEBUI_HOSTS=127.0.0.1,100.64.0.1
 # Extra Host names the GUI should answer to (MagicDNS name, later your domain); no wildcards:
 #Environment=WEBUI_ALLOWED_HOSTS=your-machine.tailnet-name.ts.net
