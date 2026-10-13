@@ -14,3 +14,4 @@ models/*.onnx.json
 .claude/
 repomix-output.xml
 features.json
+node_modules/

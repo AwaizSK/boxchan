@@ -1,8 +1,11 @@
 const assert = require('assert');
-const { shouldApplySnapshot, normalizeEditor, shouldRollback, createSSEParser, matchChannel, relTime, backoffDelay, groupChannels,
-  voiceTitle, voiceWarning, sayBlocker, voiceSwitchText, mergeVoiceSummary,
-  segmentText, substituteTags, activeTagIds, uniqueLabel, insertAtCursor, counterText, counterState, shouldApplyMembers, resetMemberCache, tokenizeMentions, channelChanged, MENTION_SRC, pingTargets, pingSummary, chipText, messageBlocker,
-  cpLen, READY_PRESET } = require('../static/app.js');
+const fs = require('fs');
+
+(async () => {
+  const { shouldApplySnapshot, normalizeEditor, shouldRollback, createSSEParser, matchChannel, relTime, backoffDelay, groupChannels,
+    voiceTitle, voiceWarning, sayBlocker, voiceSwitchText, mergeVoiceSummary,
+    segmentText, substituteTags, activeTagIds, uniqueLabel, insertAtCursor, counterText, counterState, shouldApplyMembers, resetMemberCache, tokenizeMentions, channelChanged, MENTION_SRC, pingTargets, pingSummary, chipText, messageBlocker,
+    cpLen, READY_PRESET } = await import('../frontend/src/utils.js');
 
 const got = [];
 const feed = createSSEParser((n, d) => got.push([n, d]));
@@ -228,4 +231,8 @@ assert.strictEqual(channelChanged(cfgOf({ 1: { channel_id: null } }), cfgOf({ 1:
 assert.strictEqual(channelChanged(cfgOf({ 1: { channel_id: '10' } }), null, '1'), false);
 assert.strictEqual(channelChanged(cfgOf({ 1: { channel_id: '10' }, 2: { channel_id: '5' } }), cfgOf({ 1: { channel_id: '11' }, 2: { channel_id: '5' } }), '2'), false);  // only the selected guild counts
 assert.strictEqual(channelChanged(cfgOf({ 1: { channel_id: '10' }, 2: { channel_id: '5' } }), cfgOf({ 1: { channel_id: '10' }, 2: { channel_id: '6' } }), '2'), true);
-console.log('ok');
+  console.log('ok');
+})().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});

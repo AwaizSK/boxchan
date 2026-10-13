@@ -16,10 +16,18 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
+      - name: Build Frontend (Vite)
+        run: |
+          export PATH="/home/jb/.nvm/versions/node/v22.23.0/bin:$PATH"
+          cd frontend
+          npm ci
+          npm run build
+
       - name: Run Test Suite
         run: |
           source ~/miniconda3/etc/profile.d/conda.sh
           conda activate tts-bot
+          export PATH="/home/jb/.nvm/versions/node/v22.23.0/bin:$PATH"
           python -m unittest discover -s tests -v
           bash tests/test_deploy_validation.sh
           node tests/static_logic.js
