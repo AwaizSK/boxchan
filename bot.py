@@ -5,12 +5,12 @@ import os
 import re
 import signal
 import sys
-import tempfile
 
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 
+from config_store import ConfigStore, atomic_write_json
 from tts_engine import TTSEngine, clean_discord_text
 
 load_dotenv()
@@ -48,10 +48,11 @@ if TOKEN and not TOKEN_RE.match(TOKEN):
 PREFIX = os.getenv("COMMAND_PREFIX", "!")
 MODEL_PATH = os.getenv("PIPER_MODEL_PATH", "models/en_US-lessac-medium.onnx")
 CONFIG_PATH = os.getenv("PIPER_CONFIG_PATH") or None
-TTS_CHANNEL_IDS = {int(x) for x in os.getenv("TTS_CHANNEL_ID", "").replace(" ", "").split(",") if x.isdigit()}
+SEED_CHANNEL_IDS = {int(x) for x in os.getenv("TTS_CHANNEL_ID", "").replace(" ", "").split(",") if x.isdigit()}
 MAX_CHARS = int(os.getenv("MAX_CHARS", "300"))
 MAX_QUEUE = int(os.getenv("MAX_QUEUE", "20"))
 STATE_FILE = os.getenv("STATE_FILE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json"))
+CONFIG_FILE = os.getenv("CONFIG_FILE", os.path.join(os.path.dirname(STATE_FILE), "config.json"))
 RECONNECT_WAIT = 10.0   # s to wait for voice reconnect before dropping a job
 PLAY_TIMEOUT = 180.0    # safety: max s a single clip may block the worker
 
@@ -77,22 +78,6 @@ engine = TTSEngine(MODEL_PATH, CONFIG_PATH)
 
 
 # ---------- persistent state ----------
-def save_state(data: dict, path: str = STATE_FILE) -> None:
-    """Atomic: write temp file in same dir, fsync, os.replace."""
-    dir_name = os.path.dirname(os.path.abspath(path))
-    with tempfile.NamedTemporaryFile("w", dir=dir_name, suffix=".tmp", delete=False) as tf:
-        temp_name = tf.name
-        try:
-            json.dump(data, tf, indent=2)
-            tf.flush()
-            os.fsync(tf.fileno())
-        except BaseException:
-            tf.close()
-            os.unlink(temp_name)
-            raise
-    os.replace(temp_name, path)
-
-
 class WatchStore:
     """guild_id -> set(user_id); mutations serialized by asyncio.Lock."""
 
@@ -126,12 +111,13 @@ class WatchStore:
                 users.clear()
             snap = self.snapshot()
             try:
-                await asyncio.to_thread(save_state, snap, self.path)
+                await asyncio.to_thread(atomic_write_json, snap, self.path)
             except Exception:
                 log.exception("state save failed")
 
 
 store = WatchStore(STATE_FILE)
+config = ConfigStore(CONFIG_FILE)
 
 
 # ---------- per-guild audio ----------
@@ -154,6 +140,7 @@ class TTSBot(commands.Bot):
 bot = TTSBot(command_prefix=PREFIX, intents=intents, help_command=None)
 audio: dict[int, GuildAudio] = {}
 _shutting_down = False
+_watcher_task: asyncio.Task | None = None
 
 
 def _rm(path: str) -> None:
@@ -258,25 +245,35 @@ async def teardown(guild: discord.Guild) -> None:
 @bot.check
 async def only_tts_channel(ctx: commands.Context) -> bool:
     """Commands work only in the configured text channel."""
-    if ctx.channel.id not in TTS_CHANNEL_IDS:
+    if not (ctx.guild and config.is_command_channel(ctx.guild.id, ctx.channel.id)):
         raise commands.CheckFailure("wrong channel")
     return True
 
 
 @bot.event
 async def on_ready():
+    for guild in bot.guilds:  # env TTS_CHANNEL_ID is a first-run seed only
+        for cid in sorted(SEED_CHANNEL_IDS):
+            if isinstance(guild.get_channel(cid), discord.TextChannel):
+                try:
+                    await config.seed_channel(guild.id, cid)
+                except Exception:
+                    log.exception("channel seed failed for guild %s", guild.id)
+                break
     log.info("Logged in as %s (id=%s) prefix=%r channels=%s tts_ready=%s cuda=%s",
-             bot.user, bot.user.id, PREFIX, sorted(TTS_CHANNEL_IDS), engine.ready, engine.cuda_active)
+             bot.user, bot.user.id, PREFIX,
+             {g: c for g, e in config.snapshot()["guilds"].items() if (c := e["channel_id"])},
+             engine.ready, engine.cuda_active)
 
 
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot or not message.guild:
         return
-    if message.channel.id not in TTS_CHANNEL_IDS:  # watch ONLY the configured channel
-        return
-    if message.content.startswith(PREFIX):
+    if message.content.startswith(PREFIX):  # global check limits commands to the configured channel
         await bot.process_commands(message)
+        return
+    if not config.is_listen_channel(message.guild.id, message.channel.id):  # paused/other channel: ignore
         return
     if not store.is_watched(message.guild.id, message.author.id):
         return
@@ -393,8 +390,9 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
         return
     if isinstance(error, commands.CheckFailure):
         if ctx.interaction:  # slash: must answer or Discord shows "did not respond"
-            mentions = " or ".join(f"<#{c}>" for c in sorted(TTS_CHANNEL_IDS))
-            await ctx.send(f"Use TTS commands in {mentions}.", ephemeral=True)
+            cid = config.channel_for(ctx.guild.id) if ctx.guild else None
+            msg = f"Use TTS commands in <#{cid}>." if cid else "No channel configured — set one in the web UI."
+            await ctx.send(msg, ephemeral=True)
         return
     if isinstance(error, (commands.MemberNotFound, commands.BadArgument, commands.MissingRequiredArgument)):
         return await ctx.send("Mention a valid member.")
@@ -405,6 +403,117 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
     log.error("command %s failed: %r", ctx.command, error)
 
 
+# ---------- web UI surface ----------
+def _visible_text_channels(guild: discord.Guild) -> list[discord.TextChannel]:
+    chans = [c for c in guild.text_channels if c.permissions_for(guild.me).view_channel]
+    # uncategorized first, then by category position, then channel position
+    chans.sort(key=lambda c: (c.category.position if c.category else -1, c.position, c.id))
+    return chans
+
+
+def _guild_status(guild: discord.Guild) -> dict:
+    vc = guild.voice_client
+    ga = audio.get(guild.id)
+    return {
+        "voice": vc.channel.name if vc and vc.is_connected() else None,
+        "queue": ga.queue.qsize() if ga else 0,
+        "playing": bool(vc and vc.is_playing()),
+        "watched": len(store.data.get(guild.id, ())),
+    }
+
+
+class Controller:
+    """The only surface the web UI touches. Sync, non-blocking; call from the event loop."""
+
+    def guilds_view(self) -> list[dict]:
+        return [{
+            "id": str(g.id),
+            "name": g.name,
+            "channels": [{"id": str(c.id), "name": c.name,
+                          "category": c.category.name if c.category else None,
+                          "position": c.position} for c in _visible_text_channels(g)],
+            **_guild_status(g),
+        } for g in bot.guilds]
+
+    def status_view(self) -> dict:
+        return {str(g.id): _guild_status(g) for g in bot.guilds}
+
+    def is_text_channel(self, guild_id: int, channel_id: int) -> bool:
+        guild = bot.get_guild(guild_id)
+        if guild is None:
+            return False
+        ch = guild.get_channel(channel_id)
+        return isinstance(ch, discord.TextChannel) and ch.permissions_for(guild.me).view_channel
+
+    def skip(self, guild_id: int) -> bool:
+        guild = bot.get_guild(guild_id)
+        vc = guild.voice_client if guild else None
+        if vc and vc.is_playing():
+            vc.stop()
+            return True
+        return False
+
+    def clear_queue(self, guild_id: int) -> int:
+        ga = audio.get(guild_id)
+        if not ga:
+            return 0
+        n = ga.queue.qsize()
+        drain(ga.queue)
+        return n
+
+
+controller = Controller()
+
+
+async def config_watcher() -> None:
+    """On a listen-channel change, drop that guild's pending clips (the playing one finishes)."""
+    q = config.hub.subscribe()
+    try:
+        while True:
+            event = await q.get()
+            try:
+                if event.get("type") != "config":
+                    continue
+                change = event["change"]
+                if change["field"] == "channel_id":
+                    ga = audio.get(int(change["guild_id"]))
+                    if ga:
+                        drain(ga.queue)
+            except Exception:
+                log.exception("config watcher error (continuing)")
+    finally:
+        config.hub.unsubscribe(q)
+
+
+def _publish_channels(guild: discord.Guild) -> None:
+    config.hub.publish({"type": "channels", "guild_id": str(guild.id)})
+
+
+@bot.event
+async def on_guild_channel_create(channel):
+    _publish_channels(channel.guild)
+
+
+@bot.event
+async def on_guild_channel_delete(channel):  # configured channel is left as is; UI shows it missing
+    _publish_channels(channel.guild)
+
+
+@bot.event
+async def on_guild_channel_update(before, after):  # renames, moves
+    _publish_channels(after.guild)
+
+
+@bot.event
+async def on_guild_join(guild):
+    _publish_channels(guild)
+
+
+@bot.event
+async def on_guild_remove(guild):
+    _publish_channels(guild)
+
+
 # ---------- lifecycle ----------
 async def shutdown(b: commands.Bot) -> None:
     global _shutting_down
@@ -412,6 +521,8 @@ async def shutdown(b: commands.Bot) -> None:
         return
     _shutting_down = True
     log.info("Shutting down")
+    if _watcher_task:
+        _watcher_task.cancel()
     for guild in list(b.guilds):
         if guild.voice_client or guild.id in audio:
             await teardown(guild)
@@ -422,14 +533,15 @@ async def shutdown(b: commands.Bot) -> None:
 async def main() -> None:
     if not TOKEN:
         raise SystemExit("No token: set ~/.config/tts-bot/token (see README)")
-    if not TTS_CHANNEL_IDS:
-        raise SystemExit("TTS_CHANNEL_ID not set (numeric text channel ID; comma-separate for several)")
     engine.purge_tmp()
     if not await asyncio.to_thread(engine.load):
         log.error("TTS engine failed to load; bot runs but cannot speak")
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, lambda: asyncio.create_task(shutdown(bot)))
+    global _watcher_task
+    _watcher_task = asyncio.create_task(config_watcher(), name="config-watcher")
+    # WEBUI hook: Task 5 starts the web server here (uses `controller` and `config`)
     async with bot:
         await bot.start(TOKEN)
 
