@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>TTS Bot</title>
+<link rel="stylesheet" href="/app.css">
+<script src="/app.js" defer></script>
+</head>
+<body>
+<main id="app">
+  <form id="auth" class="card" hidden>
+    <h1>Sign in</h1>
+    <p id="auth-msg" class="muted" role="alert"></p>
+    <label>Access token<input id="auth-token" type="password" autocomplete="current-password" spellcheck="false"></label>
+    <label>Your name (shown to other editors)<input id="auth-name" type="text" maxlength="40" autocomplete="nickname"></label>
+    <button type="submit" class="primary">Continue</button>
+  </form>
+
+  <div id="ui" hidden>
+    <header>
+      <div class="row top">
+        <h1 id="title">Listen channel</h1>
+        <span id="conn" class="conn" data-state="connecting"><span class="dot" aria-hidden="true"></span><span id="conn-text">Connecting…</span></span>
+      </div>
+      <div class="row">
+        <select id="guild" aria-label="Server" hidden></select>
+        <span id="meta" class="muted"></span>
+        <button id="who" type="button" class="link" title="Change your name or token"></button>
+      </div>
+    </header>
+
+    <section class="controls" aria-label="Playback controls">
+      <button id="pause" type="button"></button>
+      <button id="skip" type="button">Skip</button>
+      <button id="clear" type="button">Clear queue</button>
+      <span id="status" class="muted" role="status"></span>
+    </section>
+
+    <input id="search" type="search" placeholder="Search channels  ( / )" aria-label="Search channels" role="combobox" aria-expanded="true" aria-controls="list" autocomplete="off" spellcheck="false" autofocus>
+    <ul id="list" role="listbox" tabindex="0" aria-label="Text channels"></ul>
+    <p id="empty" class="muted" hidden>No channels match.</p>
+  </div>
+</main>
+<div id="toasts" aria-live="polite" aria-atomic="false"></div>
+</body>
+</html>
