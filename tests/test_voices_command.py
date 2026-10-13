@@ -48,6 +48,7 @@ def make_context(guild, author):
     ctx.guild = guild
     ctx.author = author
     ctx.send = mock.AsyncMock()
+    ctx.defer = mock.AsyncMock()
     return ctx
 
 
@@ -225,6 +226,53 @@ class VoicesCommandTest(CommandTestBase):
 
         message = ctx.send.await_args[0][0]
         self.assertIn("loading", message.lower())
+
+    async def test_voices_defers_before_listing_then_replies(self):
+        """The interaction is acked (defer) BEFORE the slow rescan; the reply still goes out."""
+        guild = make_guild(1, [make_text_channel(10)])
+        ctx = make_context(guild, make_member(1, "author"))
+        order = []
+        ctx.defer.side_effect = lambda *a, **k: order.append("defer")
+
+        async def fake_list():
+            order.append("list_voices")
+            return {"voices": [{"name": "v1", "quality": "medium", "language": "en", "size_mb": 1}],
+                    "current": "v1", "configured": "v1", "loading": False, "cuda": True}
+
+        with mock.patch.object(bot.controller, "list_voices", side_effect=fake_list):
+            await bot.voices(ctx)
+
+        self.assertEqual(order, ["defer", "list_voices"])
+        ctx.defer.assert_awaited_once()
+        ctx.send.assert_awaited_once()
+        self.assertIn("v1", ctx.send.await_args[0][0])
+
+    async def test_voices_engine_not_loaded_still_lists_voices(self):
+        """current None but voices on disk: list them AND say the engine is not loaded."""
+        guild = make_guild(1, [make_text_channel(10)])
+        ctx = make_context(guild, make_member(1, "author"))
+        fake = {"voices": [{"name": "voiceA", "quality": "low", "language": "en", "size_mb": 5}],
+                "current": None, "configured": None, "loading": False, "cuda": None}
+        with mock.patch.object(bot.controller, "list_voices", return_value=fake):
+            await bot.voices(ctx)
+
+        message = ctx.send.await_args[0][0]
+        self.assertIn("voiceA", message)
+        self.assertIn("engine not loaded", message)
+
+    async def test_voices_list_failure_is_friendly(self):
+        """list_voices raising yields a short message without exception text, not a crash."""
+        guild = make_guild(1, [make_text_channel(10)])
+        ctx = make_context(guild, make_member(1, "author"))
+        with mock.patch.object(bot.controller, "list_voices", side_effect=OSError("secret-path-boom")):
+            await bot.voices(ctx)
+
+        ctx.send.assert_awaited_once()
+        message = ctx.send.await_args[0][0]
+        self.assertIn("Could not list voices", message)
+        self.assertNotIn("secret-path-boom", message)
+        self.assertNotIn("OSError", message)
+        self.assertLess(len(message), 100)
 
     async def test_voices_read_only(self):
         """Test that voices command does not call config.set_voice or engine.reload."""

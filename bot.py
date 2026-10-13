@@ -446,6 +446,7 @@ async def status(ctx: commands.Context):
 @commands.guild_only()
 async def voices(ctx: commands.Context):
     """Show available Piper voices and which one is currently active."""
+    await ctx.defer()  # list_voices rescans the models dir; a slash interaction must be acked first
     try:
         result = await controller.list_voices()
     except Exception:
@@ -500,7 +501,7 @@ async def voices(ctx: commands.Context):
         if current:
             lines.append(f"Current voice: **{current}**. Change voices in the web UI.")
         else:
-            lines.append("Using default voice. Change in the web UI.")
+            lines.append("TTS engine not loaded; no voice is active. Change voices in the web UI.")
 
     reply = "\n".join(lines)
 
