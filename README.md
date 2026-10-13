@@ -23,7 +23,7 @@ The Web UI has a **Voice** tab: pick any installed Piper voice, press **Apply** 
 
 Add voices (single-speaker only; multi-speaker models are not offered):
 1. Download both files (`<name>.onnx` and `<name>.onnx.json`) from https://huggingface.co/rhasspy/piper-voices (listen first on https://rhasspy.github.io/piper-samples). Each voice has its own licence on its model card; check it before use.
-2. Production, no restart: `sudo scripts/install_voice.sh path/to/en_US-amy-medium.onnx` (the JSON is picked up next to it, or pass it as the second argument; `--force` replaces an installed voice). It validates the files and installs them atomically into `/opt/tts-bot/models`.
+2. Production, no restart: `sudo scripts/install_voice.sh path/to/en_US-amy-medium.onnx` (the JSON is picked up next to it, or pass it as the second argument). A new voice is created as a .json/.onnx pair (rolled back together if the second link fails); `--force` removes the old voice then moves the new one in, which is NOT atomic. No service restart; rescan in the GUI after install.
    Or: put both files in the repo's `models/` (gitignored) and run `sudo scripts/deploy.sh` (restarts the bot). `deploy.sh` never deletes from `/opt/tts-bot/models`, so installed voices survive deploys.
    Dev: just drop the files into `models/` (or `PIPER_MODELS_DIR`).
 3. Voice tab -> **Rescan**, select the voice, **Apply**.
@@ -86,9 +86,9 @@ Multiple editors: every change carries the config revision it was based on. If s
 Pause: the bot stops reading messages for that guild (nothing new is queued). Commands (`!join`, `!skip`, ...) still work in the chosen channel, and clips already queued finish unless you press Clear/Skip.
 
 Security notes:
-- No application-layer auth. Trust boundary = who can reach the port: loopback plus Tailscale only, narrowed by your Tailscale ACLs / zero-trust proxy. Two mechanisms enforce it: the bind policy (only loopback/Tailscale addresses are listened on) and a peer-address check on every request (source must be loopback or Tailscale, else `403 bad_peer`), because Linux's weak-host model lets a LAN device route to the Tailscale IP via the LAN address. Recommended extra: host firewall rules (`iptables -I INPUT -d 100.64.0.0/10 ! -i tailscale0 -j DROP`, `ip6tables -I INPUT -d fd7a:115c:a1e0::/48 ! -i tailscale0 -j DROP`). Anyone who can reach it can change the bot's channel, pause/skip/clear the queue, swap the voice, make the bot speak test phrases, and post messages as the bot in the configured channel.
+- No application-layer auth. Trust boundary = who can reach the port: loopback plus Tailscale only, narrowed by your Tailscale ACLs / zero-trust proxy. Two mechanisms enforce it: the bind policy (only loopback/Tailscale addresses are listened on) and a peer-address check on every request (source must be loopback or Tailscale, else `403 bad_peer`), because Linux's weak-host model lets a LAN device route to the Tailscale IP via the LAN address. Recommended extra: host firewall rules (`iptables -I INPUT -d 100.64.0.0/10 ! -i tailscale0 -j DROP`, `ip6tables -I INPUT -d fd7a:115c:a1e0::/48 ! -i tailscale0 -j DROP`). Anyone who can reach the GUI can change the configured channel, pause/resume, skip and clear the queue, swap the voice, make the bot speak test phrases, and post as the bot in the configured channel (mentions limited to <=10 distinct members who can see the channel; 10 sends per 60 s plus a 2 s gap per guild).
 - Host allowlist on every request (DNS-rebinding defense) and an Origin check on writes (a cross-site `Origin` gets `403 bad_origin`, and `Sec-Fetch-Site: cross-site` is refused on writes and on all `/api/*` requests; a missing Origin, e.g. curl, is allowed). Strong CSP, no cookies. Plain HTTP: it is safe only because of the network boundary.
-- Accepted limitation: any local process or account on the server can reach `127.0.0.1:8765` and change the channel. Do not run untrusted users on this host.
+- Accepted limitation: any local process or account on the server can reach `127.0.0.1:8765` and can change the configured channel, pause/resume, skip and clear the queue, swap the voice, make the bot speak test phrases, and post as the bot in the configured channel (mentions limited to <=10 distinct members who can see the channel; 10 sends per 60 s plus a 2 s gap per guild). Do not run untrusted users on this host.
 - If you put a proxy in front, disable response buffering for `/api/events` (SSE); the server sends `X-Accel-Buffering: no` but the proxy must honor it.
 
 ## Behavior
@@ -112,7 +112,7 @@ Roles: devs edit the repo (group `devteam`); an admin with real sudo deploys and
 ```bash
 sudo scripts/setup_system.sh            # service user, /opt/tts-bot (root-owned), sudoers, unit
 sudo scripts/install_token.sh --system  # token -> /etc/tts-bot/token (root:root 600)
-sudo scripts/deploy.sh                  # byte-compile, copy *.py + static/ + models to /opt/tts-bot, prune stale files, restart
+sudo scripts/deploy.sh                  # byte-compile, copy *.py + static/ + models to /opt/tts-bot, prune stale *.py/static files (never prune models/), restart
 sudo systemctl enable tts_bot
 ```
 Devs (no password) can: `sudo systemctl start|stop|restart tts_bot`, `systemctl status tts_bot`, `journalctl -u tts_bot` (after re-login for the `systemd-journal` group). They cannot read the token or change deployed code.
