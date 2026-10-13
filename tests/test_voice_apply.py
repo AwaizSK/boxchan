@@ -30,6 +30,7 @@ class FakeEngine:
         self.model_path = Path(model)
         self.config_path = Path(model + ".json")
         self.ready, self.loading = ready, False
+        self.cuda_active = False  # Mock GPU status
         self.calls, self.fail_next, self.gate, self.started = [], [], None, None
         self.load_results = []
 
@@ -119,7 +120,7 @@ class ApplyVoiceTests(ApplyBase):
         evs = self.events()
         self.assertEqual([e["type"] for e in evs], ["voice", "voice", "config"])
         self.assertEqual(evs[0], {"type": "voice", "loading": True})
-        self.assertEqual(evs[1], {"type": "voice", "loading": False, "current": "alpha", "error": None})
+        self.assertEqual(evs[1], {"type": "voice", "loading": False, "current": "alpha", "error": None, "cuda": False})
         self.assertEqual(evs[2]["change"], {"guild_id": None, "field": "voice", "old": None, "new": "alpha"})
 
     async def test_conflict_before_engine_is_touched(self):
@@ -153,7 +154,7 @@ class ApplyVoiceTests(ApplyBase):
         self.assertEqual(self.engine.model_name, "default")
         evs = self.events()
         self.assertEqual([e["type"] for e in evs], ["voice", "voice"])
-        self.assertEqual(evs[1], {"type": "voice", "loading": False, "current": "default", "error": "load_failed"})
+        self.assertEqual(evs[1], {"type": "voice", "loading": False, "current": "default", "error": "load_failed", "cuda": False})
 
     async def test_none_reverts_to_env_default(self):
         await self.ctl.apply_voice("alpha", None, "ed")

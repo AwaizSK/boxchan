@@ -461,7 +461,8 @@ class Controller:
 
     def voice_summary(self) -> dict:
         return {"current": engine.model_name if engine.ready else None,
-                "configured": config.voice, "loading": engine.loading}
+                "configured": config.voice, "loading": engine.loading,
+                "cuda": engine.cuda_active if engine.ready else None}
 
     async def list_voices(self) -> dict:
         """Rescans the models folder on every call (this is the GUI's Rescan)."""
@@ -471,7 +472,8 @@ class Controller:
     def _publish_voice(self, loading: bool, error: str | None = None) -> None:
         ev = {"type": "voice", "loading": loading}
         if not loading:
-            ev.update(current=engine.model_name if engine.ready else None, error=error)
+            ev.update(current=engine.model_name if engine.ready else None, error=error,
+                     cuda=engine.cuda_active if engine.ready else None)
         config.hub.publish(ev)
 
     async def apply_voice(self, name: str | None, expected_rev: int | None, editor: str) -> dict:

@@ -175,15 +175,30 @@ class ReloadTests(EngineBase):
         self.assertTrue(self.engine.ready)
         self.assertEqual(self.engine.model_name, "b")
 
-    async def test_cpu_fallback_path(self):
+    async def test_refuses_gpu_to_cpu_downgrade(self):
+        """When current voice runs on CUDA and new voice can only run on CPU, refuse the swap."""
         self.load_a()
         self.assertTrue(self.engine.cuda_active)
         self.piper.plan["b"] = {"cuda_fails": True}
+        with self.assertLogs("tts_engine", "WARNING"), self.assertRaises(VoiceLoadError):
+            await self.engine.reload(self.p("b"), self.p("b") + ".json")
+        # Old voice and cuda_active unchanged
+        self.assertTrue(self.engine.cuda_active)
+        self.assertEqual(self.engine.voice.tag, "a")
+        self.assertFalse(self.engine.loading)
+
+    async def test_cpu_to_cpu_swap_allowed(self):
+        """CPU-to-CPU swaps are allowed (initial load may be CPU if CUDA unavailable)."""
+        # Set up so CUDA is unavailable (force CPU-only)
+        self.engine._backend = lambda: (["CPUExecutionProvider"], self.piper)
+        self.load_a()
+        self.assertFalse(self.engine.cuda_active)
+        self.assertEqual(self.engine.voice.tag, "a")
+        # Now swap to another CPU-only voice
         with self.assertLogs("tts_engine", "INFO"):
             await self.engine.reload(self.p("b"), self.p("b") + ".json")
         self.assertFalse(self.engine.cuda_active)
         self.assertEqual(self.engine.voice.tag, "b")
-        self.assertIn(("b", False), self.piper.calls)
 
     async def test_loading_flag_toggles(self):
         self.load_a()

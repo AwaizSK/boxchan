@@ -6,6 +6,7 @@ import re
 import tempfile
 import wave
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 
 import discord
@@ -27,6 +28,17 @@ RE_MD_CHARS = re.compile(r"[*_~>#`|]")
 RE_EXCESSIVE_PUNCT = re.compile(r"([!?,.:;~])\1{2,}")
 RE_REPEAT_LETTER = re.compile(r"([^\W\d_])\1{3,}")
 RE_SPACES = re.compile(r"\s+")
+
+
+@dataclass(frozen=True)
+class VoiceState:
+    """Immutable snapshot of the loaded Piper voice state. Assigned atomically to prevent event-loop
+    readers from seeing a half-swapped state (e.g. new voice with old model_path)."""
+    voice: object  # PiperVoice
+    sample_rate: int
+    model_path: Path
+    config_path: Path
+    cuda_active: bool
 
 
 def _normalize(text: str, max_chars: int, user, role, channel) -> str | None:
@@ -85,17 +97,36 @@ class TTSEngine:
     """Single GPU context: one worker thread + asyncio.Lock serialize all inference."""
 
     def __init__(self, model_path: str, config_path: str | None = None):
-        self.model_path = Path(model_path)
-        self.config_path = Path(config_path) if config_path else Path(str(model_path) + ".json")
-        self.voice = None
-        self.sample_rate = 22050
-        self.cuda_active = False
+        self._state = VoiceState(voice=None, sample_rate=22050, model_path=Path(model_path),
+                                config_path=Path(config_path) if config_path else Path(str(model_path) + ".json"),
+                                cuda_active=False)
         self.ready = False
         self._pending_reloads = 0
         self.tmp_dir = Path(tempfile.gettempdir()) / "tts_bot"
         self.tmp_dir.mkdir(parents=True, exist_ok=True)
         self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="piper")
         self._lock: asyncio.Lock | None = None
+
+    # Backwards-compatible properties for existing code and tests
+    @property
+    def voice(self):
+        return self._state.voice
+
+    @property
+    def sample_rate(self):
+        return self._state.sample_rate
+
+    @property
+    def model_path(self):
+        return self._state.model_path
+
+    @property
+    def config_path(self):
+        return self._state.config_path
+
+    @property
+    def cuda_active(self):
+        return self._state.cuda_active
 
     @property
     def loading(self) -> bool:
@@ -155,11 +186,11 @@ class TTSEngine:
         except Exception:
             log.exception("model load failed")
             return False
-        self.model_path, self.config_path = target_model, target_config
-        self.voice, self.cuda_active = voice, cuda
-        self.sample_rate = voice.config.sample_rate
+        rate = voice.config.sample_rate
+        self._state = VoiceState(voice=voice, sample_rate=rate, model_path=target_model,
+                               config_path=target_config, cuda_active=cuda)
         self.ready = True
-        log.info("Piper ready (model=%s, cuda=%s, rate=%d)", self.model_name, self.cuda_active, self.sample_rate)
+        log.info("Piper ready (model=%s, cuda=%s, rate=%d)", self.model_name, cuda, rate)
         return True
 
     @staticmethod
@@ -170,7 +201,8 @@ class TTSEngine:
         return self._synth_with(self.voice, text)
 
     def _reload_blocking(self, model_path: Path, config_path: Path) -> None:
-        """Worker thread. Build + warm up the candidate; swap only on success."""
+        """Worker thread. Build + warm up the candidate; swap only on success. Refuses GPU->CPU
+        downgrade if the current voice is already on GPU."""
         for p in (model_path, config_path):
             if not p.is_file():
                 log.error("Model file missing: %s", p)
@@ -183,12 +215,16 @@ class TTSEngine:
         except Exception as e:
             log.exception("voice reload failed; keeping the current voice")
             raise VoiceLoadError() from e
+        # Check for silent GPU->CPU downgrade: if current voice is on CUDA and candidate would fall
+        # back to CPU, refuse the swap to avoid degraded performance without user awareness.
         if self.cuda_active and not cuda:
-            log.warning("Voice swapped with CPU fallback (CUDA init failed for %s); performance may be degraded", model_path.name)
-        old = self.voice
+            log.warning("refusing voice swap: currently using CUDA but candidate would run on CPU")
+            raise VoiceLoadError("GPU unavailable for this voice")
+        old = self._state.voice
         # Single step on the only inference thread: no synthesis can observe a half-swapped engine.
-        self.model_path, self.config_path = model_path, config_path
-        self.voice, self.sample_rate, self.cuda_active, self.ready = voice, rate, cuda, True
+        self._state = VoiceState(voice=voice, sample_rate=rate, model_path=model_path,
+                                config_path=config_path, cuda_active=cuda)
+        self.ready = True
         del old
         gc.collect()  # drop the old ORT session now so its (GPU) memory is released
         log.info("Piper voice swapped (model=%s, cuda=%s, rate=%d)", self.model_name, cuda, rate)
