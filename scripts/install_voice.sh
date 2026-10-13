@@ -55,7 +55,13 @@ validate_voice_files "$stage/$stem.onnx" "$stage/$stem.onnx.json" "$PY"
 chown root:root "$stage/$stem.onnx" "$stage/$stem.onnx.json"
 chmod 644 "$stage/$stem.onnx" "$stage/$stem.onnx.json"
 # config first, model last: the bot lists a voice only when both exist, so a rescan never sees a half install
-mv -f -- "$stage/$stem.onnx.json" "$MODELS/$stem.onnx.json"
-mv -f -- "$stage/$stem.onnx" "$MODELS/$stem.onnx"
+# Use mv -n (no-clobber) to prevent a race between the check and the move: fail if target appeared.
+if [ "$force" -ne 1 ]; then
+  mv -n -- "$stage/$stem.onnx.json" "$MODELS/$stem.onnx.json" || { echo "Voice '$stem' was installed by another process; aborting." >&2; exit 1; }
+  mv -n -- "$stage/$stem.onnx" "$MODELS/$stem.onnx" || { echo "Voice '$stem' was installed by another process; aborting." >&2; exit 1; }
+else
+  mv -f -- "$stage/$stem.onnx.json" "$MODELS/$stem.onnx.json"
+  mv -f -- "$stage/$stem.onnx" "$MODELS/$stem.onnx"
+fi
 echo "Installed voice '$stem' in $MODELS (no restart needed)."
 echo "Rescan in the GUI (Voice tab -> Rescan), then select it and press Apply."

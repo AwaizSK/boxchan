@@ -233,7 +233,7 @@ if (typeof document !== 'undefined') (function () {
     abort: null,
     started: false,
     tab: ['voice', 'messages'].includes(store.get(sessionStorage, 'tab')) ? store.get(sessionStorage, 'tab') : 'channel',
-    voice: { list: null, current: null, configured: null, loading: false },
+    voice: { list: null, current: null, configured: null, loading: false, cuda: null },
     vsel: null,           // highlighted (not yet applied) voice stem
     vbusy: false,         // our own apply/say request in flight
     vsig: '',
@@ -506,6 +506,12 @@ if (typeof document !== 'undefined') (function () {
   const V = () => S.voice;
   const configuredVoice = () => (S.cfg ? S.cfg.voice || null : V().configured);
 
+  // Monotonic sequence counter for voice SSE events: prevents a stale GET response from overwriting
+  // a newer SSE loading state. Incremented when a voice SSE event arrives; recorded when GET starts.
+  let voiceEventSeq = 0;
+  function nextVoiceEventSeq() { return voiceEventSeq; }
+  function onVoiceEvent() { voiceEventSeq++; }
+
   function setTab(tab) {
     S.tab = tab;
     store.set(sessionStorage, 'tab', tab);
@@ -518,11 +524,15 @@ if (typeof document !== 'undefined') (function () {
     renderVoice();
   }
 
-  function mergeVoiceSummary(v, fromSse) {
+  function mergeVoiceSummary(v, fromSse, seqAtRequest) {
     if (!v) return;
     V().current = v.current == null ? null : v.current;
     V().configured = v.configured == null ? null : v.configured;
-    if (fromSse || S.conn !== 'live') V().loading = !!v.loading;
+    // Only apply loading from GET if the SSE sequence hasn't advanced since the request started.
+    // SSE events always update loading (fromSse=true) or if offline (conn !== 'live').
+    if (fromSse || S.conn !== 'live' || seqAtRequest === undefined || voiceEventSeq === seqAtRequest) {
+      V().loading = !!v.loading;
+    }
     renderVoice();
   }
 
@@ -530,10 +540,11 @@ if (typeof document !== 'undefined') (function () {
   async function loadVoices(manual) {
     if (vlBusy) return;
     vlBusy = true;
+    const seqAtRequest = nextVoiceEventSeq();  // Record sequence at request start
     try {
       const d = await api('GET', '/api/voices');
       V().list = d.voices || [];
-      mergeVoiceSummary(d, false);
+      mergeVoiceSummary(d, false, seqAtRequest);
       if (manual) toast('Found ' + V().list.length + ' voice' + (V().list.length === 1 ? '' : 's'));
     } catch (e) {
       if (!e.denied) toast('Could not load voices: ' + friendly(e), { error: true });
@@ -547,7 +558,7 @@ if (typeof document !== 'undefined') (function () {
 
   function renderVoiceList() {
     const v = V(), names = v.list ? v.list.map((x) => x.name) : null, conf = configuredVoice();
-    const sig = JSON.stringify([v.list, v.current, conf, S.vsel]);
+    const sig = JSON.stringify([v.list, v.current, conf, S.vsel, v.cuda]);
     const warn = voiceWarning(conf, v.current, names);
     $('v-warn').hidden = !warn;
     $('v-warn').textContent = warn || '';
@@ -564,8 +575,10 @@ if (typeof document !== 'undefined') (function () {
       li.appendChild(el('span', 'nm', voiceTitle(x.name)));
       if (x.quality) li.appendChild(el('span', 'badge q', x.quality));
       li.appendChild(el('span', 'meta', [x.language, x.size_mb + ' MB'].filter(Boolean).join(' \u00b7 ')));
-      if (x.name === v.current) li.appendChild(el('span', 'badge', 'Active'));
-      else if (x.name === conf) li.appendChild(el('span', 'badge saved', 'Saved'));
+      if (x.name === v.current) {
+        li.appendChild(el('span', 'badge', 'Active'));
+        if (v.cuda === false) li.appendChild(el('span', 'badge', 'CPU'));
+      } else if (x.name === conf) li.appendChild(el('span', 'badge saved', 'Saved'));
       ul.appendChild(li);
     }
     ul.scrollTop = top;
@@ -868,6 +881,7 @@ if (typeof document !== 'undefined') (function () {
     if (name === 'hello') {
       applyState({ config: d.snapshot, guilds: d.guilds }, true);
       mergeVoiceSummary(d.voices, true);
+      onVoiceEvent();  // hello carries a voice summary
     } else if (name === 'config') {
       const ch = d.change || {};
       applySnapshot(d.snapshot, false);
@@ -883,9 +897,11 @@ if (typeof document !== 'undefined') (function () {
       }
       if (ch.field === 'voice' && !mine) toast(voiceSwitchText(d.snapshot.updated_by, ch.new));
     } else if (name === 'voice') {
+      onVoiceEvent();  // increment sequence counter for this SSE voice event
       V().loading = !!d.loading;
       if (!d.loading) {
         if ('current' in d) V().current = d.current;
+        if ('cuda' in d) V().cuda = d.cuda;
         if (V().list) loadVoices(false);
       }
       renderVoice();
