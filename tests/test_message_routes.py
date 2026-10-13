@@ -7,9 +7,16 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import test_webui as tw  # noqa: E402
+import botimport  # noqa: E402  (hermetic import of bot.py)
+import discord  # noqa: E402
+from aiohttp.test_utils import TestClient, TestServer  # noqa: E402
+from test_controller import make_channel, make_guild  # noqa: E402
+from test_messages import Clock  # noqa: E402
 
 import webui  # noqa: E402
-from messages import MessageError  # noqa: E402
+from messages import MessageError, SendLimiter  # noqa: E402
+
+bot = botimport.bot
 
 ED = {"X-Editor": "alice"}
 SECRETS = ("/", "Traceback", "Error:")
@@ -151,7 +158,7 @@ class SendRouteTests(Routes):
         for _ in range(100):
             if self.ctl.send_calls:
                 break
-            await asyncio.sleep(0.01)
+            await asyncio.sleep(0)
         task.cancel()
         with self.assertRaises(asyncio.CancelledError):
             await task
@@ -160,9 +167,53 @@ class SendRouteTests(Routes):
         for _ in range(100):
             if finished:
                 break
-            await asyncio.sleep(0.01)
+            await asyncio.sleep(0)
         self.assertEqual(len(finished), 1)
         self.assertEqual(len(self.ctl.send_calls), 1)  # one send, never repeated
+
+
+class RealControllerMentionCapTests(Routes):
+    """The REAL bot.Controller behind webui.make_app: the 10-distinct-user cap end to end."""
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.ch = make_channel(100, "general", 0)
+        self.ch.send = mock.AsyncMock(return_value=mock.MagicMock(id=999))
+        self.guild = make_guild(1, "G", [self.ch])
+        self.guild.me = mock.MagicMock()
+        self.guild.get_member.side_effect = lambda uid: mock.MagicMock(id=uid)  # all can view (default perms)
+        self.limiter = mock.Mock(wraps=SendLimiter(clock=Clock()))
+        self.real = bot.Controller(limiter=self.limiter)
+        for p in (mock.patch.object(type(bot.bot), "guilds", new_callable=mock.PropertyMock, return_value=[self.guild]),
+                  mock.patch.object(bot.bot, "get_guild", side_effect=lambda g: self.guild if g == 1 else None),
+                  mock.patch.object(bot.config, "channel_for", return_value=100)):
+            p.start()
+            self.addCleanup(p.stop)
+        app = webui.make_app(self.config, self.real, allowed_hosts=[], status_interval=0.05, static_dir=self.static)
+        self.real_client = TestClient(TestServer(app))
+        await self.real_client.start_server()
+        self.addAsyncCleanup(self.real_client.close)
+
+    def post(self, content):
+        return self.real_client.post("/api/guilds/1/send", json={"content": content}, headers=ED)
+
+    async def test_11_distinct_mentions_rejected_400_without_send_or_slot(self):
+        r = await self.post(" ".join(f"<@{i}>" for i in range(1, 12)))
+        await self.assert_error(r, 400, "bad_mention")
+        self.ch.send.assert_not_awaited()
+        self.limiter.reserve.assert_not_called()
+
+    async def test_10_distinct_mentions_with_duplicates_succeeds(self):
+        ids = list(range(1, 11))
+        r = await self.post(" ".join(f"<@{i}>" for i in ids) + " again <@3> <@!3> <@3>")
+        self.assertEqual(r.status, 200)
+        self.assertEqual(await r.json(), {"ok": True, "message_id": "999"})
+        self.ch.send.assert_awaited_once()
+        allowed = self.ch.send.await_args.kwargs["allowed_mentions"]
+        self.assertEqual(sorted(u.id for u in allowed.users), ids)
+        self.assertFalse(allowed.everyone)
+        self.assertFalse(allowed.roles)
+        self.limiter.reserve.assert_called_once_with(1)
 
 
 class GuardTests(Routes):
