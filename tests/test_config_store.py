@@ -215,5 +215,106 @@ class ConfigStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(glob.glob(os.path.join(self._td.name, "*.tmp")), [])
 
 
+class VoiceConfigTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.addCleanup(self._td.cleanup)
+        self.path = os.path.join(self._td.name, "config.json")
+
+    def write_raw(self, data):
+        with open(self.path, "w") as f:
+            json.dump(data, f)
+
+    async def test_default_none_and_in_snapshot(self):
+        s = ConfigStore(self.path)
+        self.assertIsNone(s.voice)
+        self.assertIn("voice", s.snapshot())
+        self.assertIsNone(s.snapshot()["voice"])
+
+    async def test_set_voice_bumps_rev_and_publishes_global_event(self):
+        s = ConfigStore(self.path)
+        q = s.hub.subscribe()
+        snap = await s.set_voice("en_US-amy-medium", expected_rev=0, editor="a")
+        self.assertEqual((snap["rev"], snap["voice"], snap["updated_by"]), (1, "en_US-amy-medium", "a"))
+        ev = q.get_nowait()
+        self.assertEqual(ev["type"], "config")
+        self.assertEqual(ev["change"], {"guild_id": None, "field": "voice", "old": None, "new": "en_US-amy-medium"})
+        self.assertEqual(ev["snapshot"], snap)
+        snap = await s.set_voice(None, expected_rev=1, editor="b")
+        self.assertEqual((snap["rev"], snap["voice"]), (2, None))
+        self.assertEqual(q.get_nowait()["change"]["old"], "en_US-amy-medium")
+
+    async def test_noop_does_not_bump_or_publish(self):
+        s = ConfigStore(self.path)
+        await s.set_voice("v", expected_rev=None, editor="a")
+        q = s.hub.subscribe()
+        snap = await s.set_voice("v", expected_rev=1, editor="b")
+        self.assertEqual((snap["rev"], snap["updated_by"]), (1, "a"))
+        self.assertTrue(q.empty())
+        s2 = ConfigStore(os.path.join(self._td.name, "other.json"))
+        snap = await s2.set_voice(None, expected_rev=None, editor="a")  # default -> default
+        self.assertEqual(snap["rev"], 0)
+
+    async def test_stale_rev_conflicts_without_mutation(self):
+        s = ConfigStore(self.path)
+        await s.set_channel(1, 10, expected_rev=None, editor="a")
+        q = s.hub.subscribe()
+        with self.assertRaises(ConflictError) as cm:
+            await s.set_voice("v", expected_rev=0, editor="b")
+        self.assertEqual(cm.exception.snapshot["rev"], 1)
+        self.assertIsNone(s.voice)
+        self.assertTrue(q.empty())
+
+    async def test_none_rev_always_applies(self):
+        s = ConfigStore(self.path)
+        await s.set_channel(1, 10, expected_rev=None, editor="a")
+        await s.set_voice("v", expected_rev=None, editor="a")
+        self.assertEqual((s.voice, s.rev), ("v", 2))
+
+    async def test_persist_failure_rolls_back(self):
+        s = ConfigStore(self.path)
+        await s.set_voice("old", expected_rev=None, editor="a")
+        before = s.snapshot()
+        q = s.hub.subscribe()
+        with mock.patch.object(config_store, "atomic_write_json", side_effect=OSError("disk")):
+            with self.assertRaises(OSError):
+                await s.set_voice("new", expected_rev=None, editor="b")
+        self.assertEqual(s.snapshot(), before)
+        self.assertTrue(q.empty())
+
+    async def test_rejects_non_string(self):
+        s = ConfigStore(self.path)
+        for bad in (5, ["x"], {"a": 1}, True):
+            with self.assertRaises(TypeError):
+                await s.set_voice(bad, expected_rev=None, editor="a")
+        self.assertEqual(s.rev, 0)
+
+    async def test_round_trip(self):
+        s = ConfigStore(self.path)
+        await s.set_channel(1, 10, expected_rev=None, editor="a")
+        await s.set_voice("en_GB-alba-medium", expected_rev=None, editor="a")
+        s2 = ConfigStore(self.path)
+        self.assertEqual(s2.voice, "en_GB-alba-medium")
+        self.assertEqual(s2.snapshot(), s.snapshot())
+        with open(self.path) as f:
+            self.assertEqual(json.load(f)["voice"], "en_GB-alba-medium")
+
+    async def test_old_file_without_voice_loads(self):
+        self.write_raw({"rev": 4, "updated_by": "x", "updated_at": 1.0,
+                        "guilds": {"1": {"channel_id": 10, "enabled": False}}})
+        s = ConfigStore(self.path)
+        self.assertIsNone(s.voice)
+        self.assertEqual((s.rev, s.channel_for(1), s.is_enabled(1)), (4, 10, False))
+        await s.set_voice("v", expected_rev=4, editor="a")
+        self.assertEqual(ConfigStore(self.path).voice, "v")
+
+    async def test_invalid_voice_types_load_as_none(self):
+        for bad in (5, ["x"], {"a": 1}, True, "", 1.5):
+            self.write_raw({"rev": 1, "voice": bad, "guilds": {}})
+            s = ConfigStore(self.path)
+            self.assertIsNone(s.voice, bad)
+            self.assertEqual(s.rev, 1)
+
+
 if __name__ == "__main__":
     unittest.main()

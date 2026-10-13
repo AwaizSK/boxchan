@@ -71,6 +71,7 @@ class ConfigStore:
         self.updated_by = None
         self.updated_at = None
         self._guilds: dict[str, dict] = {}
+        self.voice: str | None = None  # GLOBAL Piper voice (file stem); None = env default
         self._lock = asyncio.Lock()
         self._load()
 
@@ -89,12 +90,15 @@ class ConfigStore:
             self.updated_by = data.get("updated_by")
             self.updated_at = data.get("updated_at")
             self._guilds = guilds
+            voice = data.get("voice")
+            self.voice = voice if isinstance(voice, str) and voice else None
         except FileNotFoundError:
             pass
         except Exception:
             log.exception("could not load %s; starting with empty config", self.path)
             self._quarantine()
             self.rev, self.updated_by, self.updated_at, self._guilds = 0, None, None, {}
+            self.voice = None
 
     def _quarantine(self) -> None:
         """Best-effort: move an unreadable config aside so the next write cannot destroy it."""
@@ -110,6 +114,7 @@ class ConfigStore:
             "rev": self.rev,
             "updated_by": self.updated_by,
             "updated_at": self.updated_at,
+            "voice": self.voice,
             "guilds": {g: dict(e) for g, e in self._guilds.items()},
         }
 
@@ -136,6 +141,36 @@ class ConfigStore:
     async def set_enabled(self, guild_id: int, enabled: bool, *,
                           expected_rev: int | None, editor: str) -> dict:
         return await self._apply(guild_id, "enabled", bool(enabled), expected_rev, editor)
+
+    async def set_voice(self, name: str | None, *, expected_rev: int | None, editor: str) -> dict:
+        """Global voice (file stem or None). Same semantics as set_enabled: stale rev -> ConflictError,
+        unchanged value -> no rev bump and no event, persist failure -> rollback and re-raise."""
+        if name is not None and not isinstance(name, str):
+            raise TypeError("voice must be a string or None")
+        async with self._lock:
+            if expected_rev is not None and expected_rev != self.rev:
+                raise ConflictError(self.snapshot())
+            if name == self.voice:
+                return self.snapshot()
+            old = self.voice
+            prev = (self.rev, self.updated_by, self.updated_at)
+            self.voice = name
+            self.rev += 1
+            self.updated_by = editor
+            self.updated_at = time.time()
+            snap = self.snapshot()
+            try:
+                await asyncio.to_thread(atomic_write_json, snap, self.path)
+            except BaseException:
+                self.rev, self.updated_by, self.updated_at = prev
+                self.voice = old
+                raise
+            self.hub.publish({
+                "type": "config",
+                "snapshot": snap,
+                "change": {"guild_id": None, "field": "voice", "old": old, "new": name},
+            })
+            return snap
 
     async def seed_channel(self, guild_id: int, channel_id: int) -> bool:
         async with self._lock:

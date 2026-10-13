@@ -10,8 +10,9 @@ import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 
-from config_store import ConfigStore, atomic_write_json
-from tts_engine import TTSEngine, clean_discord_text
+from config_store import ConfigStore, ConflictError, atomic_write_json
+from tts_engine import TTSEngine, clean_discord_text, clean_plain_text
+from voices import BadVoiceError, SayError, VoiceLoadError, discover_voices, resolve_voice
 from webui import (detect_tailscale_addrs, make_app, parse_allowed_hosts, start_webui,
                    validate_bind_hosts)
 
@@ -50,6 +51,8 @@ if TOKEN and not TOKEN_RE.match(TOKEN):
 PREFIX = os.getenv("COMMAND_PREFIX", "!")
 MODEL_PATH = os.getenv("PIPER_MODEL_PATH", "models/en_US-lessac-medium.onnx")
 CONFIG_PATH = os.getenv("PIPER_CONFIG_PATH") or None
+MODELS_DIR = os.getenv("PIPER_MODELS_DIR") or os.path.dirname(MODEL_PATH) or "."
+SAY_MAX_CHARS = 200
 SEED_CHANNEL_IDS = {int(x) for x in os.getenv("TTS_CHANNEL_ID", "").replace(" ", "").split(",") if x.isdigit()}
 MAX_CHARS = int(os.getenv("MAX_CHARS", "300"))
 MAX_QUEUE = int(os.getenv("MAX_QUEUE", "20"))
@@ -441,8 +444,87 @@ def _guild_status(guild: discord.Guild) -> dict:
     }
 
 
+def default_voice_paths() -> tuple[str, str]:
+    """The env-configured fallback voice (PIPER_MODEL_PATH / PIPER_CONFIG_PATH)."""
+    return MODEL_PATH, CONFIG_PATH or MODEL_PATH + ".json"
+
+
 class Controller:
-    """The only surface the web UI touches. Sync, non-blocking; call from the event loop."""
+    """The only surface the web UI touches. Methods are non-blocking; call from the event loop
+    (the voice methods are async because they scan disk / reload the engine off-loop)."""
+
+    def __init__(self):
+        self._voice_lock = asyncio.Lock()  # one swap at a time (engine.reload also serializes, this orders the whole flow)
+
+    def voice_summary(self) -> dict:
+        return {"current": engine.model_name if engine.ready else None,
+                "configured": config.voice, "loading": engine.loading}
+
+    async def list_voices(self) -> dict:
+        """Rescans the models folder on every call (this is the GUI's Rescan)."""
+        voices = await asyncio.to_thread(discover_voices, MODELS_DIR)
+        return {"voices": voices, **self.voice_summary()}
+
+    def _publish_voice(self, loading: bool, error: str | None = None) -> None:
+        ev = {"type": "voice", "loading": loading}
+        if not loading:
+            ev.update(current=engine.model_name if engine.ready else None, error=error)
+        config.hub.publish(ev)
+
+    async def apply_voice(self, name: str | None, expected_rev: int | None, editor: str) -> dict:
+        """Hot-swap the global voice. Raises BadVoiceError, ConflictError, VoiceLoadError, OSError."""
+        async with self._voice_lock:
+            if name is None:
+                target = default_voice_paths()
+            else:
+                target = await asyncio.to_thread(resolve_voice, MODELS_DIR, name)  # BadVoiceError
+            # Stale-client detection happens HERE, before the engine is touched. The save below uses
+            # expected_rev=None on purpose: the engine has already swapped, so a rev bump from a
+            # concurrent channel/pause edit during the (slow) load must not discard the swap.
+            if expected_rev is not None and expected_rev != config.rev:
+                raise ConflictError(config.snapshot())
+            prev = (engine.model_path, engine.config_path) if engine.ready else None
+            self._publish_voice(True)
+            err = None
+            try:
+                await engine.reload(*target)
+            except VoiceLoadError:
+                err = "load_failed"
+                raise
+            finally:
+                self._publish_voice(False, err)
+            try:
+                return await config.set_voice(name, expected_rev=None, editor=editor)
+            except OSError:
+                if prev is not None:  # best effort: keep engine and saved config in agreement
+                    self._publish_voice(True)
+                    err = None
+                    try:
+                        await engine.reload(*prev)
+                    except VoiceLoadError:
+                        err = "load_failed"
+                        log.error("could not restore previous voice after a failed save")
+                    finally:
+                        self._publish_voice(False, err)
+                raise
+
+    def say(self, guild_id: int, text: str) -> dict:
+        """Queue a test phrase on this guild's normal audio path. Raises SayError."""
+        cleaned = clean_plain_text(text, SAY_MAX_CHARS)
+        if not cleaned:
+            raise SayError("bad_text")
+        guild = bot.get_guild(guild_id)
+        vc = guild.voice_client if guild else None
+        ga = audio.get(guild_id)
+        if not (vc and vc.is_connected() and ga and ga.worker and not ga.worker.done()):
+            raise SayError("not_connected")
+        if not engine.ready:
+            raise SayError("tts_unavailable")
+        try:
+            ga.queue.put_nowait(cleaned)
+        except asyncio.QueueFull:
+            raise SayError("queue_full") from None
+        return {"queued": True}
 
     def guilds_view(self) -> list[dict]:
         return [{
@@ -584,11 +666,29 @@ async def shutdown(b: commands.Bot) -> None:
     await b.close()
 
 
+async def load_engine() -> bool:
+    """Load the saved GUI voice if it still resolves (single load), else the env default.
+    A saved voice that is missing or fails to load is logged once and the default is used; the GUI
+    then shows configured != current."""
+    saved = config.voice
+    if saved:
+        try:
+            onnx, cfg = await asyncio.to_thread(resolve_voice, MODELS_DIR, saved)
+        except BadVoiceError:
+            log.warning("saved voice %r not found in the models folder; using the default voice", saved)
+        else:
+            if await asyncio.to_thread(engine.load, onnx, cfg):
+                return True
+            log.error("saved voice %r failed to load; falling back to the default voice", saved)
+    model, cfg = default_voice_paths()
+    return await asyncio.to_thread(engine.load, model, cfg)
+
+
 async def main() -> None:
     if not TOKEN:
         raise SystemExit("No token: set ~/.config/tts-bot/token (see README)")
     engine.purge_tmp()
-    if not await asyncio.to_thread(engine.load):
+    if not await load_engine():
         log.error("TTS engine failed to load; bot runs but cannot speak")
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):

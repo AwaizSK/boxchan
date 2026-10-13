@@ -16,10 +16,12 @@ from urllib.parse import unquote, urlsplit
 from aiohttp import web
 
 from config_store import ConflictError
+from voices import VOICE_NAME_RE, BadVoiceError, SayError, VoiceLoadError
 
 log = logging.getLogger("webui")
 
 MAX_BODY = 4096
+MAX_SAY_CHARS = 200
 RETRY_INTERVAL = 15.0
 ALLOWED_HOSTS_KEY = web.AppKey("allowed_hosts", set)
 SAFE_METHODS = frozenset({"GET", "HEAD"})
@@ -235,7 +237,7 @@ def wire_snapshot(snap: dict) -> dict:
 def wire_event(ev: dict) -> dict:
     if ev.get("type") == "config":
         ch = dict(ev["change"])
-        ch["guild_id"] = str(ch["guild_id"])
+        ch["guild_id"] = _s(ch["guild_id"])  # None (global change, e.g. voice) stays JSON null
         if ch.get("field") == "channel_id":
             ch["old"], ch["new"] = _s(ch["old"]), _s(ch["new"])
         return {**ev, "snapshot": wire_snapshot(ev["snapshot"]), "change": ch}
@@ -375,6 +377,57 @@ def make_app(config, controller, *, allowed_hosts, status_interval: float = 3.0,
             return _err("persist_failed", 500)
         return _json({"snapshot": wire_snapshot(snap)})
 
+    def voice_summary():
+        fn = getattr(controller, "voice_summary", None)
+        return fn() if fn else None
+
+    async def apply_voice(request):
+        editor = editor_of(request)
+        body = await body_of(request)
+        if "name" not in body:
+            return _err("bad_request", 400)
+        name = body["name"]
+        if name is not None:
+            if not isinstance(name, str):
+                return _err("bad_request", 400)
+            if VOICE_NAME_RE.fullmatch(name) is None:
+                return _err("bad_voice", 400)
+        try:
+            # shield: a client disconnect must not cancel a half-finished engine swap
+            snap = await asyncio.shield(controller.apply_voice(name, body.get("rev"), editor))
+        except ConflictError as e:
+            return _json({"error": "conflict", "snapshot": wire_snapshot(e.snapshot)}, 409)
+        except BadVoiceError:
+            return _err("bad_voice", 400)
+        except VoiceLoadError:
+            return _err("voice_load_failed", 422)
+        except OSError:
+            log.exception("config persist failed (voice)")
+            return _err("persist_failed", 500)
+        except Exception:
+            log.exception("voice change failed")
+            return _err("internal", 500)
+        return _json({"snapshot": wire_snapshot(snap)})
+
+    async def list_voices(request):
+        return _json(await controller.list_voices())
+
+    async def say(request):
+        gid = known_guild(request)
+        editor_of(request)
+        body = await body_of(request)
+        text = body.get("text")
+        if not isinstance(text, str) or not text.strip():
+            return _err("bad_request", 400)
+        if len(text) > MAX_SAY_CHARS:
+            return _err("too_long", 400)
+        try:
+            return _json(controller.say(gid, text))
+        except SayError as e:
+            if e.code == "bad_text":
+                return _err("bad_request", 400)
+            return _err(e.code, 409)
+
     # --- API ---
     async def state(request):
         return _json({"config": wire_snapshot(config.snapshot()), "guilds": controller.guilds_view()})
@@ -428,7 +481,8 @@ def make_app(config, controller, *, allowed_hosts, status_interval: float = 3.0,
 
         try:
             await send("hello", {"snapshot": wire_snapshot(config.snapshot()),
-                                 "guilds": controller.guilds_view()})
+                                 "guilds": controller.guilds_view(),
+                                 "voices": voice_summary()})
             loop = asyncio.get_running_loop()
             next_status = loop.time() + status_interval
             next_keep = loop.time() + keepalive_interval
@@ -472,6 +526,9 @@ def make_app(config, controller, *, allowed_hosts, status_interval: float = 3.0,
     app.router.add_put("/api/guilds/{gid}/enabled", put_enabled)
     app.router.add_post("/api/guilds/{gid}/skip", skip)
     app.router.add_post("/api/guilds/{gid}/clear", clear)
+    app.router.add_get("/api/voices", list_voices)
+    app.router.add_put("/api/voice", apply_voice)
+    app.router.add_post("/api/guilds/{gid}/say", say)
     app.router.add_get("/api/events", events)
     return app
 
