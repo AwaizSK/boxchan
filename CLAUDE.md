@@ -17,7 +17,7 @@ every decision: `docs/ARCHITECTURE.md` (read it before non-trivial changes).
   Never edit `config.json` or `ConfigStore._guilds` directly; writes use `atomic_write_json`.
 - The web UI talks to the bot only via `Controller` (bot.py); `webui.py` must not import `bot.py`.
 - Frontend: vanilla JS, no CDN/framework, no inline script/style, `textContent` only
-  (strict CSP; `tests/test_static.py` enforces it). Static payload stays < 56 KB (cap in `tests/test_static.py`).
+  (strict CSP; `tests/test_static.py` enforces it). Static payload stays < 60 KB (61440 bytes) (cap in `tests/test_static.py`).
 - Fail closed: unconfigured guild reads nothing; a GUI bind address outside loopback/Tailscale disables the GUI;
   `maybe_start_webui` must never crash the bot.
 - Do not run `scripts/deploy.sh`, `setup_system.sh` or anything with sudo unless asked.

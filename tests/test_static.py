@@ -28,7 +28,7 @@ class StaticContentTests(unittest.TestCase):
             size = os.path.getsize(os.path.join(STATIC, n))
             self.assertGreater(size, 0, n)
             total += size
-        self.assertLess(total, 57344)  # 56 KB cap (raised from 40 KB for the Messages tab)
+        self.assertLess(total, 61440)  # 60 KB cap (raised from 56 KB so the Messages-tab code stays readable)
 
     def test_voice_tab_ids_are_wired(self):
         html, js = read("index.html"), read("app.js")
