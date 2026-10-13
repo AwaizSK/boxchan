@@ -21,6 +21,15 @@ jobs:
           bash tests/test_deploy_validation.sh
           node tests/static_logic.js
 
+      - name: Link Models Directory
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/models"
+          if [ -d "/opt/tts-bot/models" ]; then
+            cp -n /opt/tts-bot/models/*.onnx /opt/tts-bot/models/*.onnx.json "$GITHUB_WORKSPACE/models/" 2>/dev/null || true
+          elif [ -d "/opt/workspace/boxchan/models" ]; then
+            cp -n /opt/workspace/boxchan/models/*.onnx /opt/workspace/boxchan/models/*.onnx.json "$GITHUB_WORKSPACE/models/" 2>/dev/null || true
+          fi
+
       - name: Deploy to /opt/tts-bot & Restart Service
         run: |
           sudo /opt/workspace/boxchan/scripts/deploy.sh "$GITHUB_WORKSPACE"
