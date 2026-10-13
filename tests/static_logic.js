@@ -84,10 +84,23 @@ assert.strictEqual(substituteTags('hey @J.R. (x) ok', [{ id: '5', label: 'J.R. (
 assert.strictEqual(substituteTags('@a @b', [{ id: '1', label: 'a' }, { id: '2', label: '1' }]), '<@1> @b');
 assert.strictEqual(substituteTags('@田中', [{ id: '9', label: '田中' }]), '<@9>');
 assert.strictEqual(substituteTags('line1\n@Bob\nline3', [bob]), 'line1\n<@11>\nline3');
-// segments (preview)
+// segments (preview) with glued/start-of-string tests for Safari compatibility
 assert.deepStrictEqual(segmentText('a @Bob b', [bob]), [{ text: 'a ', tag: null }, { text: '@Bob', tag: bob }, { text: ' b', tag: null }]);
 assert.deepStrictEqual(segmentText('', [bob]), [{ text: '', tag: null }]);
 assert.deepStrictEqual(segmentText('plain', []), [{ text: 'plain', tag: null }]);
+// start of string case
+assert.deepStrictEqual(segmentText('@Bob', [bob]), [{ text: '@Bob', tag: bob }]);
+// glued to word character - should NOT match
+assert.deepStrictEqual(segmentText('prefix@Bob', [bob]), [{ text: 'prefix@Bob', tag: null }]);
+// glued to digit - should NOT match
+assert.deepStrictEqual(segmentText('5@Bob', [bob]), [{ text: '5@Bob', tag: null }]);
+// glued to underscore - should NOT match
+assert.deepStrictEqual(segmentText('_@Bob', [bob]), [{ text: '_@Bob', tag: null }]);
+// test that lookbehind patterns are not in app.js source
+const fs = require('fs');
+const appSource = fs.readFileSync(__dirname + '/../static/app.js', 'utf8');
+assert.strictEqual(appSource.includes('(?<='), false, 'app.js must not contain positive lookbehind (?<=');
+assert.strictEqual(appSource.includes('(?<!'), false, 'app.js must not contain negative lookbehind (?<!');
 // chip active / inactive
 assert.deepStrictEqual(Array.from(activeTagIds('hi @Bob', [bob, al])), ['11']);
 assert.deepStrictEqual(Array.from(activeTagIds('hi', [bob, al])), []);

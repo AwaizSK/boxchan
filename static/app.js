@@ -123,6 +123,7 @@ const cpLen = (s) => Array.from(String(s)).length;
 
 // Split text into plain and tagged parts. Only the exact "@label" of a tagged chip matches
 // (longest label first, single pass, not glued to word characters); nothing is ever guessed.
+// Uses manual preceding-character check instead of lookbehind for Safari < 16.4 compatibility.
 function segmentText(text, tags) {
   const list = (tags || []).filter((t) => t && t.label).sort((a, b) => b.label.length - a.label.length);
   text = String(text);
@@ -130,18 +131,13 @@ function segmentText(text, tags) {
   const by = new Map();
   for (const t of list) if (!by.has('@' + t.label)) by.set('@' + t.label, t);
   const alt = Array.from(by.keys()).map((k) => k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
-  let re, useFallback = false;
-  try {
-    re = new RegExp('(?<![\\p{L}\\p{N}_])(?:' + alt + ')(?![\\p{L}\\p{N}_])', 'gu');
-  } catch (e) {
-    useFallback = true;
-    re = new RegExp('(?:' + alt + ')(?![\\p{L}\\p{N}_])', 'gu');
-  }
+  const re = new RegExp('(?:' + alt + ')(?![\\p{L}\\p{N}_])', 'gu');
   const isWord = (c) => /[\p{L}\p{N}_]/u.test(c);
   const out = [];
   let last = 0, m;
   while ((m = re.exec(text))) {
-    if (useFallback && m.index > 0 && isWord(text[m.index - 1])) continue;
+    // Check preceding character: match is valid only if not glued to a word character or at start
+    if (m.index > 0 && isWord(text[m.index - 1])) continue;
     if (m.index > last) out.push({ text: text.slice(last, m.index), tag: null });
     out.push({ text: m[0], tag: by.get(m[0]) });
     last = m.index + m[0].length;
