@@ -425,14 +425,11 @@ class MembersForTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["truncated"])
 
     async def test_chunk_timeout_cache_concurrent_and_memo(self):
-        """Two concurrent searches call chunk() once; within 60s no retry; after 60s retry."""
-        from tests.test_messages import Clock
-
+        """Unchunked guild whose chunk() times out: two concurrent searches call chunk() once,
+        a search within 60 s does not retry, a search after 60 s does."""
         clk = Clock()
         ch = mock.MagicMock(spec=discord.TextChannel)
         ch.id = 100
-
-        # Create members that all can view
         members = []
         for i in range(10):
             m = mock.MagicMock(spec=discord.Member)
@@ -442,74 +439,49 @@ class MembersForTests(unittest.IsolatedAsyncioTestCase):
             m.name = f"user{i}"
             m.global_name = None
             members.append(m)
+        ch.permissions_for.return_value = mock.MagicMock(view_channel=True)
 
-        def perm_for(member):
-            perm = mock.MagicMock()
-            perm.view_channel = True
-            return perm
+        release = asyncio.Event()
+        calls = []
 
-        # chunk_events to control when chunk() completes
-        chunk_events = [asyncio.Event() for _ in range(3)]
-        chunk_count = [0]
-        async def hanging_chunk():
-            call_num = chunk_count[0]
-            chunk_count[0] += 1
-            if call_num < len(chunk_events):
-                await chunk_events[call_num].wait()
+        async def timing_out_chunk():
+            calls.append(clk())
+            await release.wait()  # both searches are queued behind this call before it fails
+            raise asyncio.TimeoutError()
 
         guild = mock.MagicMock(spec=discord.Guild)
         guild.id = 1
         guild.members = members
         guild.me = mock.MagicMock()
-        guild.chunked = False
-        guild.chunk = mock.AsyncMock(side_effect=hanging_chunk)
+        guild.chunked = False  # stays unchunked: chunk() never succeeds
+        guild.chunk = timing_out_chunk
         guild.get_channel.return_value = ch
-        ch.permissions_for.side_effect = perm_for
 
-        # Use controller with injected clock
         controller = bot.Controller(clock=clk)
 
-        with mock.patch.object(bot.bot, "get_guild", return_value=guild):
-            with mock.patch.object(bot.config, "channel_for", return_value=100):
-                # Scenario 1: Two concurrent searches
-                search1 = asyncio.create_task(controller.members_for(1, ""))
-                search2 = asyncio.create_task(controller.members_for(1, ""))
-                await asyncio.sleep(0.01)  # Let both start waiting in chunk_lock
+        with mock.patch.object(bot.bot, "get_guild", return_value=guild), \
+                mock.patch.object(bot.config, "channel_for", return_value=100), \
+                self.assertLogs("bot", "WARNING"):
+            search1 = asyncio.create_task(controller.members_for(1, ""))
+            search2 = asyncio.create_task(controller.members_for(1, ""))
+            for _ in range(5):
+                await asyncio.sleep(0)  # search1 inside chunk(), search2 waiting on the lock
+            self.assertEqual(len(calls), 1)
+            release.set()
+            result1, result2 = await search1, await search2
+            self.assertEqual(len(calls), 1)  # search2 saw the fresh failure memo
+            self.assertEqual(len(result1["members"]), 10)
+            self.assertEqual(len(result2["members"]), 10)
 
-                # Release chunk() - both searches return cached members
-                guild.chunked = True
-                chunk_events[0].set()
-                result1 = await search1
-                result2 = await search2
+            clk.t += 30.0  # still inside the 60 s window
+            result3 = await controller.members_for(1, "")
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(len(result3["members"]), 10)
 
-                # chunk() should have been called exactly once
-                self.assertEqual(chunk_count[0], 1)
-                self.assertEqual(len(result1["members"]), 10)
-                self.assertEqual(len(result2["members"]), 10)
-
-                # Scenario 2: Search within 60s should not retry chunk()
-                clk.t += 30.0
-                guild.chunked = False
-                search3 = asyncio.create_task(controller.members_for(1, ""))
-                await asyncio.sleep(0.01)
-                # chunk() should not have been called again
-                self.assertEqual(chunk_count[0], 1)
-                # Search still returns results from cache
-                result3 = await search3
-                self.assertEqual(len(result3["members"]), 10)
-
-                # Scenario 3: Search after 60s should retry chunk()
-                clk.t += 31.0  # Now at 61s, past the 60s window
-                guild.chunked = False
-                search4 = asyncio.create_task(controller.members_for(1, ""))
-                await asyncio.sleep(0.01)
-                # chunk() should have been called again
-                self.assertEqual(chunk_count[0], 2)
-                # Release it
-                guild.chunked = True
-                chunk_events[1].set()
-                result4 = await search4
-                self.assertEqual(len(result4["members"]), 10)
+            clk.t += 31.0  # 61 s after the failure
+            result4 = await controller.members_for(1, "")
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(len(result4["members"]), 10)
 
     async def test_chunk_timeout_cache_prevents_retry_within_window(self):
         """After timeout, second search within 60s doesn't call chunk()."""
