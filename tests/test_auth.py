@@ -23,11 +23,18 @@ class TestAuthManager(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.users_file = os.path.join(self.tmp.name, "users.json")
 
-    def test_disabled_when_file_missing(self):
+    def test_disabled_only_without_a_configured_path(self):
+        for none in (None, ""):
+            mgr = AuthManager(none)
+            self.assertFalse(mgr.enabled)
+            self.assertEqual(mgr.load_users(), {})
+
+    def test_missing_file_is_enabled_and_admits_nobody(self):
         mgr = AuthManager(os.path.join(self.tmp.name, "missing.json"))
-        self.assertFalse(mgr.enabled)
-        self.assertEqual(mgr.load_users(), {})
-        self.assertFalse(mgr.verify_password("admin", "pass"))
+        self.assertTrue(mgr.enabled)
+        with self.assertLogs("webui", "ERROR"):
+            self.assertEqual(mgr.load_users(), {})
+            self.assertFalse(mgr.verify_password("admin", "pass"))
 
     def test_load_list_format(self):
         with open(self.users_file, "w", encoding="utf-8") as f:
@@ -198,7 +205,7 @@ class TestAuthRoutes(unittest.IsolatedAsyncioTestCase):
     async def test_bearer_authorization_header(self):
         # Create session directly
         mgr = self.app[webui.AUTH_MANAGER_KEY]
-        sid = mgr.create_session("api_tester")
+        sid = mgr.create_session("admin")
 
         # Make request with Authorization: Bearer <sid>
         headers = {"Authorization": f"Bearer {sid}"}

@@ -29,7 +29,7 @@ class MaybeStartWebui(unittest.IsolatedAsyncioTestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.cfg = ConfigStore(os.path.join(self.tmp.name, "c.json"))
-        env = mock.patch.dict(os.environ, {"WEBUI_HOSTS": "127.0.0.1"}, clear=False)
+        env = mock.patch.dict(os.environ, {"WEBUI_HOSTS": "127.0.0.1", "WEBUI_AUTH": "off"}, clear=False)  # these tests cover bind/Host policy, not login
         env.start()
         self.addCleanup(env.stop)
         os.environ.pop("WEBUI_ALLOWED_HOSTS", None)
@@ -94,6 +94,61 @@ class MaybeStartWebui(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(r.status, 403)
         finally:
             await runner.cleanup()
+
+    async def test_auth_required_by_default_and_fails_closed(self):
+        # No WEBUI_AUTH, USERS_FILE points at a file that does not exist: nobody gets in.
+        del os.environ["WEBUI_AUTH"]
+        missing = os.path.join(self.tmp.name, "nope", "users.json")
+        port = free_port()
+        with mock.patch.object(bot, "USERS_FILE", missing):
+            with self.assertLogs("webui", "INFO") as errs, self.assertLogs("bot", "INFO"):
+                runner = await self.start(port)
+        self.assertTrue(any("ERROR" in m and "does not exist" in m for m in errs.output))
+        try:
+            async with aiohttp.ClientSession() as s:
+                base = f"http://127.0.0.1:{port}"
+                self.assertEqual((await s.get(base + "/api/state")).status, 401)
+                r = await s.get(base + "/api/session")
+                self.assertTrue((await r.json())["auth_required"])
+                r = await s.post(base + "/api/login", json={"username": "admin", "password": "changeme"})
+                self.assertEqual(r.status, 401)
+        finally:
+            await runner.cleanup()
+
+    async def test_webui_auth_off_opens_gui_and_warns(self):
+        port = free_port()
+        with self.assertLogs("bot", "WARNING") as cm:
+            runner = await self.start(port)
+        self.assertTrue(any("authentication is DISABLED (WEBUI_AUTH=off)" in m for m in cm.output))
+        try:
+            async with aiohttp.ClientSession() as s:
+                r = await s.get(f"http://127.0.0.1:{port}/api/state")
+                self.assertEqual(r.status, 200)
+        finally:
+            await runner.cleanup()
+
+    async def test_only_exact_off_disables_auth(self):
+        for value in ("0", "false", "no", "offf", "off ", "", "on"):
+            os.environ["WEBUI_AUTH"] = value
+            with mock.patch.object(bot, "make_app", return_value=mock.sentinel.app) as mk, \
+                    mock.patch.object(bot, "start_webui", new=mock.AsyncMock(return_value="R")):
+                with self.assertLogs("bot", "INFO"):
+                    await self.start()
+            self.assertEqual(mk.call_args.kwargs["users_file"], bot.USERS_FILE, repr(value))
+        os.environ["WEBUI_AUTH"] = "OFF"
+        with mock.patch.object(bot, "make_app", return_value=mock.sentinel.app) as mk, \
+                mock.patch.object(bot, "start_webui", new=mock.AsyncMock(return_value="R")):
+            with self.assertLogs("bot", "WARNING"):
+                await self.start()
+        self.assertIsNone(mk.call_args.kwargs["users_file"])
+
+    def test_empty_users_file_env_means_default_not_no_auth(self):
+        import subprocess
+        code = "import sys; sys.path.insert(0, 'tests'); import botimport; print(botimport.bot.USERS_FILE)"
+        env = {**os.environ, "USERS_FILE": ""}
+        out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env,
+                             cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        self.assertTrue(out.stdout.strip().endswith("users.json"), out.stdout + out.stderr)
 
     def test_parse_port(self):
         for raw in ("abc", "0", "99999", "-1", "1.5"):

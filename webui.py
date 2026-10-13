@@ -155,75 +155,72 @@ class AuthManager:
         self._cached_users: dict[str, str] = {}
         self._cached_admins: set[str] = set()
         self._cached_groups: dict[str, set[str]] = {}
-        self._cached_mtime: float = -1.0
+        self._cached_mtime: tuple | float = -1.0
+        self._reported: set[str] = set()
         self._lock = threading.RLock()
 
     @property
     def enabled(self) -> bool:
-        return bool(self.users_file and os.path.exists(self.users_file))
+        """Fail closed: authentication is on whenever a users-file path is configured, whether or
+        not the file exists, parses or holds users. Only no path at all (library/dev use of
+        make_app, or WEBUI_AUTH=off in bot.py) turns it off."""
+        return bool(self.users_file)
+
+    def _problem(self, kind: str, detail: str) -> None:
+        """One ERROR per distinct condition, not per request; re-armed by the next good load."""
+        if kind not in self._reported:
+            self._reported.add(kind)
+            log.error("web UI users file %s: %s; nobody can log in until it is fixed", self.users_file, detail)
 
     def load_users(self) -> dict[str, str]:
         if not self.enabled:
             return {}
-        try:
-            mtime = os.path.getmtime(self.users_file)
-            if mtime == self._cached_mtime:
+        with self._lock:
+            try:
+                st = os.stat(self.users_file)
+            except FileNotFoundError:
+                self._problem("missing", "does not exist")
+                return self._cached_users  # empty if it never loaded: nobody can log in
+            except OSError as e:
+                self._problem("unreadable", f"cannot be read ({type(e).__name__})")
                 return self._cached_users
-            with open(self.users_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
+            stamp = (st.st_mtime_ns, st.st_size)
+            if stamp == self._cached_mtime:
+                return self._cached_users
+            try:
+                with open(self.users_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                records, _ = _split_raw(data)
+            except (OSError, UnicodeDecodeError) as e:
+                self._problem("unreadable", f"cannot be read ({type(e).__name__})")
+                return self._cached_users
+            except ValueError as e:  # json.JSONDecodeError is a ValueError
+                self._problem("invalid", f"is not valid ({type(e).__name__})")
+                return self._cached_users
             users: dict[str, str] = {}
             groups_map: dict[str, set[str]] = {}
-            raw_list = []
-            if isinstance(data, list):
-                raw_list = data
-            elif isinstance(data, dict):
-                if "users" in data:
-                    u_val = data["users"]
-                    if isinstance(u_val, list):
-                        raw_list = u_val
-                    elif isinstance(u_val, dict):
-                        data = u_val
-                if not raw_list:
-                    for k, v in data.items():
-                        uname = str(k).strip()
-                        ugroups: set[str] = set()
-                        if isinstance(v, str):
-                            users[uname] = v
-                        elif isinstance(v, dict) and "password" in v:
-                            users[uname] = str(v["password"])
-                            if v.get("role"):
-                                ugroups.add(str(v["role"]).lower())
-                            if v.get("is_admin") is True or v.get("role") == "admin":
-                                ugroups.add("admin")
-                            if isinstance(v.get("groups"), list):
-                                ugroups.update(str(g).strip().lower() for g in v["groups"] if g)
-                        groups_map[uname.lower()] = ugroups
-            for item in raw_list:
-                if isinstance(item, dict) and "username" in item and "password" in item:
-                    uname = str(item["username"]).strip()
-                    users[uname] = str(item["password"])
-                    ugroups = set()
-                    if item.get("role"):
-                        ugroups.add(str(item["role"]).lower())
-                    if item.get("is_admin") is True or item.get("role") == "admin":
-                        ugroups.add("admin")
-                    if isinstance(item.get("groups"), list):
-                        ugroups.update(str(g).strip().lower() for g in item["groups"] if g)
-                    groups_map[uname.lower()] = ugroups
+            for rec in records:
+                if isinstance(rec, dict) and "username" in rec and "password" in rec:
+                    uname = str(rec["username"]).strip()
+                    if not uname:
+                        continue
+                    users[uname] = str(rec["password"])
+                    groups_map[uname.lower()] = _groups_of(rec)
             for u in users:
                 u_lower = u.lower()
-                if u_lower == "admin":
-                    groups_map.setdefault(u_lower, set()).add("admin")
+                # Legacy files: an account literally named "admin" with no group info was the admin.
+                if u_lower == "admin" and not groups_map[u_lower]:
+                    groups_map[u_lower] = {"admin"}
                 if not groups_map.get(u_lower):
                     groups_map[u_lower] = {"user"}
             self._cached_users = users
             self._cached_groups = groups_map
             self._cached_admins = {u for u, grps in groups_map.items() if "admin" in grps}
-            self._cached_mtime = mtime
+            self._cached_mtime = stamp
+            self._reported.clear()
+            if not users:
+                self._problem("empty", "contains no users")
             return users
-        except Exception as e:
-            log.warning("could not load users from %s: %s", self.users_file, e)
-            return self._cached_users
 
     def get_user_groups(self, username: str | None) -> set[str]:
         if not self.enabled:
@@ -238,9 +235,13 @@ class AuthManager:
             return True
         if not username:
             return False
-        if group.strip().lower() == "admin" and username.strip().lower() == "admin":
-            return True
         return group.strip().lower() in self.get_user_groups(username)
+
+    def user_exists(self, username: str | None) -> bool:
+        if not username:
+            return False
+        self.load_users()
+        return username.strip().lower() in self._cached_groups
 
     def is_admin(self, username: str | None) -> bool:
         return self.in_group(username, "admin")
@@ -263,6 +264,9 @@ class AuthManager:
         return _split_raw(raw)
 
     def _write_records(self, rebuild, records) -> None:
+        for rec in records:  # persist the legacy "admin without groups" migration
+            if _is_user_rec(rec, "admin") and not _groups_of(rec):
+                rec["groups"] = ["admin"]
         atomic_write_json(rebuild(records), self.users_file)
         self._cached_mtime = -1.0
         self.load_users()
@@ -660,8 +664,8 @@ def make_app(config, controller, *, allowed_hosts, status_interval: float = 3.0,
     streams: set[asyncio.Task] = set()
     peer_logged: dict[str, float] = {}
     static_dir = static_dir or DEFAULT_STATIC_DIR
-    users_file = users_file or os.getenv("USERS_FILE")
-    auth_mgr = AuthManager(users_file)
+    auth_mgr = AuthManager(users_file or None)
+    auth_mgr.load_users()  # surface a missing/broken users file in the log at startup
     hash_slots = asyncio.Semaphore(4)  # concurrent scrypt operations (16 MiB each)
     features_path = features_file or os.getenv("FEATURES_FILE") or (
         os.path.join(os.path.dirname(config.path), "features.json") if hasattr(config, "path") and config.path else "features.json"
@@ -732,6 +736,9 @@ def make_app(config, controller, *, allowed_hosts, status_interval: float = 3.0,
             return await handler(request)
         sid = _session_id_from(request)
         user = auth_mgr.get_session(sid)
+        if user and not auth_mgr.user_exists(user):  # removed from the file: the session dies with it
+            auth_mgr.revoke_session(sid)
+            user = None
         if not user:
             return _err("unauthorized", 401)
         request[USER_KEY] = user
