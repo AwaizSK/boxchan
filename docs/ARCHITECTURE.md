@@ -23,7 +23,7 @@ No secret values appear in this document. Token *locations* are described; conte
 
 ## 1. Purpose and summary
 
-A Discord bot that reads messages from a chosen set of users ("watched" users) aloud in a voice channel, using the Piper neural TTS model on a local GPU (GTX 1060, CUDA, FP32). One process does everything: the discord.py client, a per-guild queue and playback worker, a GPU-serialized synthesis engine, and a small aiohttp web UI. The web UI lets several developers pick which text channel the bot listens to (per guild), pause/resume it, and skip or clear the queue, live, without restarting the bot. Channel selection lives in `config.json` (the source of truth, edited via the GUI); the watch list lives in `state.json` (edited via chat commands). Production runs as a hardened systemd service under an unprivileged user with root-owned code; the Discord token never touches the dev-writable checkout.
+A Discord bot that reads messages from a chosen set of users ("watched" users) aloud in a voice channel, using the Piper neural TTS model on a local GPU (GTX 1060, CUDA, FP32). One process does everything: the discord.py client, a per-guild queue and playback worker, a GPU-serialized synthesis engine, and a small aiohttp web UI. The web UI lets several developers pick which text channel the bot listens to (per guild), pause/resume it, and skip or clear the queue, live, without restarting the bot. A second tab (Voice) hot-swaps the Piper voice (global, one GPU engine for all guilds) from the voices installed in the models folder and can speak a test phrase. Channel selection and the chosen voice live in `config.json` (the source of truth, edited via the GUI); the watch list lives in `state.json` (edited via chat commands). Production runs as a hardened systemd service under an unprivileged user with root-owned code; the Discord token never touches the dev-writable checkout.
 
 ---
 
@@ -67,15 +67,17 @@ Key points the diagram encodes: one process and one event loop; the web UI never
 
 | File | Responsibility | Public interface |
 |---|---|---|
-| `bot.py` | Entry point. Discord events and commands, per-guild queue/worker, WatchStore, Controller, config watcher, lifecycle (startup, signals, shutdown). | Run `python bot.py`. Module-level: `config` (ConfigStore), `store` (WatchStore), `engine` (TTSEngine), `audio` (dict guild_id -> GuildAudio), `controller` (Controller), `load_token()`, `parse_port()`, `maybe_start_webui(cfg, ctl, port)`, `shutdown()`, `main()`. |
-| `tts_engine.py` | Piper wrapper (CUDA with CPU fallback) and Discord-text normalizer. | `TTSEngine(model_path, config_path)`: `load() -> bool` (never raises), `async synthesize(text) -> path\|None`, `purge_tmp()`, `close()`, attrs `ready`, `cuda_active`. `clean_discord_text(message, max_chars=300) -> str\|None`. |
-| `config_store.py` | Runtime config with revision counter, atomic persistence, pub/sub. | `atomic_write_json(data, path)`, `ConflictError(snapshot)`, `EventHub` (`subscribe/unsubscribe/publish/subscriber_count`), `ConfigStore` (`snapshot`, `channel_for`, `is_enabled`, `is_listen_channel`, `is_command_channel`, `async set_channel`, `async set_enabled`, `async seed_channel`, `.rev`, `.hub`). |
-| `webui.py` | aiohttp backend: bind-address policy (`validate_bind_hosts`, Tailscale detection), Host allowlist + Origin check, REST, SSE, static serving. No token auth. Duck-typed on the controller; never imports `bot.py`. | `validate_bind_hosts(hosts)`, `detect_tailscale_addrs()`, `parse_tailscale_ip()`, `parse_ip_addr()`, `parse_allowed_hosts()`, `host_of()`, `make_app(config, controller, *, allowed_hosts, status_interval=3.0, keepalive_interval=15.0, static_dir=None)`, `async start_webui(app, hosts, port, *, retry_interval=15.0) -> WebUIRunner` (binds each address independently, retries failures every 15 s, raises `OSError` if none bind), `sanitize_editor()`, `wire_snapshot()`, `wire_event()`. |
+| `bot.py` | Entry point. Discord events and commands, per-guild queue/worker, WatchStore, Controller (incl. `list_voices`, `apply_voice`, `say`, `voice_summary`), config watcher, lifecycle (startup incl. `load_engine`, signals, shutdown). | Run `python bot.py`. Module-level: `config` (ConfigStore), `store` (WatchStore), `engine` (TTSEngine), `audio` (dict guild_id -> GuildAudio), `controller` (Controller), `load_token()`, `parse_port()`, `maybe_start_webui(cfg, ctl, port)`, `load_engine()`, `default_voice_paths()`, `shutdown()`, `main()`. Env: `PIPER_MODELS_DIR` (default: dirname of `PIPER_MODEL_PATH`). |
+| `tts_engine.py` | Piper wrapper (CUDA with CPU fallback, hot reload) and text normalizers. | `TTSEngine(model_path, config_path)`: `load(model_path=None, config_path=None) -> bool` (never raises), `async reload(model_path, config_path)` (raises `VoiceLoadError`, old voice stays), `async synthesize(text) -> path\|None`, `purge_tmp()`, `close()`, attrs `ready`, `cuda_active`, `model_name`, `loading`. `clean_discord_text(message, max_chars=300)`, `clean_plain_text(text, max_chars=300)` (same pipeline, no Discord objects). |
+| `voices.py` | Pure stdlib: voice discovery and the errors shared by engine, bot and web layer. | `discover_voices(models_dir) -> list[dict]` (blocking), `resolve_voice(models_dir, name) -> (onnx, json)` (raises `BadVoiceError`, a `ValueError`), `VOICE_NAME_RE`, `VoiceLoadError`, `BadVoiceError`, `SayError(code)`. |
+| `config_store.py` | Runtime config with revision counter, atomic persistence, pub/sub. | `atomic_write_json(data, path)`, `ConflictError(snapshot)`, `EventHub` (`subscribe/unsubscribe/publish/subscriber_count`), `ConfigStore` (`snapshot`, `channel_for`, `is_enabled`, `is_listen_channel`, `is_command_channel`, `async set_channel`, `async set_enabled`, `async set_voice`, `async seed_channel`, `.rev`, `.voice`, `.hub`). |
+| `webui.py` | aiohttp backend: bind-address policy (`validate_bind_hosts`, Tailscale detection), Host allowlist + Origin check, REST, SSE, static serving. No token auth. Duck-typed on the controller; never imports `bot.py`. | `validate_bind_hosts(hosts)`, `detect_tailscale_addrs()`, `parse_tailscale_ip()`, `parse_ip_addr()`, `parse_allowed_hosts()`, `host_of()`, `make_app(config, controller, *, allowed_hosts, status_interval=3.0, keepalive_interval=15.0, static_dir=None)`, `async start_webui(app, hosts, port, *, retry_interval=15.0) -> WebUIRunner` (binds each address independently, retries failures every 15 s, raises `OSError` if none bind), `sanitize_editor()`, `wire_snapshot()`, `wire_event()`. The controller is duck-typed: `guilds_view`, `status_view`, `is_text_channel`, `skip`, `clear_queue`, `voice_summary` (optional), `async list_voices`, `async apply_voice`, `say`. |
 | `static/index.html`, `app.js`, `app.css` | Vanilla-JS single-page UI. No framework, no CDN, no inline script/style (CSP). `app.js` also exports pure helpers under node for tests. | Served at `/`, `/app.js`, `/app.css`. |
 | `tts_bot.service` | systemd unit: user `ttsbot`, Discord-token credential, env, sandboxing, ordered after `tailscaled`. | Installed to `/etc/systemd/system/` by `setup_system.sh`. |
 | `scripts/setup_system.sh` | One-time root setup: service user, `/opt/tts-bot`, private conda env, sudoers rule, journal group, unit install. | `sudo scripts/setup_system.sh` (env: `CONDA`, `TEAM_GROUP`). |
-| `scripts/deploy.sh` | Admin deploy: validate, snapshot, compile, install, prune, restart. | `sudo scripts/deploy.sh`. |
-| `scripts/lib/deploy_validate.sh` | Sourced function `snapshot_sources SRC SNAP` (validation + snapshot). | Tested by `tests/test_deploy_validation.sh`. |
+| `scripts/deploy.sh` | Admin deploy: validate, snapshot, compile, install, prune stale code/static (never `models/`), restart. | `sudo scripts/deploy.sh`. |
+| `scripts/lib/deploy_validate.sh` | Sourced functions `snapshot_sources SRC SNAP` (validation + snapshot) and `validate_voice_files ONNX JSON [PY]` / `voice_stem_ok`. | Tested by `tests/test_deploy_validation.sh`. |
+| `scripts/install_voice.sh` | Admin: add a voice to `/opt/tts-bot/models` with no restart or deploy (validates a private copy, atomic `mv`, refuses overwrite without `--force`). | `sudo scripts/install_voice.sh [--force] <v.onnx> [<v.onnx.json>]`. |
 | `scripts/install_token.sh` | Hidden prompt, shape-checks and stores the Discord token (mode 600). | `[--system]`; `TOKEN_DIR` env override (undocumented in README). |
 | `tests/` | See section 11. | `python -m unittest discover -s tests` |
 | `requirements.txt` | `discord.py[voice]>=2.4`, `PyNaCl>=1.5`, `piper-tts==1.2.0`, `onnxruntime-gpu>=1.18,<1.21`, `python-dotenv>=1.0`. | |
@@ -91,16 +93,21 @@ Key points the diagram encodes: one process and one event loop; the web UI never
 | `PUT /api/guilds/{gid}/enabled` | Host/Origin + `X-Editor` | Body `{"enabled": bool, "rev": int\|null}`. |
 | `POST /api/guilds/{gid}/skip` | Host/Origin + `X-Editor` | `{"skipped": bool}` |
 | `POST /api/guilds/{gid}/clear` | Host/Origin + `X-Editor` | `{"cleared": int}` |
-| `GET /api/events` | Host | SSE: `hello` (snapshot+guilds) on connect, then `config`, `channels`, `status` (only when changed), `: keepalive` comment every 15 s. |
+| `GET /api/voices` | Host | Rescans the models folder every call (this is the GUI's Rescan): `{"voices":[{name,sample_rate,quality,language,size_mb}], "current": stem\|null, "configured": stem\|null, "loading": bool}`. |
+| `PUT /api/voice` | Host/Origin + `X-Editor` | Body `{"name": "<stem>"\|null, "rev": int\|null}` (`null` = env default). 200 `{"snapshot"}`; 400 `bad_request`/`bad_voice`; 409 `conflict` (with snapshot); 422 `voice_load_failed` (nothing saved, old voice still active); 500 `persist_failed` (engine reverted best-effort). Runs under `asyncio.shield`. Takes seconds (model load + warm-up). |
+| `POST /api/guilds/{gid}/say` | Host/Origin + `X-Editor` | Body `{"text": str}` (1-200 chars). `{"queued": true}`; 400 `bad_request`/`too_long`; 404 unknown guild; 409 `not_connected`/`queue_full`/`tts_unavailable`. Goes through the normal guild queue. |
+| `GET /api/events` | Host | SSE: `hello` (snapshot+guilds+`voices` summary) on connect, then `config`, `channels`, `voice`, `status` (only when changed), `: keepalive` comment every 15 s. |
 
-Error codes: 403 `bad_peer` (TCP peer not loopback/Tailscale, any route), 403 `bad_host` (Host not on the allowlist, any route) / `bad_origin` (write with a foreign `Origin` or `Sec-Fetch-Site: cross-site`), 500 `persist_failed` (config write raised `OSError`; no detail leaked), 400 `editor_required` / `bad_request` / `bad_channel`, 404 (unknown or non-digit guild id; body is not JSON), 409 `conflict`, 413 for bodies > 4096 bytes (aiohttp `client_max_size`). Bad JSON, non-object body, or a `rev` that is not an int (bools rejected) -> 400 `bad_request`.
+Error codes: 403 `bad_peer` (TCP peer not loopback/Tailscale, any route), 403 `bad_host` (Host not on the allowlist, any route) / `bad_origin` (write with a foreign `Origin` or `Sec-Fetch-Site: cross-site`), 500 `persist_failed` (config write raised `OSError`; no detail leaked), 400 `editor_required` / `bad_request` / `bad_channel`, 404 (unknown or non-digit guild id; body is not JSON), 409 `conflict`, 422 `voice_load_failed`, 409 `not_connected` / `queue_full` / `tts_unavailable`, 500 `internal` (unexpected error in the voice apply; generic body), 413 for bodies > 4096 bytes (aiohttp `client_max_size`). Bad JSON, non-object body, or a `rev` that is not an int (bools rejected) -> 400 `bad_request`.
 
 All IDs on the wire are strings (JS numbers lose precision above 2^53). `wire_snapshot`/`wire_event` convert `channel_id` and `change.guild_id/old/new`; internally the store uses ints.
 
 ### Event shapes
 - Hub `config` event (internal, ints): `{"type":"config","snapshot":{...},"change":{"guild_id":int,"field":"channel_id"|"enabled","old":..,"new":..}}`.
+- Hub `config` event for the voice: `change = {"guild_id": null, "field": "voice", "old": stem\|null, "new": stem\|null}` (global change; `wire_event` keeps `guild_id` as JSON null).
+- Hub `voice` event (forwarded to browsers unchanged as SSE event `voice`): `{"type":"voice","loading":true}` when a swap starts, `{"type":"voice","loading":false,"current":stem\|null,"error":null\|"load_failed"}` when it ends (always, also on failure). Every tab uses it to disable Apply while loading.
 - Hub `channels` event: `{"type":"channels","guild_id":"<str>"|null}` published by `bot.py` on channel create/delete/update, guild join/remove/available, and (with `guild_id: null`) at the end of every `on_ready`, so a tab that connected during the restart window (empty guild cache) refetches. The browser reacts by refetching `/api/state`, coalesced (~250 ms trailing, one request in flight).
-- Snapshot: `{"rev","updated_by","updated_at","guilds":{"<gid>":{"channel_id":int|null,"enabled":bool}}}`.
+- Snapshot: `{"rev","updated_by","updated_at","voice":stem\|null,"guilds":{"<gid>":{"channel_id":int|null,"enabled":bool}}}`.
 
 ---
 
@@ -136,19 +143,31 @@ Toggling `enabled` follows the same path but `config_watcher` ignores it (the qu
 4. Edge: the `rev` is global per config file, not per guild, so a change to guild A also makes a stale write to guild B return 409 (the UI wording is the same). `rev: null` skips the check and always applies (API clients only; the browser always sends `rev`).
 5. Edge: even without 409, `applySnapshot(..., force=false)` ignores snapshots older than the held one, so out-of-order SSE events cannot roll the UI back.
 
+### (d) Swapping the voice
+1. Browser (Voice tab): the user highlights a row (nothing happens yet) and presses Apply. `PUT /api/voice {name, rev}`; the handler validates the name shape (`VOICE_NAME_RE`), then calls `Controller.apply_voice` inside `asyncio.shield`.
+2. `apply_voice` takes `Controller._voice_lock` (one swap at a time), resolves `name` through `resolve_voice` (the name must equal an installed stem; the path is rebuilt from the discovered entry, never from the request) or uses the env default for `null`, then checks `expected_rev` against `config.rev` (stale -> `ConflictError` -> 409) **before the engine is touched**.
+3. It publishes `voice loading:true`, then `await engine.reload(onnx, json)`. On the engine's single worker thread (same `asyncio.Lock` as synthesis, so it queues behind an in-flight clip and later clips queue behind it) a candidate `PiperVoice` is built and warmed up (CUDA, CPU fallback as at startup). Only if that succeeds, `voice`, `sample_rate`, `cuda_active`, `model_path`, `config_path` swap in one step, the old voice is `del`-ed and `gc.collect()` runs on the worker thread. Any failure raises `VoiceLoadError` (message without paths) and the old voice keeps serving untouched.
+4. A `finally` publishes `voice loading:false` with `current` and `error` (`null` or `"load_failed"`).
+5. Failure -> 422 `voice_load_failed`, nothing saved. Success -> `config.set_voice(name, expected_rev=None, editor)` persists atomically and publishes a `config` event (`field: "voice"`); every tab toasts "X switched voice to Y". If the persist raises `OSError` the engine is reloaded with the previous model (best effort) and the call returns 500 `persist_failed`.
+6. Clips already synthesized keep their own WAV header rate, so a rate change between voices is safe. Queued text is synthesized with whichever voice is current at synth time.
+7. At startup `load_engine()` loads the saved voice directly (single load) if it still resolves; a missing saved voice logs one WARNING and the env default is used; an unloadable one logs an error and falls back. In both cases `config.voice` is left alone, so the GUI shows `configured != current` and a warning.
+8. Adding voices: `scripts/install_voice.sh` (no restart) or drop files into the repo `models/` and deploy; then Rescan. The test box posts to `/api/guilds/{gid}/say`, which cleans the text (`clean_plain_text`) and puts it on the guild's normal queue (so it needs the bot in voice).
+
 ---
 
 ## 5. State and persistence
 
 | Item | Where | Format / semantics | Written by |
 |---|---|---|---|
-| Listen channel + pause flag | `config.json` (`CONFIG_FILE`; default: next to `STATE_FILE`; `/var/lib/tts-bot/config.json` in production) | The snapshot dict: `rev`, `updated_by`, `updated_at` (epoch float), `guilds{gid: {channel_id, enabled}}`. Pretty-printed JSON. | `ConfigStore._mutate` |
+| Listen channel + pause flag + global voice | `config.json` (`CONFIG_FILE`; default: next to `STATE_FILE`; `/var/lib/tts-bot/config.json` in production) | The snapshot dict: `rev`, `updated_by`, `updated_at` (epoch float), `voice` (stem or null; absent/invalid in old files -> null), `guilds{gid: {channel_id, enabled}}`. Pretty-printed JSON. | `ConfigStore._mutate` |
 | Watch list | `state.json` (`STATE_FILE`; default next to `bot.py`; `/var/lib/tts-bot/state.json` in production) | `{"watched": {"<gid>": [user ids]}}` | `WatchStore.mutate` |
+| Installed voices | `models/` next to `PIPER_MODEL_PATH` (`PIPER_MODELS_DIR`; `/opt/tts-bot/models` in production) | `<stem>.onnx` + `<stem>.onnx.json`; scanned on demand, never cached | repo + `deploy.sh`, or `install_voice.sh` |
+| Loaded Piper voice, `loading` flag, voice lock | memory | `TTSEngine`, `Controller._voice_lock` | |
 | Queues, workers, voice connections, playing clip | memory | `GuildAudio` per guild | |
 | EventHub subscribers, SSE tasks, bind-retry task | memory | | |
 | Temp `.wav` clips | `<tempdir>/tts_bot` (`/tmp/tts_bot`; under `PrivateTmp` in the service) | deleted by `after`; `purge_tmp()` at start and in `engine.close()` | |
 
-**`rev` semantics.** Starts at 0 for a fresh store; +1 for every effective change (channel set to a different value, enabled flipped, or first seed of a guild); persisted, so it survives restarts. No-op writes (same value on an existing guild entry) return the current snapshot without bumping rev or publishing. Quirk: the first `set_*` on a guild with no entry always counts as a change, even when the value equals the default (`enabled=True`, `channel_id=None`), so it bumps rev. `expected_rev=None` bypasses conflict detection.
+**`rev` semantics.** Starts at 0 for a fresh store; +1 for every effective change (channel set to a different value, enabled flipped, or first seed of a guild); persisted, so it survives restarts. `set_voice` is a global change: it bumps the same `rev`, a no-op (same value) does not. No-op writes (same value on an existing guild entry) return the current snapshot without bumping rev or publishing. Quirk: the first `set_*` on a guild with no entry always counts as a change, even when the value equals the default (`enabled=True`, `channel_id=None`), so it bumps rev. `expected_rev=None` bypasses conflict detection.
 
 **Atomic writes.** `atomic_write_json` creates a temp file in the same directory (`.cfg-*.tmp`), writes, flushes, `fsync`s, then `os.replace`s over the target; on any failure the temp file is unlinked and the error re-raised. A crash leaves either the old or the new file, never a torn one. The same function backs `state.json` (the older private `save_state` was removed).
 
@@ -158,7 +177,7 @@ Toggling `enabled` follows the same path but `config_watcher` ignores it (the qu
 
 **Seed.** `TTS_CHANNEL_ID` (comma-separated ids allowed) is only a seed: on `on_ready`, for each guild with no entry in config, the first listed id that is a `TextChannel` in that guild is stored with editor `env-seed`. Once a guild has an entry, the env value is ignored. Clearing the channel in the GUI sets `channel_id: null` but keeps the entry, so the seed does NOT re-apply.
 
-**Lost on restart:** queued-but-unspoken messages, the voice connection (the bot does not rejoin; someone must run `join` again), which also means no `GuildAudio` exists until `join`. **Kept:** channel selection, pause flag, rev, watch list.
+**Lost on restart:** queued-but-unspoken messages, the voice connection (the bot does not rejoin; someone must run `join` again), which also means no `GuildAudio` exists until `join`. **Kept:** channel selection, pause flag, chosen voice, rev, watch list.
 
 Other state-changing behaviors: `leave` and auto-leave (no humans left in the bot's voice channel) both flush that guild's watch list.
 
@@ -166,12 +185,13 @@ Other state-changing behaviors: `leave` and auto-leave (no humans left in the bo
 
 ## 6. Concurrency model
 
-- **One asyncio event loop** runs discord.py, all per-guild workers, `config_watcher`, the aiohttp server, and all `ConfigStore`/`WatchStore` logic. `Controller` methods are synchronous and non-blocking and must be called on the loop (aiohttp handlers are).
+- **One asyncio event loop** runs discord.py, all per-guild workers, `config_watcher`, the aiohttp server, and all `ConfigStore`/`WatchStore` logic. `Controller` view/action methods are synchronous and non-blocking and must be called on the loop (aiohttp handlers are); the voice methods (`list_voices`, `apply_voice`) are coroutines that hand disk scans and model loads to threads.
 - **Locks.**
   - `ConfigStore._lock` (`asyncio.Lock`): serializes all config mutations including the thread-offloaded disk write, so rev check + mutate + persist + publish is atomic with respect to other writers. Reads (`channel_for`, `is_*`, `snapshot`) take no lock; they read in-memory dicts on the loop and so never see a half-applied mutation except for the brief window in which a not-yet-persisted change is visible (and may be rolled back if persist fails).
   - `WatchStore.lock`: serializes watch-list mutations plus their persist.
+  - `Controller._voice_lock`: serializes whole voice swaps (resolve, rev check, reload, persist, revert). `TTSEngine._lock` additionally serializes `reload` with synthesis, so a swap waits for the in-flight clip and later clips wait for the swap.
   - `TTSEngine._lock` (created lazily on first use so it binds to the running loop): ensures only one synthesis is submitted at a time.
-- **Single GPU worker thread.** `TTSEngine._pool = ThreadPoolExecutor(max_workers=1)`. Why: the GTX 1060 has 6 GB and one CUDA context; ONNX Runtime sessions are not worth sharing across threads; parallel synthesis would only add VRAM pressure and contention without latency gain for short clips. The thread keeps inference off the event loop so the Discord gateway heartbeat is never blocked. The `asyncio.Lock` in front of the pool means cancellation of a waiting caller does not queue stale work behind a long job. Do not add a second thread/executor for GPU work.
+- **Single GPU worker thread.** `TTSEngine._pool = ThreadPoolExecutor(max_workers=1)`. Why: the GTX 1060 has 6 GB and one CUDA context; ONNX Runtime sessions are not worth sharing across threads; parallel synthesis would only add VRAM pressure and contention without latency gain for short clips. The thread keeps inference off the event loop so the Discord gateway heartbeat is never blocked. The `asyncio.Lock` in front of the pool means cancellation of a waiting caller does not queue stale work behind a long job. Do not add a second thread/executor for GPU work. The same thread builds and warms the candidate voice in `reload`, so a hot swap can never overlap an inference. GPU memory: the candidate is built while the old session is still loaded (peak = two sessions), then the old one is freed right after the swap (`del` + `gc.collect()` on the worker thread). ORT's arena may keep some memory, so repeated swaps can grow usage on the 6 GB card; a service restart clears it.
 - **Playback.** discord.py plays in its own audio thread. `after` runs on that thread, so it signals the worker with `loop.call_soon_threadsafe(ga.play_done.set)`; the worker awaits an `asyncio.Event` (no polling). `vc.stop()` (skip, timeout, teardown) also triggers `after`. `PLAY_TIMEOUT` (180 s) prevents a wedged clip from blocking the guild forever.
 - **Worker lifecycle.** `ensure_audio` creates the `GuildAudio` and restarts a dead worker task. `audio_worker` catches all exceptions per item and continues; only `CancelledError` ends it. `teardown(guild)` pops the `GuildAudio`, drains the queue, cancels the worker, stops playback and disconnects (`force=True`). Temp-file ownership: the worker's `finally` deletes the file unless it was handed to `after`.
 - **Voice reconnect tolerance.** `wait_connected` polls `is_connected()` every 0.5 s for up to 10 s (`RECONNECT_WAIT`), so a UDP drop or region move does not discard the queue; if the voice client is gone (`None`) or the wait expires, the current item is skipped. `on_voice_state_update` tears down only if the bot itself ends up in no channel.
@@ -215,7 +235,7 @@ Other state-changing behaviors: `leave` and auto-leave (no humans left in the bo
 `User=ttsbot`, `NoNewPrivileges`, `PrivateTmp`, `ProtectSystem=strict` (everything read-only except `StateDirectory=tts-bot` -> `/var/lib/tts-bot`), `ProtectHome=true`, `ProtectKernelModules`, `ProtectControlGroups`, `RestrictSUIDSGID`.
 
 ### Deploy trust boundary (important)
-- `scripts/deploy.sh` runs as **root** from a **group-writable checkout**. That is a privilege-escalation surface, so it is defended in depth by `scripts/lib/deploy_validate.sh`: every source file (root `*.py`, `static/*`, `models/*.onnx` and `*.onnx.json`, `requirements.txt`) must be a regular file, not a symlink; its `realpath` must lie inside the physically-resolved repo; `static/` and `models/` must be real directories; no subdirectories. Files are copied into a root-owned `mktemp -d` snapshot (mode 700), the snapshot is re-verified (no symlinks or special files), and everything after that (py_compile, install, stale pruning) reads only from the snapshot. The compiled output goes to the snapshot's own `.pyc` dir so nothing is written into the repo.
+- `scripts/deploy.sh` runs as **root** from a **group-writable checkout**. That is a privilege-escalation surface, so it is defended in depth by `scripts/lib/deploy_validate.sh`: every source file (root `*.py`, `static/*`, `models/*.onnx` and `*.onnx.json`, `requirements.txt`) must be a regular file, not a symlink; its `realpath` must lie inside the physically-resolved repo; `static/` and `models/` must be real directories; no subdirectories. Files are copied into a root-owned `mktemp -d` snapshot (mode 700), the snapshot is re-verified (no symlinks or special files), and everything after that (py_compile, install, stale pruning of `*.py`/`static/`) reads only from the snapshot. `models/` is never pruned (voices from `install_voice.sh` live only on the host). `install_voice.sh` applies the same philosophy: it copies the (dev-writable) source into a root-owned staging dir and validates the copy, never the original. The compiled output goes to the snapshot's own `.pyc` dir so nothing is written into the repo.
 - **Accepted residual risk**: a microsecond race between the `realpath` check and the `cp` into the snapshot (the later re-verification catches a swapped-in symlink but not a swapped-in regular file with different content, which is the same as "dev edited the file", i.e. legitimately deployable code).
 - `deploy.sh` and `setup_system.sh` also `source`/execute files from the dev-writable repo as root (`scripts/lib/deploy_validate.sh`, `tts_bot.service`, `requirements.txt`). **The admin must review `scripts/` (and the diff in general) before running them.**
 - **Anyone who can get code deployed can read the Discord token**, because deployed code runs with it. The boundary protects the token from devs who can only edit/run things as themselves, not from a malicious deployed change. Hence "review before `deploy.sh`".
@@ -307,6 +327,43 @@ Format: **Decision** / Why / Alternatives rejected / Cost if wrong.
 - **Why Origin is checked only when present:** browsers always send `Origin` on cross-origin writes, so a forged cross-site write is caught; scripts and curl send none and are not the CSRF threat. Requiring it would break legitimate tooling for no gain.
 - **Cost:** any local process or account on the server can reach `127.0.0.1:8765` and change the channel (accepted; run no untrusted local users). Anyone on the tailnet that ACLs allow can use the GUI. If a domain is added later it must authenticate at the proxy.
 
+### D32. The voice is global, not per guild
+- **Decision:** one `voice` in `config.json`, one loaded Piper session for all guilds.
+- **Why:** the engine is a single GPU context on a 6 GB card (see section 6). A per-guild voice would mean either several resident sessions (VRAM) or a swap before almost every clip (seconds of latency and constant allocator churn).
+- **Alternatives rejected:** per-guild voices with an LRU of sessions (VRAM and complexity for a small team); per-user voices (same, plus a UI).
+- **Cost:** every server hears the same voice; changing it affects everyone, including text queued but not yet synthesized.
+
+### D33. Hot swap on the single worker thread: build and warm up the candidate, then swap, then free
+- **Decision:** `TTSEngine.reload` runs under the engine lock on `_pool` (the only inference thread). It builds a `PiperVoice`, warm-up synthesizes, and only then swaps `voice/sample_rate/model_path/config_path/cuda_active` in one step and frees the old session. Failure raises `VoiceLoadError` and leaves the old voice serving.
+- **Why:** serializing with synthesis on the one thread means a swap can never corrupt or interleave with an inference, with no extra locking, and the bot keeps its voice if the new model is broken (bad file, CUDA OOM, wrong format).
+- **Alternatives rejected:** unload-then-load (a failure leaves the bot mute, and every failed attempt is an outage); a second executor/thread for loading (violates the one-GPU-thread rule, allows concurrent CUDA use); restarting the service (drops voice connections, needs sudo).
+- **Cost:** peak GPU memory is two sessions during a swap; the old session is freed immediately after (`del` + `gc.collect()`), but ORT may retain arena memory, so many swaps can ratchet usage up on the 6 GB GTX 1060. A service restart resets it. Synthesis is paused for the seconds a load takes (queued text waits).
+
+### D34. Apply order: validate name, check rev, swap the engine, then save with `expected_rev=None`
+- **Decision:** `Controller.apply_voice` (under `_voice_lock`): resolve the name, compare `expected_rev` with `config.rev` (409 before touching the engine), reload the engine, then `config.set_voice(..., expected_rev=None)`. If the save fails with `OSError` the previous model is reloaded (best effort) and the caller gets 500.
+- **Why:** the engine swap is slow (seconds) and has side effects, while the config write is fast and can be rolled back. Doing the cheap, side-effect-free checks first means a stale client never costs a model load, and persisting last means a failed load saves nothing.
+- **Why `expected_rev=None` on the save:** another editor's channel/pause edit during the load bumps `rev`; passing the original rev would make the save conflict *after* the engine already swapped, leaving engine and config disagreeing with no clean way to tell the client. Stale-client detection already happened in the pre-check.
+- **Alternatives rejected:** save first, then swap (a failed load would leave a saved voice that cannot load, retried at every restart); save with the original rev and roll the engine back on conflict (a second multi-second load, more failure modes); holding the config lock across the load (blocks channel edits for seconds).
+- **Cost:** a narrow window in which two editors both believe they chose the voice: the later apply wins, and everyone is told via the `config` event. If the revert after a persist failure itself fails, the engine keeps the new voice while the saved config names the old one (visible as configured != current).
+
+### D35. Multi-speaker models are excluded
+- **Decision:** `discover_voices` skips models with `num_speakers > 1`.
+- **Why:** the engine calls `synthesize_stream_raw(text)` with no speaker id, so a multi-speaker model would always speak as speaker 0 with no way to choose; listing it would be misleading. Supporting it needs a speaker picker, a persisted speaker id and a wire format, which was out of scope.
+- **Alternatives rejected:** listing them with a default speaker (silently wrong); a per-voice speaker field now (YAGNI).
+- **Cost:** some good Piper voices (e.g. libritts, vctk) are unavailable until speaker selection is built.
+
+### D36. Voices are addressed only by file stem; discovery is a rescan, not a watcher
+- **Decision:** the API carries the stem (`[A-Za-z0-9_.+-]{1,100}`, no leading dot) and `resolve_voice` only accepts an exact match with a discovered entry. The folder is rescanned on every `GET /api/voices` (the Rescan button) and after a swap.
+- **Why:** paths are rebuilt server-side from a discovered entry, so there is no path traversal surface and no filesystem path ever appears in a response. A rescan on demand is stateless; there is nothing to go stale or to leak between tabs.
+- **Alternatives rejected:** passing a path or relative filename (traversal); inotify/polling (extra moving part, half-copied files); caching the list (stale, needs invalidation).
+- **Cost:** a scan reads every `*.onnx.json` (a few KB each) on each call; fine for tens of voices. A voice added by `install_voice.sh` is invisible until someone presses Rescan.
+
+### D37. Deploy no longer prunes `models/`; voices are installed by `install_voice.sh`
+- **Decision:** `deploy.sh` still copies/updates repo models but never deletes from `/opt/tts-bot/models`. `scripts/install_voice.sh` adds a voice without a deploy or restart.
+- **Why:** voice files are large, gitignored, and chosen at runtime from the GUI; a deploy that deleted everything not in the repo would silently remove the voice the GUI had saved as active.
+- **Alternatives rejected:** keeping the prune (data loss on every deploy); making `/opt/tts-bot/models` writable by the service or devs (breaks the root-owned boundary: ONNX files are parsed by native code); uploading through the GUI (an upload surface on an unauthenticated UI).
+- **Cost:** removed or renamed repo models linger in `/opt/tts-bot/models` until an admin deletes them by hand; a repo model with the same name overwrites an installed voice on deploy; the bot cannot delete voices (no write access, by design).
+
 ---
 
 ## 9. Nuances and gotchas
@@ -335,6 +392,9 @@ Format: **Decision** / Why / Alternatives rejected / Cost if wrong.
 - **`known_guild` calls `controller.guilds_view()`** (all guilds' channels) on every write request; fine for a handful of guilds.
 - **Static files are read at app creation.** Editing `static/*` requires a bot restart (deploy restarts it anyway).
 - **Tests import `bot.py`**, which runs side effects (token lookup, opus load, `Bot` construction). Tests import it through `tests/botimport.py`, which sets the env vars first and patches `dotenv.load_dotenv` out for the import, so the repo `.env` (and a developer's real token) never reaches the test process. Import `botimport` before `bot`.
+- **Voice tab quirks.** Selecting a row only highlights it; nothing changes until Apply. A swap takes a few seconds (model load + warm-up) and disables Apply in every open tab through the SSE `voice` events. If `configured` (saved) differs from `current` (loaded) the tab warns: "Saved voice missing" (file gone) or "could not be loaded". "Reset to default" saves `voice: null` and loads `PIPER_MODEL_PATH`. The test phrase needs the bot in voice in the selected guild (it is queued like any message, so it waits behind queued text).
+- **Sample rate differs between voices.** Each WAV carries its own header rate and ffmpeg resamples to Discord's 48 kHz, so mixing 16/22.05 kHz voices is fine.
+- **Persisted voice vs env default.** `PIPER_MODEL_PATH` is only the fallback. After the first GUI change the saved voice wins at startup; editing the unit's `PIPER_MODEL_PATH` alone will not change the voice until "Reset to default".
 - **Stale state in `__pycache__`.** `deploy.sh` removes `/opt/tts-bot/__pycache__`; the repo is compiled to a throwaway dir during validation.
 
 ---
@@ -363,6 +423,12 @@ Developer Portal -> Bot -> Reset Token, then `sudo scripts/install_token.sh --sy
 - Local / on the server: `http://127.0.0.1:8765`.
 - Over Tailscale: `http://<tailscale-ip>:8765`, or `http://<machine>.<tailnet>.ts.net:8765` after setting `WEBUI_ALLOWED_HOSTS=<machine>.<tailnet>.ts.net` in the unit (uncomment the line, `systemctl daemon-reload`, restart). Restrict who may connect with Tailscale ACLs.
 - Later via a domain behind zero trust: add the domain to `WEBUI_ALLOWED_HOSTS`; keep the reverse proxy on loopback/tailnet; it must pass `Host` unchanged (or the entry must match what it sends) and must not buffer `/api/events`.
+
+### Add or change a voice (no restart)
+1. Download a voice (both files) from https://huggingface.co/rhasspy/piper-voices (samples: https://rhasspy.github.io/piper-samples; check the licence on each model card). Single-speaker only.
+2. On the server: `sudo scripts/install_voice.sh /path/to/en_US-amy-medium.onnx` (JSON next to it, or pass it as the second argument; `--force` replaces an installed voice). Alternatively put both files in the repo's `models/` and run `deploy.sh` (restarts the service).
+3. In the GUI: Voice tab -> Rescan, select the voice, Apply (a few seconds), try "Say it". "Reset to default" returns to `PIPER_MODEL_PATH`.
+If it will not load (422 / toast), the previous voice is still active; the journal has the reason (`voice reload failed`). After many swaps, `sudo systemctl restart tts_bot` clears accumulated GPU memory.
 
 ### Change the listen channel (no restart)
 Open the GUI (see above), enter your name, search, click/Enter. Takes effect immediately; the guild's pending queue is cleared. Keyboard: `/` search, Up/Down, Enter, Esc. Use Pause/Resume to mute reading while testing.
@@ -400,23 +466,27 @@ sudo ip6tables -I INPUT -d fd7a:115c:a1e0::/48  ! -i tailscale0 -j DROP
 
 Run from the repo root:
 ```
-~/miniconda3/envs/tts-bot/bin/python -m unittest discover -s tests -v   # 114 tests at time of writing
+~/miniconda3/envs/tts-bot/bin/python -m unittest discover -s tests -v   # 211 tests at time of writing
 bash tests/test_deploy_validation.sh                                    # deploy validation, no root needed
 ```
 `unittest` only; no pytest.
 
 | File | Covers |
 |---|---|
-| `tests/test_config_store.py` | atomic write (no `.tmp` leftovers on success/failure), EventHub (fan-out, idempotent unsubscribe, drop-oldest), ConfigStore (rev/no-op, conflict leaves state untouched, `expected_rev=None`, round-trip, corrupt file quarantined to `.corrupt`, persist-failure rollback, truth table of `is_*`, event publishing, seed, 20 concurrent writes). |
+| `tests/test_config_store.py` | atomic write (no `.tmp` leftovers on success/failure), EventHub (fan-out, idempotent unsubscribe, drop-oldest), ConfigStore (also `set_voice`: rev/no-op/conflict/rollback/round-trip/old-file compatibility; rev/no-op, conflict leaves state untouched, `expected_rev=None`, round-trip, corrupt file quarantined to `.corrupt`, persist-failure rollback, truth table of `is_*`, event publishing, seed, 20 concurrent writes). |
 | `tests/test_webui.py` | no auth needed on any route and a stray `Authorization` header ignored, persist failure -> JSON 500 `persist_failed`, static headers/CSP, PUT channel/enabled incl. persistence and hub events, conflict, bad inputs, editor required/sanitized/percent-encoded, skip/clear, handler cancellation mid-write stays consistent, SSE (hello, config, status only on change, keepalive, subscriber cleanup), `validate_bind_hosts` table, Tailscale output parsers and detection fallbacks, Host allowlist (ports, IPv6, case, missing Host, static/state/events, `allowed_hosts` extras), Origin / `Sec-Fetch-Site` rules, `start_webui` (policy, partial bind + retry, all-fail `OSError`, cleanup cancels retry quickly with an open SSE). |
+| `tests/test_voices.py` | `discover_voices` (fields, sorting, quality/language fallbacks, missing/bad/oversized JSON, bad keys, multi-speaker, bad stems, non-files) and `resolve_voice` (traversal, separators, absolute paths, unknown names, non-strings). |
+| `tests/test_engine.py` | `TTSEngine` with a fake `PiperVoice`: load (CUDA, CPU fallback, missing file), `reload` (swap + old voice freed via weakref, failure/warm-up failure keep the old voice and give a path-free message, never-loaded engine, CPU fallback, `loading` flag, synth vs reload ordering both ways, cancelled caller, single worker thread), `clean_plain_text`. |
+| `tests/test_voice_apply.py` | `Controller.list_voices/apply_voice/say` and `load_engine` with a fake engine: event order, conflict before engine, bad voice, load failure saves nothing, persist failure reverts the engine, failed revert, lock serialization, saved voice at startup (single load, missing -> one WARNING, unloadable -> fallback, traversal in config). |
+| `tests/test_voice_routes.py` | `GET /api/voices`, `PUT /api/voice` (200/400/409/422/500 bodies carry no paths, shield on disconnect), `/say` validation and refusals, `hello` voices summary, SSE `voice` events, `wire_event` null guild, all guards (bad host/origin/peer, missing `X-Editor`) on the new routes. |
 | `tests/test_controller.py` | `Controller` views and actions with fake guilds, `config_watcher` drain behavior (channel change drains; `enabled` change does not; other guilds and malformed events are survived). |
 | `tests/test_bot_events.py` | hot-swap path with fake objects: `on_message` (configured channel queues; paused, old channel after a swap, unconfigured guild, unwatched, bots, DMs do not; prefix goes to commands only), `only_tts_channel`, `on_command_error` slash reply, `on_ready` seeding (lowest matching id, skips existing, idempotent) and its `channels` event, channel-relay listeners, no `.env` loaded. |
 | `tests/test_wiring.py` | `maybe_start_webui` never raises (invalid `WEBUI_HOSTS`, bad `make_app`, out-of-range port, port in use, unexpected error), default hosts via Tailscale detection, `WEBUI_ALLOWED_HOSTS` reaches the app, `parse_port`, good config serves and cleans up. |
 | `tests/test_static.py` | static payload < 40 KB, CSP-safe content (no `innerHTML`/`eval`/inline handlers/external URLs), served bytes equal files, and runs `tests/static_logic.js` under node if available. |
-| `tests/static_logic.js` | pure JS helpers: SSE parser, `matchChannel`, `relTime`, `backoffDelay`, `groupChannels`, `normalizeEditor`, `shouldRollback`, `shouldApplySnapshot` (stale snapshots ignored). |
-| `tests/test_deploy_validation.sh` | deploy validator: clean tree accepted; symlinked dirs/files, in-repo symlinks, subdirectories, missing `.py` rejected. |
+| `tests/static_logic.js` | pure JS helpers: `voiceTitle`, `voiceWarning`, `sayBlocker`, `voiceSwitchText`, SSE parser, `matchChannel`, `relTime`, `backoffDelay`, `groupChannels`, `normalizeEditor`, `shouldRollback`, `shouldApplySnapshot` (stale snapshots ignored). |
+| `tests/test_deploy_validation.sh` | deploy validator: clean tree accepted; symlinked dirs/files, in-repo symlinks, subdirectories, missing `.py` rejected; `validate_voice_files` (stem rules incl. non-ASCII, symlinks, size, text-as-model, JSON/sample_rate/multi-speaker); static check that `deploy.sh` does not prune `models/`. |
 
-**Not covered:** anything needing live Discord, a GPU, ffmpeg/voice, or a browser. `engine.synthesize`/playback/`audio_worker`/`on_message` end to end, the real systemd unit, `setup_system.sh`/`deploy.sh` as root, and DOM behavior of `app.js` (rendering, optimistic rollback wiring, keyboard handling) have no automated tests. The frontend was verified by node logic tests, static content checks and code review only. Run the manual smoke checklist in a real browser (and a real Discord test guild) before relying on it: name prompt, `bad_host` toast, channel list/search/keyboard, select + toast + undo, pause/resume, skip/clear, two browsers (conflict toast, live toast), kill/restart the bot and watch reconnect, 360 px width, dark mode.
+**Not covered:** anything needing live Discord, a GPU, ffmpeg/voice, or a browser. `engine.synthesize`/playback/`audio_worker`/`on_message` end to end, the real systemd unit, `setup_system.sh`/`deploy.sh` as root, and DOM behavior of `app.js` (rendering, optimistic rollback wiring, keyboard handling) have no automated tests; the same holds for the Voice tab, real Piper/CUDA voice loading, GPU memory growth over repeated swaps, and `install_voice.sh` as root (only its validation function and a sandboxed copy were run). The frontend was verified by node logic tests, static content checks and code review only. Run the manual smoke checklist in a real browser (and a real Discord test guild) before relying on it: name prompt, `bad_host` toast, channel list/search/keyboard, select + toast + undo, pause/resume, skip/clear, two browsers (conflict toast, live toast), kill/restart the bot and watch reconnect, 360 px width, dark mode.
 
 ---
 
@@ -424,8 +494,9 @@ bash tests/test_deploy_validation.sh                                    # deploy
 
 - No live Discord, GPU or browser tests (section 11).
 - Editor names are self-declared attribution, not authentication; there is no application-layer auth at all. Any local process/account on the server can reach the loopback GUI and change the channel (accepted); the tailnet side is governed by Tailscale ACLs.
-- One channel per guild (plus pause).
-- Deploy copies every root `*.py` (stray files ship) plus `static/*`, `models/*`, `requirements.txt`; `deploy.sh` and `setup_system.sh` run repo-supplied scripts as root (admin review required); a microsecond check/copy race is accepted; `setup_system.sh` resolves `SRC` with `pwd`, not `pwd -P`.
+- One channel per guild (plus pause). One global voice (D32); multi-speaker voices are not offered (D35).
+- Voice swaps: peak GPU memory is two sessions while loading, and ORT may keep memory after freeing the old one, so use a service restart if memory creeps up on the 6 GB card. Speech is delayed for the seconds a load takes. Two editors applying different voices at once: last apply wins (D34). Installed voices cannot be deleted from the GUI.
+- Deploy copies every root `*.py` (stray files ship) plus `static/*`, `models/*` (copy only, never pruned), `requirements.txt`; `deploy.sh` and `setup_system.sh` run repo-supplied scripts as root (admin review required); a microsecond check/copy race is accepted; `setup_system.sh` resolves `SRC` with `pwd`, not `pwd -P`.
 - The GUI is down whenever the bot is down; all plain HTTP (Tailscale encrypts the tailnet hop; a domain needs TLS at the proxy).
 - The bot does not rejoin voice after a restart.
 - `config.json` and `state.json` corruption: starts empty; only `config.json` is kept aside as `.corrupt` (one generation).

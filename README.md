@@ -18,6 +18,18 @@ wget https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/me
 ```
 Discord Developer Portal: enable **Message Content Intent**. Invite with scopes `bot applications.commands`, permissions View Channel, Connect, Speak.
 
+## Voices (swap without a restart)
+The Web UI has a **Voice** tab: pick any installed Piper voice, press **Apply** and the bot hot-swaps it in a few seconds (no restart, voice connections stay up). The voice is global (one GPU engine for all servers) and is remembered in `config.json`; **Reset to default** returns to `PIPER_MODEL_PATH`. **Say it** speaks a test phrase through the normal queue (the bot must be in voice in that server). If a voice fails to load the previous one keeps working and you get an error toast.
+
+Add voices (single-speaker only; multi-speaker models are not offered):
+1. Download both files (`<name>.onnx` and `<name>.onnx.json`) from https://huggingface.co/rhasspy/piper-voices (listen first on https://rhasspy.github.io/piper-samples). Each voice has its own licence on its model card; check it before use.
+2. Production, no restart: `sudo scripts/install_voice.sh path/to/en_US-amy-medium.onnx` (the JSON is picked up next to it, or pass it as the second argument; `--force` replaces an installed voice). It validates the files and installs them atomically into `/opt/tts-bot/models`.
+   Or: put both files in the repo's `models/` (gitignored) and run `sudo scripts/deploy.sh` (restarts the bot). `deploy.sh` never deletes from `/opt/tts-bot/models`, so installed voices survive deploys.
+   Dev: just drop the files into `models/` (or `PIPER_MODELS_DIR`).
+3. Voice tab -> **Rescan**, select the voice, **Apply**.
+
+`PIPER_MODELS_DIR` (default: the folder of `PIPER_MODEL_PATH`) is where voices are scanned. `PIPER_MODEL_PATH` stays the fallback default voice. Swapping loads the new model before dropping the old one (briefly two models in GPU memory); if usage creeps up on the 6 GB card after many swaps, restart the service.
+
 ## Token safety
 - Token is never in the repo or `.env`. Order of lookup: systemd credential (`$CREDENTIALS_DIRECTORY/discord_token`), `~/.config/tts-bot/token`, then `DISCORD_TOKEN` env.
 - systemd: `LoadCredential=` in the unit passes the file to the process only.
@@ -42,7 +54,7 @@ Every command works as prefix (`COMMAND_PREFIX`, default `!`) and as slash comma
 The bot reads messages and accepts commands only in the text channel chosen per guild. `config.json` (`CONFIG_FILE`, default next to `state.json`; `/var/lib/tts-bot/config.json` in production) is the source of truth and is edited from the Web UI. `TTS_CHANNEL_ID` is only a first-boot seed: it populates a guild with no entry yet and is ignored afterwards. `join` follows whoever runs it into their voice channel.
 
 ## Web UI
-A small page to pick which text channel the bot listens to, pause/resume it, and skip or clear the queue, per guild. Changes apply live; no restart.
+A small page with two tabs: **Channel** (pick which text channel the bot listens to, pause/resume it, skip or clear the queue, per guild) and **Voice** (see above). Changes apply live; no restart.
 
 Start: just run the bot. There is **no login**: the network is the security boundary (see Security notes).
 ```bash
