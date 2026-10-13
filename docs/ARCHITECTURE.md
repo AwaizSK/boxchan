@@ -409,6 +409,18 @@ Format: **Decision** / Why / Alternatives rejected / Cost if wrong.
 - **Alternatives rejected:** keeping an optional file watcher (optional-but-unused controls silently fail; two code paths to test); making the watcher go through review (extra complexity, does not solve the "deployed code changes without per-deploy review" problem).
 - **Cost:** manual deploys are slower than watched auto-deploy, but the review gate is a feature, not a bug.
 
+### D43. Help text is generated dynamically from the command registry
+- **Decision:** `/help` iterates `bot.commands` (sorted by name) and builds the command list from their `.name` and `.description` fields at runtime.
+- **Why:** help text is always in sync with the actual commands; there is no separate documentation to drift. A command's description is assigned once in its `@bot.hybrid_command` decorator. The list is generated every time to pick up any commands added by plugins or tests.
+- **Alternatives rejected:** hardcoded command list (must be kept in sync, easy to drift); reading from a static file (same sync problem); a separate `help_command` handler left to discord.py default (harder to customize, usually less informative).
+- **Cost:** a small runtime cost (iterating 8 commands) on every `!help` call (negligible); each command must have a useful `.description` or `help` will say "No description" for that command. The "Right Now" block (channel, voice, watched users, status) is generated fresh each call so it always reflects the live state.
+
+### D44. Voices command is read-only; voice switching stays GUI-only
+- **Decision:** `/voices` lists installed voices and marks the active one, but never calls `config.set_voice` or `engine.reload`. The GUI (Voice tab) is the only way to switch voices.
+- **Why:** voice switching is a system-wide change that affects all guilds; a public command that anyone could invoke is a risk (spam, accidents). The voice swap involves a multi-second GPU load and is better initiated from a UI where the operator can see the loading state and any errors. Keeping voice switching behind a UI that is local-network-only (Tailscale / zero trust) adds a natural boundary.
+- **Alternatives rejected:** a public `/setvoice` command (spam risk, system-wide impact); rate-limiting on the voices command (still allows spam); requiring a manager role (still allows accidents from legitimate managers). Voice is global per system, not per-guild, so a per-guild permission model would not help.
+- **Cost:** users cannot swap voices from Discord chat; they must reach the web UI. This is intentional to keep voice changes deliberate and auditable.
+
 ---
 
 ## 9. Nuances and gotchas

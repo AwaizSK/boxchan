@@ -46,9 +46,12 @@ Add voices (single-speaker only; multi-speaker models are not offered):
 Every command works as prefix (`COMMAND_PREFIX`, default `!`) and as slash command. Slash needs the `applications.commands` invite scope.
 - `join` — join your voice channel, start this guild's queue worker
 - `leave` — stop playback, clear queue, cancel worker, disconnect, flush guild watch list
-- `watch @user` / `stop @user` — add / remove watched user (persisted in `state.json`, atomic write via `os.replace`, guarded by `asyncio.Lock`)
+- `watch @user` — add watched user and auto-join your voice channel if the bot is not connected (persisted in `state.json`, atomic write via `os.replace`, guarded by `asyncio.Lock`); if you are not in voice, suggests `!join`
+- `stop @user` — remove watched user (persisted in `state.json`)
 - `skip` — stop the clip now playing; worker moves to next
 - `status` — watched users, voice channel, queue depth, CUDA state
+- `help` — list all available commands (dynamically from bot registry) and show current state (channel, voice connection, active voice, watched users)
+- `voices` — list installed Piper voices with quality/language/size, mark the active one (read-only; voice switching is GUI-only)
 
 ## Channel lock
 The bot reads messages and accepts commands only in the text channel chosen per guild. `config.json` (`CONFIG_FILE`, default next to `state.json`; `/var/lib/tts-bot/config.json` in production) is the source of truth and is edited from the Web UI. `TTS_CHANNEL_ID` is only a first-boot seed: it populates a guild with no entry yet and is ignored afterwards. `join` follows whoever runs it into their voice channel.
