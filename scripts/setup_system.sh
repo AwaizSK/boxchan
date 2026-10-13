@@ -58,5 +58,6 @@ systemctl daemon-reload
 echo
 echo "Next:"
 echo "  1) sudo $SRC/scripts/install_token.sh --system"
-echo "  2) sudo $SRC/scripts/deploy.sh"
-echo "  3) sudo systemctl enable tts_bot"
+echo "  2) sudo bash $SRC/scripts/install_deploy.sh --src <runner checkout> --runner-user <ci user>"
+echo "  3) sudo tts-bot-deploy"
+echo "  4) sudo systemctl enable tts_bot"
