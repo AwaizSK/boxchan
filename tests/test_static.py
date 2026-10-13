@@ -28,7 +28,7 @@ class StaticContentTests(unittest.TestCase):
             size = os.path.getsize(os.path.join(STATIC, n))
             self.assertGreater(size, 0, n)
             total += size
-        self.assertLess(total, 40960)
+        self.assertLess(total, 57344)  # 56 KB cap (raised from 40 KB for the Messages tab)
 
     def test_voice_tab_ids_are_wired(self):
         html, js = read("index.html"), read("app.js")
@@ -41,6 +41,17 @@ class StaticContentTests(unittest.TestCase):
         self.assertIn("Hello! This is how I sound.", html)
         # the global shortcuts must not hijack typing in the test box
         self.assertIn("t.tagName === 'INPUT'", js)
+
+    def test_messages_tab_ids_are_wired(self):
+        html, js = read("index.html"), read("app.js")
+        for ident in ("tab-messages", "view-messages", "m-dest", "m-text", "m-count", "m-search", "m-list", "m-chips",
+                      "m-preview", "m-ping", "m-send", "m-preset-ready", "m-preset-clear", "m-note", "m-why"):
+            self.assertIn('id="%s"' % ident, html, ident)
+            if not ident.startswith(("view-", "tab-")):
+                self.assertIn(ident, js, ident)
+        self.assertIn("<textarea", html)
+        # global shortcuts must stay off while the Messages tab is active
+        self.assertIn("S.tab === 'messages') return", js)
 
     def test_csp_safe_content(self):
         for n in FILES:

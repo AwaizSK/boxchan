@@ -54,7 +54,7 @@ Every command works as prefix (`COMMAND_PREFIX`, default `!`) and as slash comma
 The bot reads messages and accepts commands only in the text channel chosen per guild. `config.json` (`CONFIG_FILE`, default next to `state.json`; `/var/lib/tts-bot/config.json` in production) is the source of truth and is edited from the Web UI. `TTS_CHANNEL_ID` is only a first-boot seed: it populates a guild with no entry yet and is ignored afterwards. `join` follows whoever runs it into their voice channel.
 
 ## Web UI
-A small page with two tabs: **Channel** (pick which text channel the bot listens to, pause/resume it, skip or clear the queue, per guild) and **Voice** (see above). Changes apply live; no restart.
+A small page with three tabs: **Channel** (pick which text channel the bot listens to, pause/resume it, skip or clear the queue, per guild), **Voice** (see above) and **Messages** (post as the bot, see below). Changes apply live; no restart.
 
 Start: just run the bot. There is **no login**: the network is the security boundary (see Security notes).
 ```bash
@@ -71,6 +71,14 @@ Later, behind a domain with zero trust (Cloudflare Access, etc.): add the domain
 
 If the port cannot be bound on any address the error is logged and the bot runs without the GUI.
 
+### Messages tab (speak as the bot)
+Write a message and the bot posts it in the server's **configured listen channel** ("Posting to #name as the bot"; with no channel set the tab is disabled until you pick one in the Channel tab). The bot needs **Send Messages** (and View Channel) in that channel, otherwise you get "Bot lacks Send Messages in that channel".
+- **Tag someone:** type in the "Tag someone" box, pick a member (click or Enter); `@Name` is inserted at the cursor and a chip appears (the chip greys out if you delete the name from the text). Only members who can see the channel are listed and accepted. The preview shows the message as it will go out, tagged names highlighted; "Will ping: ..." lists who gets notified.
+- **Presets:** "Ready to use" fills `The voice bot is ready to use! Join a voice channel, type !join here, and I'll read watched users' messages aloud.` (edit it freely) and puts you in the tag box so you can tag the person it is for; "Clear" empties everything.
+- Send with the button or Ctrl/Cmd+Enter. 1 to 2000 characters. Your text is kept if sending fails.
+- Limits: only individual users can be pinged, never `@everyone`, `@here` or roles (typing those words sends plain text with no ping; pasting a raw role mention is refused). At most 10 messages per minute and one every 2 seconds per server (you see "try again in N s").
+- Audit: each send logs one line, `gui message sent guild=... channel=... editor=... chars=N mentions=N`. The message content is never logged.
+
 Keyboard: `/` focus search, Up/Down move, Enter select channel, Esc clear search / leave it.
 
 Multiple editors: every change carries the config revision it was based on. If someone else changed it first the server answers 409 and your view is refreshed; edits by others arrive live over SSE with a toast naming the editor.
@@ -78,7 +86,7 @@ Multiple editors: every change carries the config revision it was based on. If s
 Pause: the bot stops reading messages for that guild (nothing new is queued). Commands (`!join`, `!skip`, ...) still work in the chosen channel, and clips already queued finish unless you press Clear/Skip.
 
 Security notes:
-- No application-layer auth. Trust boundary = who can reach the port: loopback plus Tailscale only, narrowed by your Tailscale ACLs / zero-trust proxy. Two mechanisms enforce it: the bind policy (only loopback/Tailscale addresses are listened on) and a peer-address check on every request (source must be loopback or Tailscale, else `403 bad_peer`), because Linux's weak-host model lets a LAN device route to the Tailscale IP via the LAN address. Recommended extra: host firewall rules (`iptables -I INPUT -d 100.64.0.0/10 ! -i tailscale0 -j DROP`, `ip6tables -I INPUT -d fd7a:115c:a1e0::/48 ! -i tailscale0 -j DROP`). Anyone who can reach it can change the bot's channel.
+- No application-layer auth. Trust boundary = who can reach the port: loopback plus Tailscale only, narrowed by your Tailscale ACLs / zero-trust proxy. Two mechanisms enforce it: the bind policy (only loopback/Tailscale addresses are listened on) and a peer-address check on every request (source must be loopback or Tailscale, else `403 bad_peer`), because Linux's weak-host model lets a LAN device route to the Tailscale IP via the LAN address. Recommended extra: host firewall rules (`iptables -I INPUT -d 100.64.0.0/10 ! -i tailscale0 -j DROP`, `ip6tables -I INPUT -d fd7a:115c:a1e0::/48 ! -i tailscale0 -j DROP`). Anyone who can reach it can change the bot's channel and post messages as the bot in the configured channel (Messages tab).
 - Host allowlist on every request (DNS-rebinding defense) and an Origin check on writes (a cross-site `Origin` gets `403 bad_origin`, and `Sec-Fetch-Site: cross-site` is refused on writes and on all `/api/*` requests; a missing Origin, e.g. curl, is allowed). Strong CSP, no cookies. Plain HTTP: it is safe only because of the network boundary.
 - Accepted limitation: any local process or account on the server can reach `127.0.0.1:8765` and change the channel. Do not run untrusted users on this host.
 - If you put a proxy in front, disable response buffering for `/api/events` (SSE); the server sends `X-Accel-Buffering: no` but the proxy must honor it.

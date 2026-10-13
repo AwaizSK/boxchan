@@ -33,6 +33,7 @@
     <nav class="tabs" role="tablist" aria-label="Sections">
       <button id="tab-channel" type="button" role="tab" aria-selected="true" aria-controls="view-channel">Channel</button>
       <button id="tab-voice" type="button" role="tab" aria-selected="false" aria-controls="view-voice">Voice</button>
+      <button id="tab-messages" type="button" role="tab" aria-selected="false" aria-controls="view-messages">Messages</button>
     </nav>
 
     <div id="view-channel" role="tabpanel" aria-labelledby="tab-channel">
@@ -63,6 +64,30 @@
         <button id="say-btn" type="button">Say it</button>
         <span id="say-note" class="muted"></span>
       </section>
+    </div>
+
+    <div id="view-messages" role="tabpanel" aria-labelledby="tab-messages" hidden>
+      <p id="m-dest" class="dest" role="status"></p>
+      <section aria-label="Presets" class="controls">
+        <button id="m-preset-ready" type="button">Ready to use</button>
+        <button id="m-preset-clear" type="button">Clear</button>
+      </section>
+      <label for="m-text" class="visually">Message</label>
+      <textarea id="m-text" rows="6" placeholder="Write a message the bot will post. Ctrl+Enter sends." autocomplete="off"></textarea>
+      <div class="m-count"><span id="m-count" class="muted" aria-live="off">0/2000</span></div>
+      <section class="tagger" aria-label="Tag someone">
+        <input id="m-search" type="search" placeholder="Tag someone: search members" aria-label="Tag someone: search members" role="combobox" aria-expanded="true" aria-controls="m-list" autocomplete="off" spellcheck="false">
+        <ul id="m-list" role="listbox" aria-label="Members"></ul>
+        <p id="m-note" class="muted" hidden></p>
+      </section>
+      <div id="m-chips" class="chips" aria-label="Tagging"></div>
+      <div class="muted">Preview</div>
+      <div id="m-preview" class="preview" aria-label="Preview of the message"></div>
+      <div class="sendrow">
+        <span id="m-ping" class="muted" role="status"></span>
+        <span id="m-why" class="muted"></span>
+        <button id="m-send" type="button" class="primary">Send</button>
+      </div>
     </div>
   </div>
 </main>

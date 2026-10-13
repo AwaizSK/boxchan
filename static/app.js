@@ -116,9 +116,81 @@ function voiceSwitchText(editor, name) {
   return editor + ' switched voice to ' + (name ? voiceTitle(name) : 'the default voice');
 }
 
+/* --- Messages tab helpers --- */
+const MSG_MAX = 2000;
+const READY_PRESET = "The voice bot is ready to use! Join a voice channel, type !join here, and I'll read watched users' messages aloud.";
+const cpLen = (s) => Array.from(String(s)).length;
+
+// Split text into plain and tagged parts. Only the exact "@label" of a tagged chip matches
+// (longest label first, single pass, not glued to word characters); nothing is ever guessed.
+function segmentText(text, tags) {
+  const list = (tags || []).filter((t) => t && t.label).sort((a, b) => b.label.length - a.label.length);
+  text = String(text);
+  if (!list.length) return [{ text, tag: null }];
+  const by = new Map();
+  for (const t of list) if (!by.has('@' + t.label)) by.set('@' + t.label, t);
+  const alt = Array.from(by.keys()).map((k) => k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
+  const re = new RegExp('(?<![\\p{L}\\p{N}_])(?:' + alt + ')(?![\\p{L}\\p{N}_])', 'gu');
+  const out = [];
+  let last = 0, m;
+  while ((m = re.exec(text))) {
+    if (m.index > last) out.push({ text: text.slice(last, m.index), tag: null });
+    out.push({ text: m[0], tag: by.get(m[0]) });
+    last = m.index + m[0].length;
+  }
+  if (last < text.length || !out.length) out.push({ text: text.slice(last), tag: null });
+  return out;
+}
+
+// The content sent to the server: tagged "@label" -> "<@id>", trimmed.
+function substituteTags(text, tags) {
+  return segmentText(text, tags).map((s) => (s.tag ? '<@' + s.tag.id + '>' : s.text)).join('').trim();
+}
+
+// Set of tag ids whose "@label" currently appears in the text.
+function activeTagIds(text, tags) {
+  const ids = new Set();
+  for (const s of segmentText(text, tags)) if (s.tag) ids.add(s.tag.id);
+  return ids;
+}
+
+// A label that is not already used by a different member.
+function uniqueLabel(name, username, id, tags) {
+  const taken = (l) => (tags || []).some((t) => t.label === l && t.id !== id);
+  for (const l of [name, name + ' (' + username + ')', name + ' (' + id + ')']) if (!taken(l)) return l;
+  return name + ' (' + id + ')';
+}
+
+// Insert `ins` at the selection, with a space before/after when it would touch other text.
+function insertAtCursor(value, start, end, ins) {
+  start = Math.max(0, Math.min(start, value.length));
+  end = Math.max(start, Math.min(end, value.length));
+  const pre = value.slice(0, start), post = value.slice(end);
+  const lead = pre && !/\s$/.test(pre) ? ' ' : '';
+  const trail = post && /^\S/.test(post) ? ' ' : (post ? '' : ' ');
+  const text = pre + lead + ins + trail;
+  return { value: text + post, pos: text.length };
+}
+
+function counterText(n) { return n + '/' + MSG_MAX; }
+function counterState(n) { return n > MSG_MAX ? 'over' : n >= 1900 ? 'near' : ''; }
+
+function pingSummary(names) { return names.length ? 'Will ping: ' + names.join(', ') : 'No pings'; }
+
+// Why Send is disabled right now ('' = it can send).
+function messageBlocker(live, hasChannel, content, busy) {
+  if (!live) return 'Offline';
+  if (!hasChannel) return 'No channel configured';
+  if (!content) return 'Write a message first';
+  if (cpLen(content) > MSG_MAX) return 'Message is too long';
+  if (busy) return 'Please wait…';
+  return '';
+}
+
 if (typeof module !== 'undefined') {
   module.exports = { shouldApplySnapshot, normalizeEditor, shouldRollback, createSSEParser, matchChannel, relTime, backoffDelay, groupChannels,
-    voiceTitle, voiceWarning, sayBlocker, voiceSwitchText };
+    voiceTitle, voiceWarning, sayBlocker, voiceSwitchText,
+    segmentText, substituteTags, activeTagIds, uniqueLabel, insertAtCursor, counterText, counterState, pingSummary, messageBlocker, cpLen, MSG_MAX, READY_PRESET };
 }
 
 /* ---------- app ---------- */
@@ -152,12 +224,13 @@ if (typeof document !== 'undefined') (function () {
     visible: [],
     abort: null,
     started: false,
-    tab: store.get(sessionStorage, 'tab') === 'voice' ? 'voice' : 'channel',
+    tab: ['voice', 'messages'].includes(store.get(sessionStorage, 'tab')) ? store.get(sessionStorage, 'tab') : 'channel',
     voice: { list: null, current: null, configured: null, loading: false },
     vsel: null,           // highlighted (not yet applied) voice stem
     vbusy: false,         // our own apply/say request in flight
     vsig: '',
   };
+  const M = { tags: [], members: [], hi: -1, inflight: false, again: false, timer: null, busy: false, cool: false, note: '', gid: '', q: null };
 
   /* --- toasts --- */
   function toast(msg, opts) {
@@ -388,6 +461,7 @@ if (typeof document !== 'undefined') (function () {
     renderMeta();
     renderControls();
     renderVoice();
+    renderMessages();
   }
 
   function renderMeta() {
@@ -417,6 +491,7 @@ if (typeof document !== 'undefined') (function () {
     for (const id of ['pause', 'skip', 'clear']) $(id).disabled = off;
     $('list').setAttribute('aria-disabled', off ? 'true' : 'false');
     renderVoiceControls();
+    renderMessages();
   }
 
   /* --- voice tab --- */
@@ -426,11 +501,12 @@ if (typeof document !== 'undefined') (function () {
   function setTab(tab) {
     S.tab = tab;
     store.set(sessionStorage, 'tab', tab);
-    for (const t of ['channel', 'voice']) {
+    for (const t of ['channel', 'voice', 'messages']) {
       $('view-' + t).hidden = t !== tab;
       $('tab-' + t).setAttribute('aria-selected', t === tab ? 'true' : 'false');
     }
     if (tab === 'voice' && !V().list) loadVoices(false);
+    if (tab === 'messages') { renderMessages(); fetchMembers(); }
     renderVoice();
   }
 
@@ -544,6 +620,153 @@ if (typeof document !== 'undefined') (function () {
         tts_unavailable: 'The TTS engine is not loaded', bad_request: 'Enter some speakable text', too_long: 'Text is too long (max 200)' }[e.message];
       if (!e.denied) toast(msg || 'Could not play the test phrase: ' + friendly(e), { error: true });
     } finally { S.vbusy = false; renderVoiceControls(); }
+  }
+
+  /* --- messages tab --- */
+  const mText = () => $('m-text').value;
+  const mContent = () => substituteTags(mText(), M.tags);
+  const hasChannel = () => !!gcfg().channel_id && !!chName(gcfg().channel_id);
+
+  function renderMessages() {
+    if (!$('m-text')) return;
+    const cid = gcfg().channel_id, name = cid ? chName(cid) : null;
+    const dest = $('m-dest');
+    dest.classList.toggle('off', !name);
+    dest.textContent = name ? 'Posting to ' + name + ' as the bot'
+      : cid ? 'The configured channel is missing — pick another in the Channel tab'
+        : 'No channel is configured — pick one in the Channel tab to enable messages';
+    const content = mContent(), n = cpLen(content);
+    const cnt = $('m-count');
+    cnt.textContent = counterText(n);
+    cnt.className = 'muted ' + counterState(n);
+    const act = activeTagIds(mText(), M.tags);
+    // chips
+    const chips = $('m-chips');
+    chips.textContent = '';
+    for (const t of M.tags) {
+      const on = act.has(t.id);
+      const c = el('span', 'chip' + (on ? '' : ' off'));
+      c.appendChild(el('span', null, '@' + t.label));
+      if (!on) c.appendChild(el('span', 'muted', 'not in message'));
+      const b = el('button', null, '×');
+      b.type = 'button';
+      b.dataset.id = t.id;
+      b.setAttribute('aria-label', 'Remove ' + t.label);
+      c.appendChild(b);
+      chips.appendChild(c);
+    }
+    // preview
+    const pv = $('m-preview');
+    pv.textContent = '';
+    const text = mText();
+    if (!text.trim()) pv.appendChild(el('span', 'muted', 'Nothing to send yet'));
+    else for (const seg of segmentText(text, M.tags)) {
+      if (seg.tag) pv.appendChild(el('span', 'tag', seg.text));
+      else pv.appendChild(document.createTextNode(seg.text));
+    }
+    const names = M.tags.filter((t) => act.has(t.id)).map((t) => t.label);
+    const live = S.conn === 'live' && !!S.cfg;
+    const why = messageBlocker(live, hasChannel(), content, M.busy || M.cool);
+    $('m-ping').textContent = pingSummary(names);
+    $('m-why').textContent = M.busy || M.cool ? '' : why;
+    $('m-send').disabled = !!why;
+    $('m-search').disabled = !hasChannel();
+    $('m-note').hidden = !M.note;
+    $('m-note').textContent = M.note;
+    renderMemberList();
+  }
+
+  function renderMemberList() {
+    const ul = $('m-list');
+    ul.textContent = '';
+    M.members.forEach((m, i) => {
+      const li = el('li', 'opt' + (i === M.hi ? ' hi' : ''));
+      li.dataset.i = String(i);
+      li.setAttribute('role', 'option');
+      li.setAttribute('aria-selected', i === M.hi ? 'true' : 'false');
+      li.appendChild(el('span', 'nm', m.name));
+      if (m.bot) li.appendChild(el('span', 'badge q', 'bot'));
+      li.appendChild(el('span', 'meta', '@' + m.username));
+      ul.appendChild(li);
+    });
+  }
+
+  function scheduleMembers() {
+    clearTimeout(M.timer);
+    M.timer = setTimeout(fetchMembers, 200);
+  }
+
+  async function fetchMembers() {
+    if (S.tab !== 'messages' || !S.gid || S.conn !== 'live' || !hasChannel()) return;
+    if (M.inflight) { M.again = true; return; }
+    const q = $('m-search').value.trim(), gid = S.gid;
+    if (M.gid === gid && M.q === q) return;
+    M.inflight = true; M.again = false;
+    try {
+      const d = await api('GET', '/api/guilds/' + gid + '/members?q=' + encodeURIComponent(q));
+      if (gid === S.gid) {
+        M.members = d.members || []; M.hi = M.members.length ? 0 : -1; M.gid = gid; M.q = q;
+        M.note = d.truncated ? 'Showing the first 25 — type to narrow down' : (M.members.length ? '' : 'No matching members');
+      }
+    } catch (e) {
+      M.note = e.message === 'no_channel' ? 'No channel configured' : 'Could not load members';
+      M.members = [];
+    } finally {
+      M.inflight = false;
+      renderMessages();
+      if (M.again || $('m-search').value.trim() !== q) fetchMembers();
+    }
+  }
+
+  function resetMessages() {   // switching server: tags belong to one server's members
+    M.tags = []; M.members = []; M.hi = -1; M.gid = ''; M.q = null; M.note = '';
+    $('m-search').value = '';
+  }
+
+  function pickMember(m) {
+    let t = M.tags.find((x) => x.id === m.id);
+    if (!t) { t = { id: m.id, label: uniqueLabel(m.name, m.username, m.id, M.tags) }; M.tags.push(t); }
+    const ta = $('m-text');
+    const r = insertAtCursor(ta.value, ta.selectionStart, ta.selectionEnd, '@' + t.label);
+    ta.value = r.value;
+    $('m-search').value = ''; M.q = null;
+    renderMessages();
+    ta.focus();
+    ta.setSelectionRange(r.pos, r.pos);
+    fetchMembers();
+  }
+
+  function preset(text, clearTags) {
+    $('m-text').value = text;
+    if (clearTags) M.tags = [];
+    $('m-text').setSelectionRange(0, 0);   // a tag lands at the start: "@Name The voice bot is ready..."
+    renderMessages();
+    if (text) $('m-search').focus(); else $('m-text').focus();
+  }
+
+  const SEND_ERRORS = {
+    bad_mention: 'Someone you tagged cannot see that channel (or a role mention was used). Remove the tag and retry',
+    no_channel: 'No usable channel is configured for this server',
+    bad_request: 'The message is empty or too long',
+    discord_error: 'Discord refused the message. Try again in a moment',
+  };
+
+  async function sendMessage() {
+    const content = mContent(), source = mText(), gid = S.gid;
+    if (M.busy || M.cool || messageBlocker(S.conn === 'live' && !!S.cfg, hasChannel(), content, false)) return;
+    M.busy = true; renderMessages();
+    try {
+      await api('POST', '/api/guilds/' + gid + '/send', { content });
+      if (mText() === source) { $('m-text').value = ''; M.tags = []; }
+      toast('Sent');
+      M.cool = true;
+      setTimeout(() => { M.cool = false; renderMessages(); }, 2000);
+    } catch (e) {
+      if (e.denied) { /* host guard already toasted */ }
+      else if (e.status === 429) toast('Slow down: try again in ' + ((e.body && e.body.retry_after) || 2) + ' s', { error: true });
+      else if (e.status === 403 && e.message === 'missing_permission') toast('Bot lacks Send Messages in that channel', { error: true });
+      else toast(SEND_ERRORS[e.message] || 'Could not send: ' + friendly(e), { error: true });
+    } finally { M.busy = false; renderMessages(); }
   }
 
   /* --- actions --- */
@@ -697,7 +920,7 @@ if (typeof document !== 'undefined') (function () {
     setConn('connecting');
     attempt = 0;
     setTab(S.tab);
-    refetch().then(() => { if (S.tab === 'channel') $('search').focus(); });
+    refetch().then(() => { if (S.tab === 'channel') $('search').focus(); else if (S.tab === 'messages') fetchMembers(); });
     connectLoop();
   }
 
@@ -716,13 +939,46 @@ if (typeof document !== 'undefined') (function () {
     S.gid = e.target.value;
     store.set(sessionStorage, 'gid', S.gid);
     S.hi = null;
+    resetMessages();
     renderList(); renderConfig(); renderStatus();
+    if (S.tab === 'messages') fetchMembers();
   });
   $('pause').addEventListener('click', doPause);
   $('skip').addEventListener('click', doSkip);
   $('clear').addEventListener('click', doClear);
   $('tab-channel').addEventListener('click', () => setTab('channel'));
   $('tab-voice').addEventListener('click', () => setTab('voice'));
+  $('tab-messages').addEventListener('click', () => setTab('messages'));
+  $('m-text').addEventListener('input', renderMessages);
+  $('m-text').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey) && !e.isComposing) { e.preventDefault(); sendMessage(); }
+  });
+  $('m-send').addEventListener('click', sendMessage);
+  $('m-preset-ready').addEventListener('click', () => preset(READY_PRESET, false));
+  $('m-preset-clear').addEventListener('click', () => preset('', true));
+  $('m-chips').addEventListener('click', (e) => {
+    const b = e.target.closest('button[data-id]');
+    if (b) { M.tags = M.tags.filter((t) => t.id !== b.dataset.id); renderMessages(); }
+  });
+  $('m-list').addEventListener('click', (e) => {
+    const li = e.target.closest('.opt[data-i]');
+    if (li && M.members[+li.dataset.i]) pickMember(M.members[+li.dataset.i]);
+  });
+  $('m-search').addEventListener('focus', fetchMembers);
+  $('m-search').addEventListener('input', scheduleMembers);
+  $('m-search').addEventListener('keydown', (e) => {
+    if (e.isComposing) return;
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      if (M.members.length) { M.hi = Math.min(M.members.length - 1, Math.max(0, M.hi + (e.key === 'ArrowDown' ? 1 : -1))); renderMemberList(); }
+    } else if (e.key === 'Enter') {
+      e.preventDefault();
+      if (M.members[M.hi]) pickMember(M.members[M.hi]);
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      if ($('m-search').value) { $('m-search').value = ''; scheduleMembers(); }
+    }
+  });
   $('v-apply').addEventListener('click', () => { if (S.vsel) applyVoice(S.vsel); });
   $('v-reset').addEventListener('click', () => applyVoice(null));
   $('v-rescan').addEventListener('click', () => loadVoices(true));
@@ -749,6 +1005,7 @@ if (typeof document !== 'undefined') (function () {
   document.addEventListener('keydown', (e) => {
     if ($('ui').hidden || e.isComposing || e.ctrlKey || e.metaKey || e.altKey) return;
     const t = e.target, typing = t && (t.tagName === 'INPUT' || t.tagName === 'SELECT' || t.tagName === 'TEXTAREA');
+    if (S.tab === 'messages') return;   // typing areas own their keys; no global shortcuts here
     if (S.tab === 'voice') {
       const list = V().list || [];
       if (t === $('v-list') && (e.key === 'ArrowDown' || e.key === 'ArrowUp') && list.length) {

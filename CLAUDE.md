@@ -17,7 +17,7 @@ every decision: `docs/ARCHITECTURE.md` (read it before non-trivial changes).
   Never edit `config.json` or `ConfigStore._guilds` directly; writes use `atomic_write_json`.
 - The web UI talks to the bot only via `Controller` (bot.py); `webui.py` must not import `bot.py`.
 - Frontend: vanilla JS, no CDN/framework, no inline script/style, `textContent` only
-  (strict CSP; `tests/test_static.py` enforces it). Static payload stays < 40 KB.
+  (strict CSP; `tests/test_static.py` enforces it). Static payload stays < 56 KB (cap in `tests/test_static.py`).
 - Fail closed: unconfigured guild reads nothing; a GUI bind address outside loopback/Tailscale disables the GUI;
   `maybe_start_webui` must never crash the bot.
 - Do not run `scripts/deploy.sh`, `setup_system.sh` or anything with sudo unless asked.
@@ -37,6 +37,7 @@ No live Discord/GPU/browser tests exist; say so rather than claiming they passed
   `Controller`, `config_watcher`, `maybe_start_webui`, `shutdown`.
 - `tts_engine.py`: `TTSEngine` (Piper, CUDA->CPU fallback, `reload` hot swap), `clean_discord_text`, `clean_plain_text`.
 - `voices.py`: `discover_voices`, `resolve_voice`, `VoiceLoadError`/`BadVoiceError`/`SayError` (pure stdlib).
+- `messages.py`: `MessageError`, `parse_mentions`, `SendLimiter` (pure stdlib; used by `Controller.send_message` and `webui.py`).
 - `config_store.py`: `ConfigStore` (rev, optimistic concurrency, `ConflictError`), `EventHub`, `atomic_write_json`.
 - `webui.py`: `make_app`, `start_webui`, `validate_bind_hosts`, `detect_tailscale_addrs`; peer/Host/Origin checks, REST, SSE. No token auth.
 - `static/{index,app}.{html,js}`, `static/app.css`: the UI (`app.js` helpers are node-testable).
@@ -49,6 +50,7 @@ No live Discord/GPU/browser tests exist; say so rather than claiming they passed
 - `config.json` (`CONFIG_FILE`) = channel + pause per guild, global `rev`; writes carry `rev`, mismatch -> 409.
   `TTS_CHANNEL_ID` is only a first-boot seed. `state.json` (`STATE_FILE`) = watch list.
 - The Piper voice is GLOBAL (`config.json` top-level `voice`, null = `PIPER_MODEL_PATH`). `Controller.apply_voice` order: resolve name -> `expected_rev` check (409) -> `engine.reload` (old voice stays on failure, 422) -> `config.set_voice(expected_rev=None)` (OSError -> engine reverted, 500). Voices are scanned from `PIPER_MODELS_DIR` on demand (Rescan), addressed only by file stem; multi-speaker models are skipped. `deploy.sh` never prunes `/opt/tts-bot/models`; add voices with `scripts/install_voice.sh` (no restart). A swap briefly holds two sessions on the GPU; restart clears growth.
+- Messages tab: `POST /api/guilds/{gid}/send` posts as the bot ONLY in `config.channel_for(gid)`; user mentions only (`allowed_mentions` users=validated ids, roles/everyone off, `<@&id>` rejected); every tagged user must be able to view the channel; 10 per 60 s + 2 s gap per guild (`SendLimiter`, reserved before the await); body limit 16 KB app-wide; audit log has editor + counts, never content. `GET .../members?q=` feeds the picker (max 25, `guild.chunk()` once if not chunked).
 - Channel swap drains that guild's queue (not the playing clip); pause only stops reading new messages.
 - Wire IDs are strings (JS precision); internal IDs are ints. `X-Editor` is percent-encoded by the client.
 - GUI has NO token: network layer is the boundary. Binds loopback + auto-detected Tailscale addrs (re-detected every 15 s until found) on `WEBUI_PORT` (8765); every request's TCP peer must be loopback/Tailscale (`bad_peer`, weak-host model); `WEBUI_HOSTS` overrides (loopback/Tailscale only, else GUI disabled); Host allowlist + `WEBUI_ALLOWED_HOSTS` (MagicDNS/domain) and Origin check on writes; SSE needs proxy buffering off. Any local process can reach loopback (accepted).

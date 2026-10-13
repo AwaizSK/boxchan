@@ -1,6 +1,8 @@
 const assert = require('assert');
 const { shouldApplySnapshot, normalizeEditor, shouldRollback, createSSEParser, matchChannel, relTime, backoffDelay, groupChannels,
-  voiceTitle, voiceWarning, sayBlocker, voiceSwitchText } = require('../static/app.js');
+  voiceTitle, voiceWarning, sayBlocker, voiceSwitchText,
+  segmentText, substituteTags, activeTagIds, uniqueLabel, insertAtCursor, counterText, counterState, pingSummary, messageBlocker,
+  cpLen, READY_PRESET } = require('../static/app.js');
 
 const got = [];
 const feed = createSSEParser((n, d) => got.push([n, d]));
@@ -62,4 +64,62 @@ assert.strictEqual(sayBlocker(true, { voice: 'Lounge' }, true), 'Voice is loadin
 assert.strictEqual(sayBlocker(true, { voice: 'Lounge' }, false), '');
 assert.strictEqual(voiceSwitchText('bob', 'en_US-kristin-medium'), 'bob switched voice to Kristin');
 assert.strictEqual(voiceSwitchText('bob', null), 'bob switched voice to the default voice');
+
+// --- Messages tab helpers ---
+const bob = { id: '11', label: 'Bob' }, al = { id: '12', label: 'Al' }, alice = { id: '13', label: 'Alice' };
+assert.strictEqual(substituteTags('hi @Bob!', [bob]), 'hi <@11>!');
+assert.strictEqual(substituteTags('@Bob and @Bob', [bob]), '<@11> and <@11>');
+assert.strictEqual(substituteTags('hi @Bob', []), 'hi @Bob');                 // never guessed
+assert.strictEqual(substituteTags('hi @Carl', [bob]), 'hi @Carl');
+assert.strictEqual(substituteTags('hi @bob', [bob]), 'hi @bob');             // exact (case-sensitive)
+assert.strictEqual(substituteTags('  @Bob  ', [bob]), '<@11>');             // trimmed like the server
+// longest label first and overlapping names
+assert.strictEqual(substituteTags('@Alice @Al', [al, alice]), '<@13> <@12>');
+assert.strictEqual(substituteTags('@Alice @Al', [alice, al]), '<@13> <@12>');
+assert.strictEqual(substituteTags('@Alicex', [al, alice]), '@Alicex');       // not glued to a longer word
+assert.strictEqual(substituteTags('x@Bob', [bob]), 'x@Bob');
+assert.strictEqual(substituteTags('@Bob,@Bob.', [bob]), '<@11>,<@11>.');
+// labels with regex metacharacters and spaces; output is not re-scanned
+assert.strictEqual(substituteTags('hey @J.R. (x) ok', [{ id: '5', label: 'J.R. (x)' }]), 'hey <@5> ok');
+assert.strictEqual(substituteTags('@a @b', [{ id: '1', label: 'a' }, { id: '2', label: '1' }]), '<@1> @b');
+assert.strictEqual(substituteTags('@田中', [{ id: '9', label: '田中' }]), '<@9>');
+assert.strictEqual(substituteTags('line1\n@Bob\nline3', [bob]), 'line1\n<@11>\nline3');
+// segments (preview)
+assert.deepStrictEqual(segmentText('a @Bob b', [bob]), [{ text: 'a ', tag: null }, { text: '@Bob', tag: bob }, { text: ' b', tag: null }]);
+assert.deepStrictEqual(segmentText('', [bob]), [{ text: '', tag: null }]);
+assert.deepStrictEqual(segmentText('plain', []), [{ text: 'plain', tag: null }]);
+// chip active / inactive
+assert.deepStrictEqual(Array.from(activeTagIds('hi @Bob', [bob, al])), ['11']);
+assert.deepStrictEqual(Array.from(activeTagIds('hi', [bob, al])), []);
+assert.deepStrictEqual(Array.from(activeTagIds('@Alice', [al, alice])), ['13']);
+// unique labels
+assert.strictEqual(uniqueLabel('Bob', 'bob99', '1', []), 'Bob');
+assert.strictEqual(uniqueLabel('Bob', 'bob99', '2', [{ id: '1', label: 'Bob' }]), 'Bob (bob99)');
+assert.strictEqual(uniqueLabel('Bob', 'bob99', '1', [{ id: '1', label: 'Bob' }]), 'Bob');
+assert.strictEqual(uniqueLabel('Bob', 'bob99', '3', [{ id: '1', label: 'Bob' }, { id: '2', label: 'Bob (bob99)' }]), 'Bob (3)');
+// insert at cursor
+assert.deepStrictEqual(insertAtCursor('', 0, 0, '@Bob'), { value: '@Bob ', pos: 5 });
+assert.deepStrictEqual(insertAtCursor('hello', 5, 5, '@Bob'), { value: 'hello @Bob ', pos: 11 });
+assert.deepStrictEqual(insertAtCursor('hello world', 5, 5, '@Bob'), { value: 'hello @Bob world', pos: 10 });
+assert.deepStrictEqual(insertAtCursor('hi there', 3, 8, '@Bob'), { value: 'hi @Bob ', pos: 8 });
+assert.deepStrictEqual(insertAtCursor('abc', 0, 0, '@Bob'), { value: '@Bob abc', pos: 5 });
+assert.deepStrictEqual(insertAtCursor('abc', 99, 99, '@B'), { value: 'abc @B ', pos: 7 });
+// counter and ping text
+assert.strictEqual(counterText(0), '0/2000');
+assert.strictEqual(counterText(1999), '1999/2000');
+assert.strictEqual(counterState(1899), '');
+assert.strictEqual(counterState(1900), 'near');
+assert.strictEqual(counterState(2000), 'near');
+assert.strictEqual(counterState(2001), 'over');
+assert.strictEqual(cpLen('a\u{1F600}b'), 3);
+assert.strictEqual(pingSummary([]), 'No pings');
+assert.strictEqual(pingSummary(['A', 'B']), 'Will ping: A, B');
+// send blocker
+assert.strictEqual(messageBlocker(false, true, 'x', false), 'Offline');
+assert.strictEqual(messageBlocker(true, false, 'x', false), 'No channel configured');
+assert.strictEqual(messageBlocker(true, true, '', false), 'Write a message first');
+assert.strictEqual(messageBlocker(true, true, 'x'.repeat(2001), false), 'Message is too long');
+assert.strictEqual(messageBlocker(true, true, 'x'.repeat(2000), false), '');
+assert.strictEqual(messageBlocker(true, true, 'x', true), 'Please wait…');
+assert.ok(READY_PRESET.startsWith('The voice bot is ready to use!') && cpLen(READY_PRESET) < 2000);
 console.log('ok');
