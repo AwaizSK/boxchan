@@ -1,5 +1,10 @@
 name: Deploy TTS Bot
 
+# Security model: pull requests run ONLY the `test` job on GitHub-hosted runners.
+# The self-hosted runner (production host) is reachable only from the `deploy` job,
+# which runs for pushes to main after `test` passed. Never use pull_request_target here.
+# Actions are pinned to major tags; pinning to full commit SHAs is recommended.
+
 on:
   push:
     branches:
@@ -8,29 +13,73 @@ on:
     branches:
       - main
 
-jobs:
-  test-and-deploy:
-    runs-on: self-hosted
+permissions:
+  contents: read
 
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: pip install "discord.py[voice]>=2.4" "PyNaCl>=1.5" "python-dotenv>=1.0"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
 
       - name: Build Frontend (Vite)
         run: |
-          export PATH="/home/jb/.nvm/versions/node/v22.23.0/bin:$PATH"
           cd frontend
           npm ci
           npm run build
 
       - name: Run Test Suite
         run: |
-          source ~/miniconda3/etc/profile.d/conda.sh
-          conda activate tts-bot
-          export PATH="/home/jb/.nvm/versions/node/v22.23.0/bin:$PATH"
           python -m unittest discover -s tests -v
           bash tests/test_deploy_validation.sh
           node tests/static_logic.js
+
+      - name: Upload built static files
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: static-build
+          path: static/
+          if-no-files-found: error
+
+  deploy:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: self-hosted
+    environment: production
+    timeout-minutes: 10
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Download built static files
+        uses: actions/download-artifact@v4
+        with:
+          name: static-build
+          path: static/
 
       - name: Link Models Directory
         run: |
@@ -42,6 +91,4 @@ jobs:
           fi
 
       - name: Deploy to /opt/tts-bot & Restart Service
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        run: |
-          sudo /opt/workspace/boxchan/scripts/deploy.sh "$GITHUB_WORKSPACE"
+        run: sudo -n /usr/local/sbin/tts-bot-deploy
