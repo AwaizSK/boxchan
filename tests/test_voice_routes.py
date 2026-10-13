@@ -19,6 +19,10 @@ SECRETS = ("/", "Traceback", "Error:", "onnx")  # bodies of error responses must
 
 
 class Routes(tw.Base):
+    async def asyncSetUp(self):
+        tw.quiet_loggers(self)
+        await super().asyncSetUp()
+
     def put_voice(self, body, headers=ED):
         return self.client.put("/api/voice", json=body, headers=headers)
 
@@ -192,7 +196,6 @@ class SSEVoiceTests(Routes):
             def status_view(self): return {}
 
         app = webui.make_app(self.config, Old(), allowed_hosts=[], static_dir=self.static)
-        from aiohttp.test_utils import TestClient, TestServer
         async with TestClient(TestServer(app)) as c:
             r = await c.get("/api/events")
             ev, data = await tw.read_event(r)
