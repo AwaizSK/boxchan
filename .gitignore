@@ -11,6 +11,6 @@ __pycache__/
 models/*.onnx
 models/*.onnx.json
 .superpowers/
-.claude/settings.local.json
+.claude/
 repomix-output.xml
 features.json
