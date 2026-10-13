@@ -1,9 +1,11 @@
 """Web backend: REST + SSE. No application-layer auth: the network layer (loopback + Tailscale ACLs)
 is the trust boundary; this module enforces a bind-address policy, a Host allowlist and an Origin
 check on writes. Duck-typed on the controller; never imports bot.py."""
+import argparse
 import asyncio
 import base64
 import contextlib
+import getpass
 import hashlib
 import hmac
 import ipaddress
@@ -13,6 +15,7 @@ import os
 import re
 import secrets
 import subprocess
+import sys
 import threading
 import time
 import unicodedata
@@ -118,6 +121,17 @@ def _split_raw(raw):
         elif isinstance(v, dict):
             recs.append({**v, "username": str(k)})
     return recs, (lambda r: {**raw, "users": r}) if wrapped else (lambda r: r)
+
+
+def _read_users_file(path: str):
+    """(records, rebuild) of the file on disk; ([], identity) when it does not exist yet.
+    Raises (OSError / ValueError) rather than guess when it exists but cannot be understood."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except FileNotFoundError:
+        return [], (lambda recs: recs)
+    return _split_raw(raw)
 
 
 def _groups_of(rec: dict) -> set[str]:
@@ -255,13 +269,7 @@ class AuthManager:
         return result
 
     def _read_records(self):
-        """(records, rebuild) of the file on disk; ([], identity) when it does not exist yet."""
-        try:
-            with open(self.users_file, "r", encoding="utf-8") as f:
-                raw = json.load(f)
-        except FileNotFoundError:
-            return [], (lambda recs: recs)
-        return _split_raw(raw)
+        return _read_users_file(self.users_file)
 
     def _write_records(self, rebuild, records) -> None:
         for rec in records:  # persist the legacy "admin without groups" migration
@@ -1256,3 +1264,106 @@ async def start_webui(app: web.Application, hosts: list[str], port: int, *,
             _retry_binds(runner, pending, port, retry_interval, detect, set(hosts), tailnet_found),
             name="webui-bind-retry")
     return runner
+
+
+# ---------- user bootstrap CLI ----------
+USERNAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,40}$")
+
+
+def main_cli(argv=None, *, getpass_fn=getpass.getpass, environ=None, stdout=None, stderr=None) -> int:
+    """`python webui.py add-user|list-users|remove-user ...` -- manage the web UI users file.
+    Passwords are only ever read from an interactive prompt (never argv or the environment)."""
+    out = stdout if stdout is not None else sys.stdout
+    err = stderr if stderr is not None else sys.stderr
+    env = os.environ if environ is None else environ
+
+    def say(msg, stream=out):
+        print(msg, file=stream)
+
+    parser = argparse.ArgumentParser(prog="webui.py", description="Manage web UI users.")
+    parser.add_argument("--users-file", help="users file (default: $USERS_FILE)")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    p_add = sub.add_parser("add-user", help="create a user or change a user's password")
+    p_add.add_argument("username")
+    p_add.add_argument("--admin", action="store_true", help="put the user in the admin group")
+    sub.add_parser("list-users", help="list user names and groups")
+    p_rm = sub.add_parser("remove-user", help="delete a user")
+    p_rm.add_argument("username")
+    # global option is accepted before or after the sub-command
+    for p in (p_add, p_rm, sub.choices["list-users"]):
+        p.add_argument("--users-file", dest="users_file_sub", default=None, help=argparse.SUPPRESS)
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as e:
+        return int(e.code or 0) if isinstance(e.code, int) else 2
+
+    path = args.users_file_sub or args.users_file or env.get("USERS_FILE") or ""
+    if not path:
+        say("error: no users file: pass --users-file PATH or set USERS_FILE", err)
+        return 2
+    try:
+        records, rebuild = _read_users_file(path)
+    except (OSError, ValueError) as e:
+        say(f"error: cannot use {path}: {type(e).__name__}; refusing to overwrite it", err)
+        return 1
+
+    if args.cmd == "list-users":
+        if not os.path.exists(path):
+            say(f"error: {path} does not exist", err)
+            return 1
+        for rec in records:
+            if isinstance(rec, dict) and rec.get("username"):
+                groups = sorted(_groups_of(rec)) or ["user"]
+                say(f"{rec['username']}\t{','.join(groups)}")
+        return 0
+
+    name = args.username.strip()
+    lower = name.lower()
+    if not USERNAME_RE.match(name):
+        say("error: username must be 1-40 characters of A-Z a-z 0-9 _ . -", err)
+        return 1
+
+    if args.cmd == "remove-user":
+        kept = [r for r in records if not _is_user_rec(r, lower)]
+        if len(kept) == len(records):
+            say(f"error: no such user: {name}", err)
+            return 1
+        atomic_write_json(rebuild(kept), path)
+        say(f"removed {name}")
+        return 0
+
+    # add-user
+    pw1 = getpass_fn("Password: ")
+    pw2 = getpass_fn("Repeat password: ")
+    if pw1 != pw2:
+        say("error: passwords do not match", err)
+        return 1
+    if password_policy_error(pw1):
+        say(f"error: password must be {MIN_PASSWORD_LEN} to {MAX_PASSWORD_LEN} characters and not a well-known default", err)
+        return 1
+    new_hash = hash_password(pw1)
+    for rec in records:
+        if _is_user_rec(rec, lower):
+            groups = _groups_of(rec) or ({"admin"} if lower == "admin" else {"user"})
+            if args.admin:
+                groups.add("admin")
+            rec.pop("role", None)
+            rec.pop("is_admin", None)
+            rec["groups"] = sorted(groups)
+            rec["password"] = new_hash
+            verb = "updated"
+            break
+    else:
+        records.append({"username": name, "password": new_hash, "groups": ["admin"] if args.admin else ["user"]})
+        verb = "created"
+    try:
+        atomic_write_json(rebuild(records), path)  # new files are created 0600
+    except OSError as e:
+        say(f"error: cannot write {path}: {type(e).__name__}", err)
+        return 1
+    say(f"{verb} {name}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main_cli())
