@@ -1,0 +1,58 @@
+# CLAUDE.md
+
+Discord TTS bot: reads watched users' messages aloud in a voice channel with Piper
+(ONNX Runtime GPU, CUDA, FP32, GTX 1060). One Python 3.11 process: discord.py client,
+per-guild queue + worker, single-thread GPU engine, and an aiohttp web UI (REST + SSE)
+that hot-swaps the listened-to text channel at runtime. Full detail and the "why" of
+every decision: `docs/ARCHITECTURE.md` (read it before non-trivial changes).
+
+## Hard rules
+- NEVER read, print, log, commit or paste secrets. Off-limits: `.env`, `~/.config/tts-bot/*`,
+  `/etc/tts-bot/*`, any file named `token` or `gui_token`. Do not echo token values or lengths
+  beyond what existing code already logs.
+- Do not add dependencies (pip/conda) without asking. Stdlib + aiohttp (ships with discord.py) only.
+- All Piper/GPU work stays on the single worker thread in `TTSEngine` (`max_workers=1` + lock).
+  Never run inference on the event loop or add a second executor.
+- Channel/pause changes go through `ConfigStore` (`set_channel`, `set_enabled`, `seed_channel`).
+  Never edit `config.json` or `ConfigStore._guilds` directly; writes use `atomic_write_json`.
+- The web UI talks to the bot only via `Controller` (bot.py); `webui.py` must not import `bot.py`.
+- Frontend: vanilla JS, no CDN/framework, no inline script/style, `textContent` only
+  (strict CSP; `tests/test_static.py` enforces it). Static payload stays < 40 KB.
+- Fail closed: unconfigured guild reads nothing; GUI token < 24 chars disables the GUI;
+  `maybe_start_webui` must never crash the bot.
+- Do not run `scripts/deploy.sh`, `setup_system.sh` or anything with sudo unless asked.
+- Commits: conventional style, end with `Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>`.
+
+## Commands
+```
+~/miniconda3/envs/tts-bot/bin/python -m unittest discover -s tests -v   # unittest, no pytest
+bash tests/test_deploy_validation.sh                                    # deploy validator
+~/miniconda3/envs/tts-bot/bin/python -m py_compile bot.py webui.py config_store.py tts_engine.py
+~/miniconda3/envs/tts-bot/bin/python bot.py                             # dev run (needs your own dev token)
+```
+No live Discord/GPU/browser tests exist; say so rather than claiming they passed.
+
+## File map
+- `bot.py`: entry, events, hybrid commands, `WatchStore` (state.json), `GuildAudio` + `audio_worker`,
+  `Controller`, `config_watcher`, `maybe_start_webui`, `shutdown`.
+- `tts_engine.py`: `TTSEngine` (Piper, CUDA->CPU fallback), `clean_discord_text`.
+- `config_store.py`: `ConfigStore` (rev, optimistic concurrency, `ConflictError`), `EventHub`, `atomic_write_json`.
+- `webui.py`: `make_app`, `start_webui`, `load_gui_token`; bearer auth, throttle, REST, SSE.
+- `static/{index,app}.{html,js}`, `static/app.css`: the UI (`app.js` helpers are node-testable).
+- `tts_bot.service`: hardened systemd unit (`ttsbot` user, `LoadCredential` for both tokens).
+- `scripts/`: `setup_system.sh`, `deploy.sh` (+ `lib/deploy_validate.sh`), `install_token.sh`, `gen_gui_token.sh`.
+- `tests/`: unittest suites + `static_logic.js` + `test_deploy_validation.sh`.
+- `docs/ARCHITECTURE.md`: architecture, decision log, gotchas, runbook.
+
+## Key facts
+- `config.json` (`CONFIG_FILE`) = channel + pause per guild, global `rev`; writes carry `rev`, mismatch -> 409.
+  `TTS_CHANNEL_ID` is only a first-boot seed. `state.json` (`STATE_FILE`) = watch list.
+- Channel swap drains that guild's queue (not the playing clip); pause only stops reading new messages.
+- Wire IDs are strings (JS precision); internal IDs are ints. `X-Editor` is percent-encoded by the client.
+- GUI binds `127.0.0.1:8765` (`WEBUI_HOST`, `WEBUI_PORT`); access via SSH tunnel; SSE needs proxy buffering off.
+- piper-tts is pinned to 1.2.0 (`synthesize_stream_raw`); CPU `onnxruntime` must stay uninstalled.
+- Prod layout: code root-owned `/opt/tts-bot`, state `/var/lib/tts-bot`, tokens in `/etc/tts-bot`.
+  Anyone who can get code deployed can read the Discord token: review changes before deploy.
+- Unit refuses to start without `/etc/tts-bot/gui_token` (and `bot.env`); upgrading needs
+  gen_gui_token -> setup_system -> deploy, not deploy alone.
+- Importing `bot.py` has side effects; tests set env vars (`STATE_FILE`, `CONFIG_FILE`, ...) first.
