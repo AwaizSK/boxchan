@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - main
+  pull_request:
+    branches:
+      - main
 
 jobs:
   test-and-deploy:
@@ -31,5 +34,6 @@ jobs:
           fi
 
       - name: Deploy to /opt/tts-bot & Restart Service
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: |
           sudo /opt/workspace/boxchan/scripts/deploy.sh "$GITHUB_WORKSPACE"
