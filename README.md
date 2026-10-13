@@ -24,7 +24,7 @@ The Web UI has a **Voice** tab: pick any installed Piper voice, press **Apply** 
 Add voices (single-speaker only; multi-speaker models are not offered):
 1. Download both files (`<name>.onnx` and `<name>.onnx.json`) from https://huggingface.co/rhasspy/piper-voices (listen first on https://rhasspy.github.io/piper-samples). Each voice has its own licence on its model card; check it before use.
 2. Production, no restart: `sudo scripts/install_voice.sh path/to/en_US-amy-medium.onnx` (the JSON is picked up next to it, or pass it as the second argument). A new voice is created as a .json/.onnx pair (rolled back together if the second link fails); `--force` removes the old voice then moves the new one in, which is NOT atomic. No service restart; rescan in the GUI after install.
-   Or: put both files in the repo's `models/` (gitignored) and run `sudo scripts/deploy.sh` (restarts the bot). `deploy.sh` never deletes from `/opt/tts-bot/models`, so installed voices survive deploys.
+   Or: put both files in the repo's `models/` (gitignored) and run `sudo tts-bot-deploy` (restarts the bot). `deploy.sh` never deletes from `/opt/tts-bot/models`, so installed voices survive deploys.
    Dev: just drop the files into `models/` (or `PIPER_MODELS_DIR`).
 3. Voice tab -> **Rescan**, select the voice, **Apply**.
 
@@ -145,11 +145,12 @@ Enable **Message Content** and **Server Members** intents in the Developer Porta
 python bot.py
 ```
 ## Team deployment (production)
-Roles: devs edit the repo (group `devteam`); an admin with real sudo deploys and holds the token.
+Roles: devs edit the repo (group `devteam`); an admin with real sudo installs the root-owned deploy wrapper and holds the token. The deploy itself is `sudo tts-bot-deploy` (installed copy of `scripts/deploy.sh`; never run `scripts/deploy.sh` from the repo, it refuses).
 ```bash
 sudo scripts/setup_system.sh            # service user, /opt/tts-bot (root-owned), sudoers, unit
 sudo scripts/install_token.sh --system  # token -> /etc/tts-bot/token (root:root 600)
-sudo scripts/deploy.sh                  # byte-compile, copy *.py + static/ + models to /opt/tts-bot, prune stale *.py/static files (never prune models/), restart
+sudo bash scripts/install_deploy.sh --src <runner checkout> --runner-user <ci user>   # review scripts/deploy.sh + scripts/lib/deploy_validate.sh first: they become root-run code
+sudo tts-bot-deploy                     # byte-compile, copy *.py + static/ + models from the --src dir to /opt/tts-bot, prune stale *.py/static files (never prune models/), restart
 sudo systemctl enable tts_bot
 ```
 Devs (no password) can: `sudo systemctl start|stop|restart tts_bot`, `systemctl status tts_bot`, `journalctl -u tts_bot` (after re-login for the `systemd-journal` group). They cannot read the token or change deployed code.
@@ -177,11 +178,23 @@ Local testing: each dev should create their own dev bot application and run `scr
    - Keep commits granular and adhere to documentation guidelines.
    - Open a PR against `main` for review.
 
-### CI/CD & Self-Hosted Runner Deployment
-To automate deployments from PR merges:
-- Setup a self-hosted GitHub Actions / GitLab CI runner on this server.
-- The runner executes tests on incoming PRs.
-- On merge to `main`, an authorized pipeline triggers `sudo scripts/deploy.sh` to update `/opt/tts-bot` and restart `tts_bot.service`.
+### CI/CD (GitHub Actions)
+`.github/workflows/deploy.yml` has two jobs. `test` runs on a GitHub-hosted runner for push and pull requests (unit tests, deploy validation, node tests, frontend build). `deploy` runs on the self-hosted runner ONLY for pushes to `main` (needs `test`, environment `production`): it downloads the built `static/` artifact, copies voices into the workspace and runs `sudo -n /usr/local/sbin/tts-bot-deploy` (no arguments). No pull request can reach the self-hosted runner. `tests/test_workflow.py` guards this.
+
+**Human-run hardening (NOT done by the repo, do these in GitHub and on the server):**
+1. Settings > Actions > General: "Fork pull request workflows from outside collaborators" = **Require approval for all outside collaborators**; Workflow permissions = **Read repository contents**; untick "Allow GitHub Actions to create and approve pull requests".
+2. Settings > Branches: protect `main`: require a pull request with at least 1 approving review, dismiss stale approvals, block force pushes and deletions, restrict who can push, require the `test` status check.
+3. Settings > Environments: create `production`, add required reviewers (recommended), limit deployment branches to `main`.
+4. Re-register the runner under a dedicated unprivileged user (e.g. `ghrunner`: no sudo, no docker group, not `jb`). Remove the old runner that runs as `jb`:
+   ```bash
+   cd <old runner dir>
+   sudo ./svc.sh stop && sudo ./svc.sh uninstall     # service actions.runner.jonathanbraganza-boxchan.predator-runner.service
+   ./config.sh remove --token <REMOVAL_TOKEN>        # token from Settings > Actions > Runners
+   ```
+   Then register the new runner as `ghrunner` and run `sudo bash scripts/install_deploy.sh --src <ghrunner's workspace checkout> --runner-user ghrunner`.
+5. Consider making the repo private; confirm no secrets in the repo or Actions logs; rotate the Discord token if a log ever printed it.
+6. Optional: pin actions to commit SHAs; enable Dependabot for npm and github-actions.
+7. Residual risk: whoever can merge to `main` controls production and the Discord token (deployed code runs with it).
 
 ### Upgrading an existing deployment
 The GUI token is gone and the unit changed (Tailscale ordering, no `gui_token` credential, `WEBUI_HOST` replaced by `WEBUI_HOSTS`):
@@ -194,9 +207,10 @@ sudo rm -f /etc/systemd/system/tts_bot_watcher.service
 sudo systemctl daemon-reload
 # Then proceed with the upgrade:
 sudo scripts/setup_system.sh             # 1) installs the new unit (or: copy tts_bot.service to /etc/systemd/system/ && sudo systemctl daemon-reload)
-sudo scripts/deploy.sh                   # 2) ship the code, restart
+sudo bash scripts/install_deploy.sh --src <runner checkout> --runner-user <ci user>   # 2a) once (re-run after changing deploy.sh or its lib; removes the old %devteam deploy rule)
+sudo tts-bot-deploy                      # 2b) ship the code, restart
 sudo shred -u /etc/tts-bot/gui_token     # 3) an existing gui_token is no longer used; delete it (after the new unit is live)
 ```
-The watcher would auto-deploy any code that landed in the repo as root with no review gate (decision D42). `deploy.sh` alone ships new code with the OLD unit (which still requires the `gui_token` credential file), so re-run `setup_system.sh` first. `deploy.sh` refuses symlinks or non-regular files in the repo's `*.py`, `static/`, `models/`.
+The watcher would auto-deploy any code that landed in the repo as root with no review gate (decision D42). `tts-bot-deploy` alone ships new code with the OLD unit (which still requires the `gui_token` credential file), so re-run `setup_system.sh` first. `deploy.sh` refuses symlinks or non-regular files in the repo's `*.py`, `static/`, `models/`.
 
-Known boundary: anyone who can deploy code can read the token (the code runs with it). Review changes before `deploy.sh`.
+Known boundary: anyone who can deploy code can read the token (the code runs with it). Review changes before deploying.

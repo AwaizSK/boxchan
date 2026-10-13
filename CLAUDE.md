@@ -42,7 +42,7 @@ No live Discord/GPU/browser tests exist; say so rather than claiming they passed
 - `webui.py`: `make_app`, `start_webui`, `validate_bind_hosts`, `detect_tailscale_addrs`; peer/Host/Origin checks, REST, SSE, session auth (`users.json`, scrypt hashes, fail closed), `python webui.py add-user|list-users|remove-user` CLI.
 - `static/{index,app}.{html,js}`, `static/app.css`: the UI (`app.js` helpers are node-testable).
 - `tts_bot.service`: hardened systemd unit (`ttsbot` user, `LoadCredential` for the Discord token).
-- `scripts/`: `setup_system.sh`, `deploy.sh` (+ `lib/deploy_validate.sh`), `install_token.sh`, `install_voice.sh`.
+- `scripts/`: `setup_system.sh`, `deploy.sh` (+ `lib/deploy_validate.sh`; installed root-owned as `/usr/local/sbin/tts-bot-deploy` by `install_deploy.sh` + `lib/install_deploy_lib.sh`), `install_token.sh`, `install_voice.sh`.
 - `tests/`: unittest suites + `static_logic.js` + `test_deploy_validation.sh`.
 - `docs/ARCHITECTURE.md`: architecture, decision log, gotchas, runbook.
 
@@ -55,6 +55,7 @@ No live Discord/GPU/browser tests exist; say so rather than claiming they passed
 - Wire IDs are strings (JS precision); internal IDs are ints. `X-Editor` is percent-encoded by the client.
 - GUI security: network layer is the network boundary (loopback + Tailscale, bad_peer, Host allowlist, Origin check). Application layer: session login backed by users.json (USERS_FILE), FAIL CLOSED: a configured file that is missing/invalid/empty admits nobody; only `WEBUI_AUTH=off` (dev, logs a warning) or `make_app(users_file=None)` (tests) disables login. Passwords are stdlib scrypt hashes only (legacy plaintext/sha256 still log in and are upgraded on login; known example passwords are refused; Admin tab/CLI enforce 10..200 chars); admin = `admin` group in the file, not the name. Create users with `python webui.py add-user NAME --admin` (prompt, never argv/env); never read users.json. 441 unit tests. Binds loopback + auto-detected Tailscale addrs on WEBUI_PORT (8765); WEBUI_HOSTS overrides (loopback/Tailscale only, else GUI disabled); SSE needs proxy buffering off.
 - piper-tts is pinned to 1.2.0 (`synthesize_stream_raw`); CPU `onnxruntime` must stay uninstalled.
+- Deploy: `sudo tts-bot-deploy` (root-owned copy; refuses to run from the repo; lib and `/etc/tts-bot/deploy-src` fixed; sudoers = runner user, no args). Re-run `install_deploy.sh` after editing `deploy.sh`/the lib. The CI user can deploy whatever is in its checkout: security = who can merge to `main` + runner host (D51/D52).
 - Prod layout: code root-owned `/opt/tts-bot`, state `/var/lib/tts-bot`, tokens in `/etc/tts-bot`.
   Anyone who can get code deployed can read the Discord token: review changes before deploy.
 - `bot.env` is optional (`EnvironmentFile=-`, only a first-boot `TTS_CHANNEL_ID` seed). Fresh install: setup_system -> install_token --system -> deploy -> enable. Upgrade: setup_system (new unit) then deploy.
