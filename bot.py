@@ -409,6 +409,84 @@ async def status(ctx: commands.Context):
     )
 
 
+@bot.hybrid_command(name="help", description="Show available commands and current status")
+@commands.guild_only()
+async def help(ctx: commands.Context):
+    """Show all registered commands and current bot state."""
+    lines = []
+
+    # Header
+    lines.append("**Available Commands**")
+
+    # List all commands (sorted by name)
+    sorted_commands = sorted(bot.commands, key=lambda c: c.name)
+    for cmd in sorted_commands:
+        desc = cmd.description or "No description"
+        lines.append(f"`{PREFIX}{cmd.name}` — {desc}")
+
+    lines.append("")  # blank line
+    lines.append("**Right Now**")
+
+    # Listen channel
+    cid = config.channel_for(ctx.guild.id)
+    if cid:
+        lines.append(f"Listen channel: <#{cid}>")
+    else:
+        lines.append("Listen channel: not set")
+
+    # Voice connection
+    vc = ctx.voice_client
+    if vc and vc.is_connected():
+        lines.append(f"Voice: connected to **{vc.channel.name}**")
+    else:
+        lines.append("Voice: not connected")
+
+    # Active voice
+    if engine.ready:
+        lines.append(f"Active voice: **{engine.model_name}**" + ("" if engine.cuda_active else " (CPU)"))
+    else:
+        lines.append("Active voice: not loaded / default")
+
+    # Paused status
+    ga = audio.get(ctx.guild.id)
+    enabled = config.is_enabled(ctx.guild.id)
+    if ga and not enabled:
+        lines.append("Status: **paused**")
+    elif ga:
+        lines.append("Status: **reading**")
+    else:
+        lines.append("Status: idle")
+
+    # Watched users
+    watched_ids = sorted(store.data.get(ctx.guild.id, ()))
+    watched_names = []
+    for uid in watched_ids:
+        m = ctx.guild.get_member(uid)
+        if m:
+            watched_names.append(m.display_name)
+        else:
+            watched_names.append(str(uid))
+
+    # Cap at 15 watched users, then add "+N more"
+    if len(watched_names) > 15:
+        extra = len(watched_names) - 15
+        watched_names = watched_names[:15]
+        watched_names.append(f"… +{extra} more")
+
+    if watched_names:
+        lines.append(f"Watched users: {', '.join(watched_names)}")
+    else:
+        lines.append("Watched users: none")
+
+    reply = "\n".join(lines)
+
+    # Truncate to 2000 chars if needed
+    if len(reply) > 2000:
+        reply = reply[:1996] + "…"
+
+    await ctx.send(reply, allowed_mentions=discord.AllowedMentions.none())
+
+
 @bot.event
 async def on_command_error(ctx: commands.Context, error: commands.CommandError):
     if isinstance(error, commands.CommandNotFound):
