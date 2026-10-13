@@ -10,3 +10,4 @@ models/*.onnx
 models/*.onnx.json
 .superpowers/
 .claude/settings.local.json
+repomix-output.xml

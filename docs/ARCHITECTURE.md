@@ -402,6 +402,12 @@ Format: **Decision** / Why / Alternatives rejected / Cost if wrong.
 - **Alternatives rejected:** per-route limit (more code on a security-relevant path); limiting content to fewer chars (Discord allows 2000).
 - **Cost:** every write route now accepts bodies up to 16 KB before returning 400/413.
 
+### D42. Auto-deploy file watcher NOT adopted; deploys remain manual
+- **Decision:** Reject the auto-deploy watcher (scripts removed). Deploys stay manual: dev edits the repo, reviewer checks it, admin runs `sudo scripts/deploy.sh` after review.
+- **Why:** an auto-deploy watcher watching the filesystem for changes is a trust-boundary regression: it would auto-execute unreviewed code as root, silently. The original plan (Rationale 1) valued code review over iteration speed; that stands. The watcher also introduced extra moving parts (file syscalls, debouncing, cooldown) and a second entry point for deployment logic, without solving the review step. For fast local iteration: devs run `python bot.py` as their own user against a personal dev bot token; for production deploy, review first, then admin runs the deploy.
+- **Alternatives rejected:** keeping an optional file watcher (optional-but-unused controls silently fail; two code paths to test); making the watcher go through review (extra complexity, still unauditable at runtime).
+- **Cost:** manual deploys are slower than watched auto-deploy, but the review gate is a feature, not a bug.
+
 ---
 
 ## 9. Nuances and gotchas
@@ -538,6 +544,7 @@ bash tests/test_deploy_validation.sh                                    # deploy
 - Messages tab: text only (no embeds, attachments, replies, edits or deletes); sends go to the configured listen channel only. The 10/60 s and 2 s limits are in-memory per process (reset on restart) and per guild, not per editor. Members only appear if they are in the member cache (Server Members intent; first use of a big guild triggers one `chunk()`, up to 10 s). Tags are plain `@Name` text until send; a name edited by hand loses its tag. DOM behavior of the tab is untested (no browser).
 - One channel per guild (plus pause). One global voice (D32); multi-speaker voices are not offered (D35).
 - Voice swaps: peak GPU memory is two sessions while loading, and ORT may keep memory after freeing the old one, so use a service restart if memory creeps up on the 6 GB card. Speech is delayed for the seconds a load takes. Two editors applying different voices at once: last apply wins (D34). Installed voices cannot be deleted from the GUI.
+- Deploys are manual (D42): dev reviews code, admin runs `sudo scripts/deploy.sh`. No auto-deploy watcher (was rejected as unsafe; watch the filesystem as root, execute unreviewed code).
 - Deploy copies every root `*.py` (stray files ship) plus `static/*`, `models/*` (copy only, never pruned), `requirements.txt`; `deploy.sh` and `setup_system.sh` run repo-supplied scripts as root (admin review required); a microsecond check/copy race is accepted; `setup_system.sh` resolves `SRC` with `pwd`, not `pwd -P`.
 - The GUI is down whenever the bot is down; all plain HTTP (Tailscale encrypts the tailnet hop; a domain needs TLS at the proxy).
 - The bot does not rejoin voice after a restart.
