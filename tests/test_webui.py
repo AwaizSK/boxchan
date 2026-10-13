@@ -350,6 +350,39 @@ class SSETests(Base):
             r.close()
 
 
+class HardeningTests(Base):
+    async def test_bad_tokens_rejected(self):
+        for t in ("", "x" * 23):
+            with self.assertRaises(ValueError):
+                webui.make_app(self.config, self.ctl, t, static_dir=self.static)
+
+    async def test_header_parsing(self):
+        r = await self.client.get("/api/state", headers={"Authorization": f"bearer {TOKEN}"})
+        self.assertEqual(r.status, 200)
+        r = await self.client.get("/api/state", headers={"Authorization": f"Basic {TOKEN}"})
+        self.assertEqual(r.status, 401)
+        r = await self.client.get("/api/state", headers={"Authorization": "Bearer "})
+        self.assertEqual(r.status, 401)
+
+
+class ShutdownTests(unittest.IsolatedAsyncioTestCase):
+    async def test_open_sse_does_not_block_cleanup(self):
+        import time
+        with tempfile.TemporaryDirectory() as d:
+            cfg = ConfigStore(os.path.join(d, "c.json"))
+            app = webui.make_app(cfg, FakeController(), TOKEN, static_dir=d)
+            runner = await webui.start_webui(app, "127.0.0.1", 0)
+            port = runner.addresses[0][1]
+            import aiohttp
+            async with aiohttp.ClientSession() as s:
+                r = await s.get(f"http://127.0.0.1:{port}/api/events", headers=AUTH)
+                await r.content.readline()
+                t0 = time.monotonic()
+                await runner.cleanup()
+                self.assertLess(time.monotonic() - t0, 3)
+            self.assertEqual(cfg.hub.subscriber_count, 0)
+
+
 class TokenLoadTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

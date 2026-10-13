@@ -94,7 +94,10 @@ def _err(code, status):
 def make_app(config, controller, token: str, *, status_interval: float = 3.0,
              keepalive_interval: float = 15.0, static_dir: str | None = None,
              clock=time.monotonic) -> web.Application:
+    if not token or len(token) < MIN_TOKEN_LEN:
+        raise ValueError(f"GUI token must be at least {MIN_TOKEN_LEN} characters")
     token_b = token.encode()
+    streams: set[asyncio.Task] = set()
     fails: dict[str, list[float]] = {}
     blocked: dict[str, float] = {}
     static_dir = static_dir or DEFAULT_STATIC_DIR
@@ -241,6 +244,7 @@ def make_app(config, controller, token: str, *, status_interval: float = 3.0,
         _apply_headers(request, resp)  # must precede prepare(); middleware re-sets harmlessly
         await resp.prepare(request)
         q = config.hub.subscribe()
+        streams.add(asyncio.current_task())
 
         async def send(event, data):
             await resp.write(f"event: {event}\ndata: {json.dumps(data)}\n\n".encode())
@@ -272,14 +276,20 @@ def make_app(config, controller, token: str, *, status_interval: float = 3.0,
                 if now >= next_keep:
                     next_keep = now + keepalive_interval
                     await resp.write(b": keepalive\n\n")
-        except (ConnectionResetError, ConnectionError, asyncio.CancelledError):
+        except (ConnectionResetError, ConnectionError):
             pass
         except Exception:
             log.exception("SSE stream failed")
         finally:
             config.hub.unsubscribe(q)
+            streams.discard(asyncio.current_task())
         return resp
 
+    async def end_streams(app):
+        for t in list(streams):
+            t.cancel()
+
+    app.on_shutdown.append(end_streams)
     app.router.add_get("/api/state", state)
     app.router.add_put("/api/guilds/{gid}/channel", put_channel)
     app.router.add_put("/api/guilds/{gid}/enabled", put_enabled)
@@ -290,7 +300,7 @@ def make_app(config, controller, token: str, *, status_interval: float = 3.0,
 
 
 async def start_webui(app: web.Application, host: str, port: int) -> web.AppRunner:
-    runner = web.AppRunner(app)
+    runner = web.AppRunner(app, shutdown_timeout=5.0)
     await runner.setup()
     try:
         await web.TCPSite(runner, host, port).start()
