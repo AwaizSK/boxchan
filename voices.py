@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import stat
 from pathlib import Path
 
 log = logging.getLogger("voices")
@@ -51,29 +52,38 @@ def _read_config(path: str) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
-def _entry(models_dir: str, stem: str) -> dict | None:
+def _checked_files(models_dir: str, models_real: str, stem: str) -> tuple[str, str, int] | None:
+    """THE voice-file validation, shared by discover_voices and resolve_voice. Returns
+    (onnx_path, config_path, onnx_size) or None. Rejects a symlinked .onnx, a symlinked .onnx.json,
+    anything that is not a regular file, and anything whose realpath is not directly inside the
+    realpath of the models dir (which also catches a symlinked parent component). One lstat and one
+    realpath per file."""
     onnx = os.path.join(models_dir, stem + ".onnx")
-    cfg_path = onnx + ".json"
+    cfg = onnx + ".json"
+    size = 0
+    for path in (onnx, cfg):
+        try:
+            st = os.lstat(path)
+        except OSError:
+            return None
+        if stat.S_ISLNK(st.st_mode):
+            log.debug("voice %s uses a symlink; skipped", stem)
+            return None
+        if not stat.S_ISREG(st.st_mode):
+            return None
+        if os.path.realpath(path) != os.path.join(models_real, os.path.basename(path)):
+            log.debug("voice %s resolves outside the models dir; skipped", stem)
+            return None
+        if path is onnx:
+            size = st.st_size
+    return onnx, cfg, size
 
-    # Check for symlinks: skip if either .onnx or .onnx.json is a symlink
-    if os.path.islink(onnx) or os.path.islink(cfg_path):
-        log.debug("voice %s is a symlink; skipped", stem)
-        return None
 
-    # Check realpath is inside models dir: both files must resolve within the models directory
-    models_real = os.path.realpath(models_dir)
-    if not os.path.isfile(onnx) or not os.path.isfile(cfg_path):
-        log.debug("voice %s has missing files; skipped", stem)
+def _entry(models_dir: str, models_real: str, stem: str) -> dict | None:
+    checked = _checked_files(models_dir, models_real, stem)
+    if checked is None:
         return None
-
-    onnx_real = os.path.realpath(onnx)
-    cfg_real = os.path.realpath(cfg_path)
-    if not (onnx_real.startswith(models_real + os.sep) or onnx_real == os.path.join(models_real, stem + ".onnx")):
-        log.debug("voice %s .onnx outside models dir; skipped", stem)
-        return None
-    if not (cfg_real.startswith(models_real + os.sep) or cfg_real == os.path.join(models_real, stem + ".onnx.json")):
-        log.debug("voice %s .onnx.json outside models dir; skipped", stem)
-        return None
+    onnx, cfg_path, size = checked
     cfg = _read_config(cfg_path)
     if cfg is None:
         return None
@@ -96,18 +106,13 @@ def _entry(models_dir: str, stem: str) -> dict | None:
     lang = espeak.get("voice") if isinstance(espeak, dict) else None
     if not isinstance(lang, str) or not lang:
         lang = stem.split("-", 1)[0] if "-" in stem else None
-    try:
-        size = os.path.getsize(onnx)
-    except OSError:
-        return None
     return {"name": stem, "sample_rate": rate, "quality": quality, "language": lang,
             "size_mb": round(size / (1024 * 1024), 1)}
 
 
 def discover_voices(models_dir) -> list[dict]:
     """Blocking. Every installed single-speaker voice, sorted by name. Never raises.
-    Skips symlinked .onnx files and any voice whose .onnx or .onnx.json resolve outside
-    the models directory."""
+    Each voice goes through `_checked_files` (symlinks and escapes rejected)."""
     models_dir = os.fspath(models_dir)
     out = []
     try:
@@ -117,7 +122,6 @@ def discover_voices(models_dir) -> list[dict]:
         return []
 
     models_real = os.path.realpath(models_dir)
-
     for fname in names:
         if not fname.endswith(".onnx"):
             continue
@@ -125,24 +129,8 @@ def discover_voices(models_dir) -> list[dict]:
         if not valid_name(stem):
             log.debug("skipping voice with unsafe file name")
             continue
-        target_path = os.path.join(models_dir, fname)
-
-        # Skip symlinked .onnx files
-        if os.path.islink(target_path):
-            log.debug("voice %s is a symlink; skipped", stem)
-            continue
-
-        if not os.path.isfile(target_path):
-            continue
-
-        # Additional realpath check: ensure .onnx resolves inside the models directory
-        target_real = os.path.realpath(target_path)
-        if not (target_real.startswith(models_real + os.sep) or target_real == os.path.join(models_real, fname)):
-            log.debug("voice %s resolves outside models dir; skipped", stem)
-            continue
-
         try:
-            entry = _entry(models_dir, stem)
+            entry = _entry(models_dir, models_real, stem)
         except Exception:  # defensive: one odd file must not hide the others
             log.debug("could not inspect voice %s", stem, exc_info=True)
             continue
@@ -157,8 +145,13 @@ def resolve_voice(models_dir, name) -> tuple[Path, Path]:
     discovered entry: the path is built from the discovered stem, never from raw input."""
     if not valid_name(name):
         raise BadVoiceError("unknown voice")
-    for e in discover_voices(models_dir):
-        if e["name"] == name:
-            base = Path(os.fspath(models_dir)) / (e["name"] + ".onnx")
-            return base, Path(str(base) + ".json")
-    raise BadVoiceError("unknown voice")
+    models_dir = os.fspath(models_dir)
+    try:
+        entry = _entry(models_dir, os.path.realpath(models_dir), name)
+    except Exception:
+        log.debug("could not inspect voice %s", name, exc_info=True)
+        entry = None
+    if entry is None:
+        raise BadVoiceError("unknown voice")
+    onnx = Path(models_dir) / (name + ".onnx")
+    return onnx, Path(str(onnx) + ".json")

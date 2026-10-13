@@ -89,6 +89,80 @@ class DiscoverTests(unittest.TestCase):
         self.assertEqual([v["name"] for v in self.discover()], ["real"])
 
 
+class SymlinkSafetyTests(unittest.TestCase):
+    """REAL symlinks in temp dirs; discover_voices and resolve_voice share one validation."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.d = os.path.join(self.tmp.name, "models")
+        self.out = os.path.join(self.tmp.name, "outside")
+        os.mkdir(self.d)
+        os.mkdir(self.out)
+        write_voice(self.d, "good")
+        write_voice(self.out, "ext")
+
+    def names(self):
+        return [v["name"] for v in discover_voices(self.d)]
+
+    def assert_rejected(self, name):
+        self.assertNotIn(name, self.names())
+        with self.assertRaises(ValueError) as cm:
+            resolve_voice(self.d, name)
+        self.assertNotIn(self.tmp.name, str(cm.exception))
+        self.assertNotIn(os.sep, str(cm.exception))
+
+    def test_control_good_voice_is_accepted_by_both(self):
+        self.assertEqual(self.names(), ["good"])
+        self.assertEqual(str(resolve_voice(self.d, "good")[0]), os.path.join(self.d, "good.onnx"))
+
+    def test_symlinked_onnx_alone(self):
+        write_voice(self.d, "linkonnx", with_json=True)
+        os.unlink(os.path.join(self.d, "linkonnx.onnx"))
+        os.symlink(os.path.join(self.out, "ext.onnx"), os.path.join(self.d, "linkonnx.onnx"))
+        self.assertTrue(os.path.islink(os.path.join(self.d, "linkonnx.onnx")))
+        self.assertFalse(os.path.islink(os.path.join(self.d, "linkonnx.onnx.json")))
+        self.assert_rejected("linkonnx")
+
+    def test_symlinked_json_alone(self):
+        write_voice(self.d, "linkjson")
+        os.unlink(os.path.join(self.d, "linkjson.onnx.json"))
+        os.symlink(os.path.join(self.out, "ext.onnx.json"), os.path.join(self.d, "linkjson.onnx.json"))
+        self.assertFalse(os.path.islink(os.path.join(self.d, "linkjson.onnx")))
+        self.assert_rejected("linkjson")
+
+    def test_symlink_to_file_inside_models_dir_is_still_rejected(self):
+        os.symlink(os.path.join(self.d, "good.onnx"), os.path.join(self.d, "alias.onnx"))
+        os.symlink(os.path.join(self.d, "good.onnx.json"), os.path.join(self.d, "alias.onnx.json"))
+        self.assert_rejected("alias")
+        self.assertEqual(self.names(), ["good"])
+
+    def test_entry_pointing_outside_models_dir(self):
+        os.symlink(os.path.join(self.out, "ext.onnx"), os.path.join(self.d, "ext.onnx"))
+        os.symlink(os.path.join(self.out, "ext.onnx.json"), os.path.join(self.d, "ext.onnx.json"))
+        self.assert_rejected("ext")
+
+    def test_containment_check_is_independent_of_the_symlink_check(self):
+        """Regular files whose realpath is not under the given models realpath are refused."""
+        other = os.path.join(self.tmp.name, "elsewhere")
+        os.mkdir(other)
+        self.assertIsNotNone(voices._checked_files(self.d, os.path.realpath(self.d), "good"))
+        self.assertIsNone(voices._checked_files(self.d, os.path.realpath(other), "good"))
+
+    def test_symlinked_models_dir_itself_is_allowed(self):
+        link = os.path.join(self.tmp.name, "models-link")
+        os.symlink(self.d, link)
+        self.assertEqual([v["name"] for v in discover_voices(link)], ["good"])
+        self.assertEqual(str(resolve_voice(link, "good")[0]), os.path.join(link, "good.onnx"))
+
+    def test_symlinked_subpath_component_inside_models_dir(self):
+        """A voice reached through a directory symlink cannot be addressed by name at all."""
+        os.symlink(self.out, os.path.join(self.d, "dirlink"))
+        self.assertEqual(self.names(), ["good"])
+        with self.assertRaises(ValueError):
+            resolve_voice(self.d, "dirlink/ext")
+
+
 class ResolveTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
