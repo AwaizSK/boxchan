@@ -116,7 +116,6 @@ function voiceSwitchText(editor, name) {
   return editor + ' switched voice to ' + (name ? voiceTitle(name) : 'the default voice');
 }
 
-/* --- Messages tab helpers --- */
 const MSG_MAX = 2000;
 const READY_PRESET = "The voice bot is ready to use! Join a voice channel, type !join here, and I'll read watched users' messages aloud.";
 const cpLen = (s) => Array.from(String(s)).length;
@@ -176,11 +175,10 @@ function insertAtCursor(value, start, end, ins) {
   return { value: text + post, pos: text.length };
 }
 
+
 function counterText(n) { return n + '/' + MSG_MAX; }
 function counterState(n) { return n > MSG_MAX ? 'over' : n >= 1900 ? 'near' : ''; }
 
-// Extract mention targets from final text (after substituteTags).
-// Returns array of {id, label, username, known} for unique mentions found in the text.
 function pingTargets(finalText, chips) {
   const byId = new Map((chips || []).map((c) => [c.id, c]));
   const result = [];
@@ -203,7 +201,6 @@ function pingTargets(finalText, chips) {
   return result;
 }
 
-// Format chip for display: "@Display Name (@username)"
 function chipText(chip) {
   return '@' + chip.label + ' (@' + chip.username + ')';
 }
@@ -755,6 +752,7 @@ if (typeof document !== 'undefined') (function () {
 
   function renderMemberList() {
     const ul = $('m-list');
+    const top = ul.scrollTop;
     ul.textContent = '';
     M.members.forEach((m, i) => {
       const li = el('li', 'opt' + (i === M.hi ? ' hi' : ''));
@@ -766,6 +764,7 @@ if (typeof document !== 'undefined') (function () {
       li.appendChild(el('span', 'meta', '@' + m.username));
       ul.appendChild(li);
     });
+    ul.scrollTop = top;
   }
 
   function scheduleMembers() {
@@ -859,6 +858,7 @@ if (typeof document !== 'undefined') (function () {
     try {
       const d = await api('PUT', '/api/guilds/' + gid + '/channel', { channel_id: id, rev: prevRev });
       applySnapshot(d.snapshot, false);
+      M.members = []; M.hi = -1; M.gid = ''; M.q = null;
       if (!opts.silent) {
         toast('Switched to ' + (chName(id) || 'channel') + (prev && chName(prev) ? ' (was ' + chName(prev) + ')' : ''),
           prev && chName(prev) ? { undo: () => selectChannel(prev, { silent: true }) } : null);
