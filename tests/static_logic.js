@@ -1,7 +1,7 @@
 const assert = require('assert');
 const { shouldApplySnapshot, normalizeEditor, shouldRollback, createSSEParser, matchChannel, relTime, backoffDelay, groupChannels,
   voiceTitle, voiceWarning, sayBlocker, voiceSwitchText, mergeVoiceSummary,
-  segmentText, substituteTags, activeTagIds, uniqueLabel, insertAtCursor, counterText, counterState, pingTargets, pingSummary, messageBlocker,
+  segmentText, substituteTags, activeTagIds, uniqueLabel, insertAtCursor, counterText, counterState, pingTargets, pingSummary, chipText, messageBlocker,
   cpLen, READY_PRESET } = require('../static/app.js');
 
 const got = [];
@@ -136,6 +136,9 @@ assert.deepStrictEqual(pingTargets('x@<@5> hi', chips1), [{ id: '5', label: 'Ali
 assert.strictEqual(pingSummary([]), 'No pings');
 assert.strictEqual(pingSummary([{ id: '5', label: 'Alice', username: 'alice123', known: true }]), 'Will ping: @Alice (@alice123)');
 assert.strictEqual(pingSummary([{ id: '5', label: 'Alice', username: 'alice123', known: true }, { id: '999', label: null, username: null, known: false }]), 'Will ping: @Alice (@alice123), unknown user 999');
+// chipText display format
+assert.strictEqual(chipText({ id: '5', label: 'Alice', username: 'alice123' }), '@Alice (@alice123)');
+assert.strictEqual(chipText({ id: '6', label: 'Bob (bob99)', username: 'bob99' }), '@Bob (bob99) (@bob99)');
 // send blocker
 assert.strictEqual(messageBlocker(false, true, 'x', false), 'Offline');
 assert.strictEqual(messageBlocker(true, false, 'x', false), 'No channel configured');

@@ -203,13 +203,18 @@ function pingTargets(finalText, chips) {
   return result;
 }
 
+// Format chip for display: "@Display Name (@username)"
+function chipText(chip) {
+  return '@' + chip.label + ' (@' + chip.username + ')';
+}
+
 function pingSummary(targets) {
   // targets is an array of {id, label, username, known}
   if (!Array.isArray(targets)) return 'No pings';  // legacy compatibility
   if (!targets.length) return 'No pings';
   const names = targets.map((t) => {
     if (!t.known) return 'unknown user ' + t.id;
-    return '@' + t.label + ' (@' + t.username + ')';
+    return chipText(t);
   });
   return 'Will ping: ' + names.join(', ');
 }
@@ -245,7 +250,7 @@ function mergeVoiceSummary(prev, incoming, { seqAtRequest, seqNow, live }) {
 if (typeof module !== 'undefined') {
   module.exports = { shouldApplySnapshot, normalizeEditor, shouldRollback, createSSEParser, matchChannel, relTime, backoffDelay, groupChannels,
     voiceTitle, voiceWarning, sayBlocker, voiceSwitchText, mergeVoiceSummary,
-    segmentText, substituteTags, activeTagIds, uniqueLabel, insertAtCursor, counterText, counterState, pingTargets, pingSummary, messageBlocker, cpLen, MSG_MAX, READY_PRESET };
+    segmentText, substituteTags, activeTagIds, uniqueLabel, insertAtCursor, counterText, counterState, pingTargets, pingSummary, chipText, messageBlocker, cpLen, MSG_MAX, READY_PRESET };
 }
 
 /* ---------- app ---------- */
@@ -710,7 +715,9 @@ if (typeof document !== 'undefined') (function () {
     for (const t of M.tags) {
       const on = act.has(t.id);
       const c = el('span', 'chip' + (on ? '' : ' off'));
-      c.appendChild(el('span', null, '@' + t.label));
+      const chipDisplay = chipText(t);
+      c.title = chipDisplay;
+      c.appendChild(el('span', null, chipDisplay));
       if (!on) c.appendChild(el('span', 'muted', 'not in message'));
       const b = el('button', null, '×');
       b.type = 'button';
