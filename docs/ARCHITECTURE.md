@@ -511,7 +511,7 @@ sudo ip6tables -I INPUT -d fd7a:115c:a1e0::/48  ! -i tailscale0 -j DROP
 
 Run from the repo root:
 ```
-~/miniconda3/envs/tts-bot/bin/python -m unittest discover -s tests -v   # 283 tests at time of writing
+~/miniconda3/envs/tts-bot/bin/python -m unittest discover -s tests -v   # 289 tests at time of writing
 bash tests/test_deploy_validation.sh                                    # deploy validation, no root needed
 ```
 `unittest` only; no pytest.
