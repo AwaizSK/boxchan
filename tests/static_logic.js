@@ -1,6 +1,6 @@
 const assert = require('assert');
 const { shouldApplySnapshot, normalizeEditor, shouldRollback, createSSEParser, matchChannel, relTime, backoffDelay, groupChannels,
-  voiceTitle, voiceWarning, sayBlocker, voiceSwitchText,
+  voiceTitle, voiceWarning, sayBlocker, voiceSwitchText, mergeVoiceSummary,
   segmentText, substituteTags, activeTagIds, uniqueLabel, insertAtCursor, counterText, counterState, pingSummary, messageBlocker,
   cpLen, READY_PRESET } = require('../static/app.js');
 
@@ -122,4 +122,23 @@ assert.strictEqual(messageBlocker(true, true, 'x'.repeat(2001), false), 'Message
 assert.strictEqual(messageBlocker(true, true, 'x'.repeat(2000), false), '');
 assert.strictEqual(messageBlocker(true, true, 'x', true), 'Please wait…');
 assert.ok(READY_PRESET.startsWith('The voice bot is ready to use!') && cpLen(READY_PRESET) < 2000);
+{
+  const prev = { list: [{ name: 'old' }], current: 'b', configured: 'b', loading: true, cuda: true };
+  const incoming = { voices: [{ name: 'a' }, { name: 'b' }], current: 'a', configured: null, loading: false, cuda: false };
+  // stale GET: an SSE voice event arrived after the GET started, stream live -> SSE-owned fields kept, list taken
+  assert.deepStrictEqual(mergeVoiceSummary(prev, incoming, { seqAtRequest: 3, seqNow: 4, live: true }),
+    { list: incoming.voices, current: 'b', configured: 'b', loading: true, cuda: true });
+  // fresh GET: no newer event -> everything from incoming
+  assert.deepStrictEqual(mergeVoiceSummary(prev, incoming, { seqAtRequest: 4, seqNow: 4, live: true }),
+    { list: incoming.voices, current: 'a', configured: null, loading: false, cuda: false });
+  // not live: SSE ordering is meaningless, take incoming even if the counter moved
+  assert.deepStrictEqual(mergeVoiceSummary(prev, incoming, { seqAtRequest: 3, seqNow: 9, live: false }),
+    { list: incoming.voices, current: 'a', configured: null, loading: false, cuda: false });
+  // missing optional fields normalise to null / false; summary without a list keeps the previous list
+  assert.deepStrictEqual(mergeVoiceSummary(prev, { loading: 0 }, { seqAtRequest: 1, seqNow: 1, live: true }),
+    { list: prev.list, current: null, configured: null, loading: false, cuda: null });
+  // prev is never mutated
+  assert.strictEqual(prev.current, 'b');
+  assert.strictEqual(mergeVoiceSummary(prev, null, { seqAtRequest: 1, seqNow: 1, live: true }), prev);
+}
 console.log('ok');

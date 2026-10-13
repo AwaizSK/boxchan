@@ -195,9 +195,27 @@ function messageBlocker(live, hasChannel, content, busy) {
   return '';
 }
 
+// Merge a /api/voices (GET) or hello summary into the voice state. SSE `voice` events own
+// loading/current/configured/cuda: if one arrived after this GET started (seqNow > seqAtRequest) while
+// the stream is live, the GET is stale for those fields and prev wins; the voices LIST is always taken.
+function mergeVoiceSummary(prev, incoming, { seqAtRequest, seqNow, live }) {
+  if (!incoming) return prev;
+  const list = Array.isArray(incoming.voices) ? incoming.voices : prev.list;
+  if (live && seqNow > seqAtRequest) {
+    return { list, current: prev.current, configured: prev.configured, loading: prev.loading, cuda: prev.cuda };
+  }
+  return {
+    list,
+    current: incoming.current == null ? null : incoming.current,
+    configured: incoming.configured == null ? null : incoming.configured,
+    loading: !!incoming.loading,
+    cuda: incoming.cuda == null ? null : incoming.cuda,
+  };
+}
+
 if (typeof module !== 'undefined') {
   module.exports = { shouldApplySnapshot, normalizeEditor, shouldRollback, createSSEParser, matchChannel, relTime, backoffDelay, groupChannels,
-    voiceTitle, voiceWarning, sayBlocker, voiceSwitchText,
+    voiceTitle, voiceWarning, sayBlocker, voiceSwitchText, mergeVoiceSummary,
     segmentText, substituteTags, activeTagIds, uniqueLabel, insertAtCursor, counterText, counterState, pingSummary, messageBlocker, cpLen, MSG_MAX, READY_PRESET };
 }
 
@@ -524,15 +542,12 @@ if (typeof document !== 'undefined') (function () {
     renderVoice();
   }
 
-  function mergeVoiceSummary(v, fromSse, seqAtRequest) {
-    if (!v) return;
-    V().current = v.current == null ? null : v.current;
-    V().configured = v.configured == null ? null : v.configured;
-    // Only apply loading from GET if the SSE sequence hasn't advanced since the request started.
-    // SSE events always update loading (fromSse=true) or if offline (conn !== 'live').
-    if (fromSse || S.conn !== 'live' || seqAtRequest === undefined || voiceEventSeq === seqAtRequest) {
-      V().loading = !!v.loading;
-    }
+  // seqAtRequest: SSE voice-event count when the GET started; undefined for SSE-delivered summaries.
+  function applyVoiceSummary(incoming, seqAtRequest) {
+    if (!incoming) return;
+    const seqNow = voiceEventSeq;
+    S.voice = mergeVoiceSummary(V(), incoming,
+      { seqAtRequest: seqAtRequest === undefined ? seqNow : seqAtRequest, seqNow, live: S.conn === 'live' });
     renderVoice();
   }
 
@@ -543,9 +558,8 @@ if (typeof document !== 'undefined') (function () {
     const seqAtRequest = nextVoiceEventSeq();  // Record sequence at request start
     try {
       const d = await api('GET', '/api/voices');
-      V().list = d.voices || [];
-      mergeVoiceSummary(d, false, seqAtRequest);
-      if (manual) toast('Found ' + V().list.length + ' voice' + (V().list.length === 1 ? '' : 's'));
+      applyVoiceSummary(d, seqAtRequest);
+      if (manual) toast('Found ' + (V().list || []).length + ' voice' + ((V().list || []).length === 1 ? '' : 's'));
     } catch (e) {
       if (!e.denied) toast('Could not load voices: ' + friendly(e), { error: true });
     } finally { vlBusy = false; }
@@ -880,7 +894,7 @@ if (typeof document !== 'undefined') (function () {
     try { d = JSON.parse(raw); } catch (e) { return; }
     if (name === 'hello') {
       applyState({ config: d.snapshot, guilds: d.guilds }, true);
-      mergeVoiceSummary(d.voices, true);
+      applyVoiceSummary(d.voices);
       onVoiceEvent();  // hello carries a voice summary
     } else if (name === 'config') {
       const ch = d.change || {};
