@@ -10,11 +10,10 @@
 </head>
 <body>
 <main id="app">
-  <form id="auth" class="card" hidden>
-    <h1>Sign in</h1>
-    <p id="auth-msg" class="muted" role="alert"></p>
-    <label>Access token<input id="auth-token" type="password" autocomplete="current-password" spellcheck="false"></label>
-    <label>Your name (shown to other editors)<input id="auth-name" type="text" maxlength="40" autocomplete="nickname"></label>
+  <form id="name-form" class="card" hidden>
+    <h1>Who are you?</h1>
+    <p id="name-msg" class="muted" role="alert"></p>
+    <label>Your name (shown to other editors)<input id="name-input" type="text" maxlength="40" autocomplete="nickname"></label>
     <button type="submit" class="primary">Continue</button>
   </form>
 
@@ -27,7 +26,7 @@
       <div class="row">
         <select id="guild" aria-label="Server" hidden></select>
         <span id="meta" class="muted"></span>
-        <button id="who" type="button" class="link" title="Change your name or token"></button>
+        <button id="who" type="button" class="link" title="Change your name"></button>
       </div>
     </header>
 

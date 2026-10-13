@@ -106,7 +106,6 @@ if (typeof document !== 'undefined') (function () {
   };
 
   const S = {
-    token: store.get(sessionStorage, 'token') || '',
     editor: store.get(localStorage, 'editor') || '',
     cfg: null,            // {rev, updated_by, updated_at, guilds:{gid:{channel_id,enabled}}}
     guilds: [],           // [{id,name,channels,voice,queue,playing,watched}]
@@ -138,46 +137,48 @@ if (typeof document !== 'undefined') (function () {
     const box = $('toasts');
     box.appendChild(t);
     while (box.children.length > 3) box.firstChild.remove();
-    setTimeout(() => t.remove(), opts.undo ? 8000 : 5000);
+    setTimeout(() => t.remove(), opts.sticky ? 30000 : opts.undo ? 8000 : 5000);
   }
 
-  /* --- auth / api --- */
-  function showAuth(msg) {
+  /* --- name prompt / api --- */
+  function showName(msg) {
     if (S.abort) S.abort.abort();
     S.started = false;
     $('ui').hidden = true;
-    $('auth').hidden = false;
-    $('auth-msg').textContent = msg || '';
-    $('auth-token').value = '';
-    $('auth-token').placeholder = S.token ? 'leave blank to keep current' : '';
-    $('auth-name').value = S.editor;
-    (S.token ? $('auth-name') : $('auth-token')).focus();
+    $('name-form').hidden = false;
+    $('name-msg').textContent = msg || '';
+    $('name-input').value = S.editor;
+    $('name-input').focus();
   }
 
-  let lastTooMany = 0;
-  function tooMany() {   // keep the session, token and stream; just tell the user (rate-limited toast)
+  // The server rejected our Host/Origin (allowlist). Retrying cannot help: say so once, stop the stream.
+  let lastDenied = 0;
+  function hostDenied() {
     const now = Date.now();
-    if (now - lastTooMany < 10000) return;
-    lastTooMany = now;
-    toast('Too many failed attempts \u2014 wait a minute', { error: true });
+    if (now - lastDenied < 10000) return;
+    lastDenied = now;
+    toast('This hostname is not allowed \u2014 add it to WEBUI_ALLOWED_HOSTS on the server', { error: true, sticky: true });
   }
+  const isDenied = (status, data) => status === 403 && !!data && (data.error === 'bad_host' || data.error === 'bad_origin');
 
   const friendly = (e) => (e.message === 'persist_failed'
     ? 'the server could not save the change (storage error)' : e.message);
 
   class ApiError extends Error {
-    constructor(status, body) { super((body && body.error) || ('http_' + status)); this.status = status; this.body = body; }
+    constructor(status, body) {
+      super((body && body.error) || ('http_' + status));
+      this.status = status; this.body = body; this.denied = isDenied(status, body);
+    }
   }
 
   async function api(method, path, body) {
-    const headers = { Authorization: 'Bearer ' + S.token, 'X-Editor': encodeURIComponent(S.editor) };
+    const headers = { 'X-Editor': encodeURIComponent(S.editor) };
     const init = { method, headers };
     if (body !== undefined) { headers['Content-Type'] = 'application/json'; init.body = JSON.stringify(body); }
     const r = await fetch(path, init);
     let data = null;
     try { data = await r.json(); } catch (e) { /* no body */ }
-    if (r.status === 401) { showAuth('Token rejected. Enter a valid token.'); throw new ApiError(401, data); }
-    if (r.status === 429) { tooMany(); throw new ApiError(429, data); }
+    if (isDenied(r.status, data)) hostDenied();
     if (!r.ok) throw new ApiError(r.status, data);
     return data;
   }
@@ -211,7 +212,7 @@ if (typeof document !== 'undefined') (function () {
 
   async function refetch() {
     try { applyState(await api('GET', '/api/state'), false); } catch (e) {
-      if (e.status !== 401 && e.status !== 429) toast('Could not load state: ' + friendly(e), { error: true });
+      if (!e.denied) toast('Could not load state: ' + friendly(e), { error: true });
     }
   }
 
@@ -395,7 +396,7 @@ if (typeof document !== 'undefined') (function () {
       if (e.status === 409 && e.body && e.body.snapshot) {
         applySnapshot(e.body.snapshot, true);
         toast('Changed by ' + (e.body.snapshot.updated_by || 'someone') + ' — your change was not applied', { error: true });
-      } else if (e.status !== 401 && e.status !== 429) {
+      } else if (!e.denied) {
         const cur = S.cfg && S.cfg.guilds[gid];
         if (cur && shouldRollback(cur.channel_id, id)) {
           S.cfg.guilds[gid] = { ...cur, channel_id: prev };
@@ -416,7 +417,7 @@ if (typeof document !== 'undefined') (function () {
       if (e.status === 409 && e.body && e.body.snapshot) {
         applySnapshot(e.body.snapshot, true);
         toast('Changed by ' + (e.body.snapshot.updated_by || 'someone') + ' — your change was not applied', { error: true });
-      } else if (e.status !== 401 && e.status !== 429) toast('Request failed: ' + friendly(e), { error: true });
+      } else if (!e.denied) toast('Request failed: ' + friendly(e), { error: true });
     } finally { S.busy = false; renderControls(); }
   }
 
@@ -469,9 +470,12 @@ if (typeof document !== 'undefined') (function () {
   }
 
   async function streamOnce(signal) {
-    const r = await fetch('/api/events', { headers: { Authorization: 'Bearer ' + S.token }, signal, cache: 'no-store' });
-    if (r.status === 401) { showAuth('Token rejected. Enter a valid token.'); return 'auth'; }
-    if (r.status === 429) { tooMany(); throw new Error('http_429'); }   // backoff + retry, keep the token
+    const r = await fetch('/api/events', { signal, cache: 'no-store' });
+    if (r.status === 403) {   // Host/Origin allowlist: retrying cannot help
+      let d = null;
+      try { d = await r.json(); } catch (e) { /* no body */ }
+      if (isDenied(403, d)) { hostDenied(); setConn('down'); return 'denied'; }
+    }
     if (!r.ok || !r.body) throw new Error('http_' + r.status);
     const dec = new TextDecoder();
     const feed = createSSEParser((n, d) => { if (n === 'hello') { attempt = 0; setConn('live'); } onEvent(n, d); });
@@ -497,7 +501,7 @@ if (typeof document !== 'undefined') (function () {
     while (!signal.aborted) {
       let res = '';
       try { res = await streamOnce(signal); } catch (e) { if (signal.aborted) return; }
-      if (res === 'auth' || signal.aborted) return;
+      if (res === 'denied' || signal.aborted) return;
       setConn(attempt >= 3 ? 'down' : 'reconnecting');
       const wait = backoffDelay(attempt++, Math.random());
       await new Promise((ok) => setTimeout(ok, wait));
@@ -507,7 +511,7 @@ if (typeof document !== 'undefined') (function () {
   function start() {
     if (S.started) return;
     S.started = true;
-    $('auth').hidden = true;
+    $('name-form').hidden = true;
     $('ui').hidden = false;
     $('who').textContent = 'Editing as ' + S.editor;
     setConn('connecting');
@@ -517,20 +521,16 @@ if (typeof document !== 'undefined') (function () {
   }
 
   /* --- wiring --- */
-  $('auth').addEventListener('submit', (e) => {
+  $('name-form').addEventListener('submit', (e) => {
     e.preventDefault();
-    const tok = $('auth-token').value.trim();
-    const name = $('auth-name').value.trim().slice(0, 40);
-    if (tok) { S.token = tok; store.set(sessionStorage, 'token', tok); }
-    if (!S.token) { $('auth-msg').textContent = 'A token is required.'; return; }
-    if (!name) { $('auth-msg').textContent = 'A name is required.'; return; }
+    const name = $('name-input').value.trim().slice(0, 40);
     S.editor = normalizeEditor(name);
-    if (!S.editor) { $('auth-msg').textContent = 'A name is required.'; return; }
+    if (!S.editor) { $('name-msg').textContent = 'A name is required.'; return; }
     store.set(localStorage, 'editor', S.editor);
     S.started = false;
     start();
   });
-  $('who').addEventListener('click', () => showAuth(''));
+  $('who').addEventListener('click', () => showName(''));
   $('guild').addEventListener('change', (e) => {
     S.gid = e.target.value;
     store.set(sessionStorage, 'gid', S.gid);
@@ -568,5 +568,5 @@ if (typeof document !== 'undefined') (function () {
   });
 
   setInterval(renderMeta, 30000);
-  if (S.token && S.editor) start(); else showAuth('');
+  if (S.editor) start(); else showName('');
 })();

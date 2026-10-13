@@ -1,3 +1,4 @@
+import logging
 import os
 import socket
 import tempfile
@@ -28,41 +29,71 @@ class MaybeStartWebui(unittest.IsolatedAsyncioTestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.cfg = ConfigStore(os.path.join(self.tmp.name, "c.json"))
-        self.tokfile = os.path.join(self.tmp.name, "gui_token")
-        env = mock.patch.dict(os.environ, {"WEBUI_TOKEN_FILE": self.tokfile}, clear=False)
+        env = mock.patch.dict(os.environ, {"WEBUI_HOSTS": "127.0.0.1"}, clear=False)
         env.start()
         self.addCleanup(env.stop)
-        os.environ.pop("WEBUI_TOKEN", None)
-        os.environ.pop("CREDENTIALS_DIRECTORY", None)
+        os.environ.pop("WEBUI_ALLOWED_HOSTS", None)
+        for name in ("aiohttp.access", "asyncio"):
+            lg = logging.getLogger(name)
+            self.addCleanup(lg.setLevel, lg.level)
+            lg.setLevel(logging.WARNING)
 
-    def write_token(self, tok):
-        with open(self.tokfile, "w") as f:
-            f.write(tok)
+    def start(self, port=None):
+        return bot.maybe_start_webui(self.cfg, FakeController(), port if port is not None else free_port())
 
-    async def test_no_token(self):
-        self.assertIsNone(await bot.maybe_start_webui(self.cfg, FakeController(), "127.0.0.1", free_port()))
+    async def start_ok(self, port=None):
+        with self.assertLogs("bot", "INFO"), self.assertLogs("webui", "INFO"):
+            return await self.start(port)
 
-    async def test_short_token(self):
-        self.write_token("short")
-        self.assertIsNone(await bot.maybe_start_webui(self.cfg, FakeController(), "127.0.0.1", free_port()))
-
-    async def test_make_app_valueerror_is_contained(self):
-        self.write_token("x" * 40)
-        with mock.patch.object(bot, "make_app", side_effect=ValueError("bad")):
-            self.assertIsNone(await bot.maybe_start_webui(self.cfg, FakeController(), "127.0.0.1", free_port()))
-
-    async def test_out_of_range_port(self):
-        self.write_token("x" * 40)
-        self.assertIsNone(await bot.maybe_start_webui(self.cfg, FakeController(), "127.0.0.1", 99999))
+    async def test_invalid_hosts_disable_gui(self):
+        for bad in ("0.0.0.0", "127.0.0.1,192.168.1.5", "example.com", ","):
+            os.environ["WEBUI_HOSTS"] = bad
+            with self.assertLogs("bot", "ERROR"):
+                self.assertIsNone(await self.start(), bad)
 
     async def test_unexpected_error_contained(self):
-        self.write_token("x" * 40)
         with mock.patch.object(bot, "start_webui", side_effect=RuntimeError("boom")):
-            self.assertIsNone(await bot.maybe_start_webui(self.cfg, FakeController(), "127.0.0.1", free_port()))
+            with self.assertLogs("bot", "ERROR"):
+                self.assertIsNone(await self.start())
 
-    async def test_token_load_error_contained(self):
-        with mock.patch.object(bot, "load_gui_token", side_effect=RuntimeError("boom")):
-            self.assertIsNone(await bot.maybe_start_webui(self.cfg, FakeController(), "127.0.0.1", free_port()))
+    async def test_make_app_error_contained(self):
+        with mock.patch.object(bot, "make_app", side_effect=ValueError("bad")):
+            with self.assertLogs("bot", "ERROR"):
+                self.assertIsNone(await self.start())
+
+    async def test_out_of_range_port(self):
+        with self.assertLogs("bot", "ERROR"):
+            self.assertIsNone(await self.start(99999))
+
+    async def test_default_hosts_use_detection(self):
+        del os.environ["WEBUI_HOSTS"]
+        with mock.patch.object(bot, "detect_tailscale_addrs", return_value=["100.64.0.5"]) as det, \
+                mock.patch.object(bot, "start_webui", new=mock.AsyncMock(return_value="R")) as st:
+            with self.assertLogs("bot", "INFO"):
+                self.assertEqual(await self.start(), "R")
+        det.assert_called_once()
+        self.assertEqual(st.call_args.args[1], ["127.0.0.1", "100.64.0.5"])
+
+    async def test_default_hosts_without_tailscale(self):
+        del os.environ["WEBUI_HOSTS"]
+        with mock.patch.object(bot, "detect_tailscale_addrs", return_value=[]), \
+                mock.patch.object(bot, "start_webui", new=mock.AsyncMock(return_value="R")) as st:
+            with self.assertLogs("bot", "INFO"):
+                self.assertEqual(await self.start(), "R")
+        self.assertEqual(st.call_args.args[1], ["127.0.0.1"])
+
+    async def test_allowed_hosts_env_reaches_app(self):
+        os.environ["WEBUI_ALLOWED_HOSTS"] = "Box.tail.ts.net"
+        port = free_port()
+        runner = await self.start_ok(port)
+        try:
+            async with aiohttp.ClientSession() as s:
+                r = await s.get(f"http://127.0.0.1:{port}/api/state", headers={"Host": "box.tail.ts.net"})
+                self.assertEqual(r.status, 200)
+                r = await s.get(f"http://127.0.0.1:{port}/api/state", headers={"Host": "other.example"})
+                self.assertEqual(r.status, 403)
+        finally:
+            await runner.cleanup()
 
     def test_parse_port(self):
         for raw in ("abc", "0", "99999", "-1", "1.5"):
@@ -72,18 +103,16 @@ class MaybeStartWebui(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bot.parse_port("9000"), 9000)
 
     async def test_port_in_use(self):
-        self.write_token("x" * 40)
         with socket.socket() as s:
             s.bind(("127.0.0.1", 0))
             s.listen()
             port = s.getsockname()[1]
-            self.assertIsNone(await bot.maybe_start_webui(self.cfg, FakeController(), "127.0.0.1", port))
+            with self.assertLogs("webui", "WARNING"), self.assertLogs("bot", "ERROR"):
+                self.assertIsNone(await self.start(port))
 
-    async def test_good_token_serves_and_cleans_up(self):
-        tok = "g" * 40
-        self.write_token(tok)
+    async def test_good_config_serves_and_cleans_up(self):
         port = free_port()
-        runner = await bot.maybe_start_webui(self.cfg, FakeController(), "127.0.0.1", port)
+        runner = await self.start_ok(port)
         self.assertIsNotNone(runner)
         try:
             async with aiohttp.ClientSession() as s:
@@ -91,8 +120,6 @@ class MaybeStartWebui(unittest.IsolatedAsyncioTestCase):
                 r = await s.get(base + "/")
                 self.assertEqual(r.status, 200)
                 r = await s.get(base + "/api/state")
-                self.assertEqual(r.status, 401)
-                r = await s.get(base + "/api/state", headers={"Authorization": f"Bearer {tok}"})
                 self.assertEqual(r.status, 200)
                 self.assertIn("guilds", await r.json())
         finally:

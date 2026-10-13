@@ -1,7 +1,7 @@
 [Unit]
 Description=Discord Piper TTS bot
-After=network-online.target
-Wants=network-online.target
+After=network-online.target tailscaled.service
+Wants=network-online.target tailscaled.service
 
 [Service]
 Type=simple
@@ -12,15 +12,17 @@ WorkingDirectory=/opt/tts-bot
 ExecStart=/opt/tts-bot/env/bin/python bot.py
 # Token: root:root 600 file, readable only by systemd; exposed to the process as $CREDENTIALS_DIRECTORY/discord_token
 LoadCredential=discord_token:/etc/tts-bot/token
-# GUI bearer token (create with: sudo scripts/gen_gui_token.sh --system). The file MUST exist or systemd refuses to start the unit; a token < 24 chars disables the UI.
-LoadCredential=gui_token:/etc/tts-bot/gui_token
 StateDirectory=tts-bot
 # Optional, non-secret settings (the leading "-" makes a missing file fine), e.g. TTS_CHANNEL_ID=123456789012345678 as a first-boot channel seed: echo 'TTS_CHANNEL_ID=<id>' | sudo tee /etc/tts-bot/bot.env
 EnvironmentFile=-/etc/tts-bot/bot.env
 Environment=STATE_FILE=/var/lib/tts-bot/state.json
 Environment=CONFIG_FILE=/var/lib/tts-bot/config.json
-# Web UI binds to loopback only; reach it via SSH tunnel: ssh -L 8765:127.0.0.1:8765 <host>
-Environment=WEBUI_HOST=127.0.0.1
+# Web UI has NO login: the network is the boundary. It binds loopback + this host's Tailscale address(es)
+# (auto-detected; never LAN) and only answers Host names on the allowlist. Secure it with Tailscale ACLs.
+# Optional overrides (loopback / Tailscale addresses only, comma-separated; anything else disables the GUI):
+#Environment=WEBUI_HOSTS=127.0.0.1,100.64.0.1
+# Extra Host names the GUI should answer to (MagicDNS name, later your domain); no wildcards:
+#Environment=WEBUI_ALLOWED_HOSTS=your-machine.tailnet-name.ts.net
 Environment=WEBUI_PORT=8765
 Environment=PIPER_MODEL_PATH=/opt/tts-bot/models/en_US-lessac-medium.onnx
 Environment=PIPER_CONFIG_PATH=/opt/tts-bot/models/en_US-lessac-medium.onnx.json

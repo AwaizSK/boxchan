@@ -44,13 +44,20 @@ The bot reads messages and accepts commands only in the text channel chosen per 
 ## Web UI
 A small page to pick which text channel the bot listens to, pause/resume it, and skip or clear the queue, per guild. Changes apply live; no restart.
 
-Start:
+Start: just run the bot. There is **no login**: the network is the security boundary (see Security notes).
 ```bash
-scripts/gen_gui_token.sh              # dev: ~/.config/tts-bot/gui_token; prints the token ONCE
-sudo scripts/gen_gui_token.sh --system  # prod: /etc/tts-bot/gui_token (root:root 600); --rotate to replace
-ssh -L 8765:127.0.0.1:8765 <host>     # tunnel (not needed for a local dev run)
+python bot.py                          # dev: GUI on http://127.0.0.1:8765
 ```
-Open `http://127.0.0.1:8765`, enter the token and a display name (shown to other editors). Settings: `WEBUI_HOST` (default `127.0.0.1`), `WEBUI_PORT` (default `8765`), `WEBUI_TOKEN_FILE`. Token lookup: `$CREDENTIALS_DIRECTORY/gui_token`, the token file, then `WEBUI_TOKEN`. A token shorter than 24 chars (or none) disables the GUI with a log warning; the bot still runs. If the port cannot be bound the error is logged and the bot runs without the GUI. In production the unit requires `/etc/tts-bot/gui_token` to exist (`LoadCredential`), so generate it before the first `deploy.sh`.
+Open it, enter a display name (shown to other editors). Settings (all optional):
+- `WEBUI_PORT` (default `8765`).
+- `WEBUI_HOSTS`: comma-separated bind addresses. Only loopback (`127.0.0.0/8`, `::1`, or `localhost`) and Tailscale addresses (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`) are accepted; anything else (`0.0.0.0`, `::`, LAN addresses, hostnames) disables the GUI with an error log. Unset = `127.0.0.1` plus this machine's Tailscale addresses, auto-detected (`tailscale ip`, else `ip addr show dev tailscale0`). An address that cannot be bound yet (e.g. Tailscale not up at boot) is retried every 15 s; the others keep serving.
+- `WEBUI_ALLOWED_HOSTS`: extra `Host` names the GUI answers to (comma-separated hostnames, no wildcards), e.g. your MagicDNS name. Always allowed: `localhost`, `127.0.0.1`, `::1` and the configured bind addresses. Any other Host gets `403 {"error":"bad_host"}`.
+
+Over Tailscale: open `http://<tailscale-ip>:8765` (works out of the box) or `http://your-machine.tailnet-name.ts.net:8765` after adding that name to `WEBUI_ALLOWED_HOSTS`. Restrict who can reach port 8765 with Tailscale ACLs.
+
+Later, behind a domain with zero trust (Cloudflare Access, etc.): add the domain to `WEBUI_ALLOWED_HOSTS` and keep the reverse proxy on loopback or the tailnet (never LAN). The proxy must pass `Host` unchanged (or the allowlist entry must match what it sends), and must not buffer `/api/events` (SSE).
+
+If the port cannot be bound on any address the error is logged and the bot runs without the GUI.
 
 Keyboard: `/` focus search, Up/Down move, Enter select channel, Esc clear search / leave it.
 
@@ -59,10 +66,10 @@ Multiple editors: every change carries the config revision it was based on. If s
 Pause: the bot stops reading messages for that guild (nothing new is queued). Commands (`!join`, `!skip`, ...) still work in the chosen channel, and clips already queued finish unless you press Clear/Skip.
 
 Security notes:
-- Bearer token compared in constant time; strong CSP, no cookies. Plain HTTP: keep it on loopback and reach it through the SSH tunnel. Do not expose it directly.
-- Failed-auth throttle is per client IP (`request.remote`): 5 invalid or missing credentials / 60 s, then further invalid attempts get 429 for 60 s. A valid token is always accepted (even while the IP is blocked) and never counted, so a mistyped token or stale tabs cannot lock out working sessions. A local process (or everyone behind a shared proxy IP) can still make invalid attempts return 429, but cannot lock out valid tokens.
-- If you do put a proxy in front, disable response buffering for `/api/events` (SSE); the server sends `X-Accel-Buffering: no` but the proxy must honor it.
-- Anyone with the token can change the bot's channel. Rotate with `--rotate` and restart the service.
+- No application-layer auth. Trust boundary = who can reach the port: loopback plus Tailscale only (the bind policy refuses to listen anywhere else), narrowed by your Tailscale ACLs / zero-trust proxy. Anyone who can reach it can change the bot's channel.
+- Host allowlist on every request (DNS-rebinding defense) and an Origin check on writes (a cross-site `Origin` or `Sec-Fetch-Site: cross-site` gets `403 bad_origin`; a missing Origin, e.g. curl, is allowed). Strong CSP, no cookies. Plain HTTP: it is safe only because of the network boundary.
+- Accepted limitation: any local process or account on the server can reach `127.0.0.1:8765` and change the channel. Do not run untrusted users on this host.
+- If you put a proxy in front, disable response buffering for `/api/events` (SSE); the server sends `X-Accel-Buffering: no` but the proxy must honor it.
 
 ## Behavior
 - Per-guild `asyncio.Queue` (`MAX_QUEUE`, default 20) and worker. Full queue: message gets a ⏳ reaction and a log line.
@@ -83,7 +90,6 @@ python bot.py
 ## Team deployment (production)
 Roles: devs edit the repo (group `devteam`); an admin with real sudo deploys and holds the token.
 ```bash
-sudo scripts/gen_gui_token.sh --system  # web UI token -> /etc/tts-bot/gui_token (required by the unit; setup refuses without it)
 sudo scripts/setup_system.sh            # service user, /opt/tts-bot (root-owned), sudoers, unit
 sudo scripts/install_token.sh --system  # token -> /etc/tts-bot/token (root:root 600)
 sudo scripts/deploy.sh                  # byte-compile, copy *.py + static/ + models to /opt/tts-bot, prune stale files, restart
@@ -93,12 +99,12 @@ Devs (no password) can: `sudo systemctl start|stop|restart tts_bot`, `systemctl 
 Local testing: each dev should create their own dev bot application and run `scripts/install_token.sh` (personal `~/.config/tts-bot/token`). Never share the production token.
 
 ### Upgrading an existing deployment
-The unit changed (it now loads `/etc/tts-bot/gui_token`), so order matters:
+The GUI token is gone and the unit changed (Tailscale ordering, no `gui_token` credential, `WEBUI_HOST` replaced by `WEBUI_HOSTS`):
 ```bash
-sudo scripts/gen_gui_token.sh --system   # 1) token first; the unit will not start without it
-sudo scripts/setup_system.sh             # 2) installs the new unit (or: copy tts_bot.service to /etc/systemd/system/ && sudo systemctl daemon-reload)
-sudo scripts/deploy.sh                   # 3) ship the code
+sudo scripts/setup_system.sh             # 1) installs the new unit (or: copy tts_bot.service to /etc/systemd/system/ && sudo systemctl daemon-reload)
+sudo scripts/deploy.sh                   # 2) ship the code, restart
+sudo shred -u /etc/tts-bot/gui_token     # 3) an existing gui_token is no longer used; delete it (after the new unit is live)
 ```
-`deploy.sh` alone ships new code with the OLD unit (no `gui_token` credential, no `CONFIG_FILE`/`WEBUI_*`), so the GUI would silently stay disabled. `deploy.sh` and `setup_system.sh` refuse to run if the token file is missing, and `deploy.sh` refuses symlinks or non-regular files in the repo's `*.py`, `static/`, `models/`.
+`deploy.sh` alone ships new code with the OLD unit (which still requires the `gui_token` credential file), so re-run `setup_system.sh` first. `deploy.sh` refuses symlinks or non-regular files in the repo's `*.py`, `static/`, `models/`.
 
 Known boundary: anyone who can deploy code can read the token (the code runs with it). Review changes before `deploy.sh`.

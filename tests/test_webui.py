@@ -1,11 +1,14 @@
 import asyncio
 import json
+import logging
 import os
+import socket
 import tempfile
 import threading
 import unittest
 from unittest import mock
 
+import aiohttp
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer, make_mocked_request
 from aiohttp import streams
@@ -14,9 +17,7 @@ import config_store
 import webui
 from config_store import ConfigStore
 
-TOKEN = "t" * 32
-AUTH = {"Authorization": f"Bearer {TOKEN}"}
-ED = {**AUTH, "X-Editor": "alice"}
+ED = {"X-Editor": "alice"}
 
 
 class FakeController:
@@ -44,14 +45,6 @@ class FakeController:
         return 3
 
 
-class Clock:
-    def __init__(self):
-        self.t = 1000.0
-
-    def __call__(self):
-        return self.t
-
-
 class Base(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -64,9 +57,8 @@ class Base(unittest.IsolatedAsyncioTestCase):
         self.cfgpath = os.path.join(self.tmp.name, "c.json")
         self.config = ConfigStore(self.cfgpath)
         self.ctl = FakeController()
-        self.clock = Clock()
-        self.app = webui.make_app(self.config, self.ctl, TOKEN, status_interval=0.05,
-                                  static_dir=self.static, clock=self.clock)
+        self.app = webui.make_app(self.config, self.ctl, allowed_hosts=[], status_interval=0.05,
+                                  static_dir=self.static)
         self.client = TestClient(TestServer(self.app))
         await self.client.start_server()
         self.addAsyncCleanup(self.client.close)
@@ -75,92 +67,45 @@ class Base(unittest.IsolatedAsyncioTestCase):
         return self.client.put(f"/api/guilds/{gid}/channel", json=body, headers=headers)
 
 
-class AuthTests(Base):
-    async def test_missing_wrong_right(self):
+class OpenAccessTests(Base):
+    async def test_api_needs_no_authorization(self):
         r = await self.client.get("/api/state")
-        self.assertEqual(r.status, 401)
-        self.assertEqual(await r.json(), {"error": "unauthorized"})
-        r = await self.client.get("/api/state", headers={"Authorization": "Bearer nope"})
-        self.assertEqual(r.status, 401)
-        r = await self.client.get("/api/state", headers={"Authorization": TOKEN})
-        self.assertEqual(r.status, 401)
-        r = await self.client.get("/api/state", headers=AUTH)
         self.assertEqual(r.status, 200)
         body = await r.json()
         self.assertEqual(body["config"]["rev"], 0)
         self.assertEqual(body["guilds"][0]["id"], "1")
 
-    async def test_throttle(self):
-        bad = {"Authorization": "Bearer x"}
-        for _ in range(5):
-            r = await self.client.get("/api/state", headers=bad)
-            self.assertEqual(r.status, 401)
-        # blocked: invalid credentials get 429, valid token is still served
-        r = await self.client.get("/api/state", headers=bad)
-        self.assertEqual(r.status, 429)
-        self.assertEqual(await r.json(), {"error": "too_many_attempts"})
-        r = await self.client.get("/api/state")
-        self.assertEqual(r.status, 429)
-        r = await self.client.get("/api/state", headers=AUTH)
-        self.assertEqual(r.status, 200)
-        self.clock.t += 61
-        r = await self.client.get("/api/state", headers=bad)
-        self.assertEqual(r.status, 401)
-
-    async def test_valid_token_not_counted_as_failure(self):
-        for _ in range(4):
-            await self.client.get("/api/state", headers={"Authorization": "Bearer x"})
-        for _ in range(10):
-            r = await self.client.get("/api/state", headers=AUTH)
-            self.assertEqual(r.status, 200)
-        r = await self.client.get("/api/state", headers={"Authorization": "Bearer x"})
-        self.assertEqual(r.status, 401)  # 5th failure: blocks from now on
-        r = await self.client.get("/api/state", headers={"Authorization": "Bearer x"})
-        self.assertEqual(r.status, 429)
-
-    async def test_failures_outside_window_dont_count(self):
-        for _ in range(4):
-            await self.client.get("/api/state")
-        self.clock.t += 61
-        await self.client.get("/api/state")
-        r = await self.client.get("/api/state", headers=AUTH)
+    async def test_stray_authorization_header_ignored(self):
+        for h in ("Bearer nope", "Basic abc", "garbage"):
+            r = await self.client.get("/api/state", headers={"Authorization": h})
+            self.assertEqual(r.status, 200, h)
+        r = await self.put_channel({"channel_id": "10", "rev": None}, headers={**ED, "Authorization": "Bearer x"})
         self.assertEqual(r.status, 200)
 
-    async def test_static_no_auth_and_headers(self):
+    async def test_static_and_headers(self):
         for path, ct in (("/", "text/html"), ("/app.js", "javascript"), ("/app.css", "text/css")):
             r = await self.client.get(path)
             self.assertEqual(r.status, 200)
             self.assertIn(ct, r.headers["Content-Type"])
             self.assertEqual(r.headers["Cache-Control"], "no-cache")
             self.assertIn("default-src 'none'", r.headers["Content-Security-Policy"])
-        r = await self.client.get("/api/state", headers=AUTH)
+        r = await self.client.get("/api/state")
         self.assertEqual(r.headers["Cache-Control"], "no-store")
         self.assertEqual(r.headers["X-Content-Type-Options"], "nosniff")
         self.assertEqual(r.headers["Referrer-Policy"], "no-referrer")
         self.assertEqual(r.headers["Content-Security-Policy"],
                          "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; "
                          "base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
-        r = await self.client.get("/api/state")  # 401 also carries headers
-        self.assertEqual(r.headers["X-Content-Type-Options"], "nosniff")
         r = await self.client.get("/nope")
         self.assertEqual(r.status, 404)
         self.assertEqual(r.headers["X-Content-Type-Options"], "nosniff")
 
     async def test_missing_static_does_not_crash(self):
         os.unlink(os.path.join(self.static, "app.js"))
-        app = webui.make_app(self.config, self.ctl, TOKEN, static_dir=self.static)
+        app = webui.make_app(self.config, self.ctl, allowed_hosts=[], static_dir=self.static)
         async with TestClient(TestServer(app)) as c:
             self.assertEqual((await c.get("/app.js")).status, 500)
             self.assertEqual((await c.get("/")).status, 200)
-
-    async def test_token_never_in_body(self):
-        await self.put_channel({"channel_id": "10", "rev": None})
-        for method, path in (("get", "/api/state"), ("get", "/"), ("get", "/nope"),
-                             ("post", "/api/guilds/1/skip")):
-            r = await getattr(self.client, method)(path, headers=ED)
-            self.assertNotIn(TOKEN, await r.text())
-        r = await self.client.get("/api/state", headers={"Authorization": "Bearer wrong"})
-        self.assertNotIn(TOKEN, await r.text())
 
 
 class WriteTests(Base):
@@ -211,13 +156,13 @@ class WriteTests(Base):
         self.assertEqual(self.config.rev, 0)
 
     async def test_editor_required_and_sanitized(self):
-        r = await self.put_channel({"channel_id": "10", "rev": None}, headers=AUTH)
+        r = await self.put_channel({"channel_id": "10", "rev": None}, headers={})
         self.assertEqual(r.status, 400)
         self.assertEqual((await r.json())["error"], "editor_required")
-        r = await self.put_channel({"channel_id": "10", "rev": None}, headers={**AUTH, "X-Editor": " \t "})
+        r = await self.put_channel({"channel_id": "10", "rev": None}, headers={"X-Editor": " \t "})
         self.assertEqual(r.status, 400)
         r = await self.put_channel({"channel_id": "10", "rev": None},
-                                   headers={**AUTH, "X-Editor": "ab   c" + "z" * 100})
+                                   headers={"X-Editor": "ab   c" + "z" * 100})
         self.assertEqual(r.status, 200)
         by = (await r.json())["snapshot"]["updated_by"]
         self.assertTrue(by.startswith("ab c"))
@@ -226,16 +171,16 @@ class WriteTests(Base):
     async def test_editor_percent_encoded(self):
         from urllib.parse import quote
         r = await self.put_channel({"channel_id": "10", "rev": None},
-                                   headers={**AUTH, "X-Editor": quote("\u7530\u4e2d \U0001F600 Jos\u00e9")})
+                                   headers={"X-Editor": quote("\u7530\u4e2d \U0001F600 Jos\u00e9")})
         self.assertEqual(r.status, 200)
         self.assertEqual((await r.json())["snapshot"]["updated_by"], "\u7530\u4e2d \U0001F600 Jos\u00e9")
         r = await self.put_channel({"channel_id": "11", "rev": None},
-                                   headers={**AUTH, "X-Editor": "al%00ic%07e%1B"})
+                                   headers={"X-Editor": "al%00ic%07e%1B"})
         self.assertEqual((await r.json())["snapshot"]["updated_by"], "alice")
-        r = await self.put_channel({"channel_id": "10", "rev": None}, headers={**AUTH, "X-Editor": "bob"})
+        r = await self.put_channel({"channel_id": "10", "rev": None}, headers={"X-Editor": "bob"})
         self.assertEqual((await r.json())["snapshot"]["updated_by"], "bob")
         for bad in ("100%", "%zz", "%E4%B8", "%"):
-            r = await self.put_channel({"channel_id": "11", "rev": None}, headers={**AUTH, "X-Editor": "x" + bad})
+            r = await self.put_channel({"channel_id": "11", "rev": None}, headers={"X-Editor": "x" + bad})
             self.assertIn(r.status, (200, 400), bad)
 
     def test_sanitize(self):
@@ -252,7 +197,7 @@ class WriteTests(Base):
         self.assertEqual(r.status, 400)
         r = await self.client.put("/api/guilds/1/enabled", json={"enabled": True, "rev": 0}, headers=ED)
         self.assertEqual(r.status, 409)
-        r = await self.client.put("/api/guilds/1/enabled", json={"enabled": True, "rev": 0}, headers=AUTH)
+        r = await self.client.put("/api/guilds/1/enabled", json={"enabled": True, "rev": 0})
         self.assertEqual(r.status, 400)
 
     async def test_bad_bodies_and_ids(self):
@@ -277,7 +222,7 @@ class WriteTests(Base):
         r = await self.client.post("/api/guilds/1/clear", headers=ED)
         self.assertEqual(await r.json(), {"cleared": 3})
         self.assertEqual((self.ctl.skips, self.ctl.clears), ([1], [1]))
-        r = await self.client.post("/api/guilds/1/skip", headers=AUTH)
+        r = await self.client.post("/api/guilds/1/skip")
         self.assertEqual(r.status, 400)
         r = await self.client.post("/api/guilds/2/skip", headers=ED)
         self.assertEqual(r.status, 404)
@@ -338,7 +283,7 @@ async def read_event(resp, timeout=2):
 
 class SSETests(Base):
     async def test_hello_config_status_and_cleanup(self):
-        r = await self.client.get("/api/events", headers=AUTH)
+        r = await self.client.get("/api/events")
         self.assertEqual(r.status, 200)
         self.assertEqual(r.headers["Content-Type"], "text/event-stream; charset=utf-8")
         self.assertEqual(r.headers["X-Accel-Buffering"], "no")
@@ -375,16 +320,11 @@ class SSETests(Base):
             await asyncio.sleep(0.05)
         self.assertEqual(self.config.hub.subscriber_count, 0)
 
-    async def test_requires_auth(self):
-        r = await self.client.get("/api/events")
-        self.assertEqual(r.status, 401)
-        self.assertEqual(self.config.hub.subscriber_count, 0)
-
     async def test_keepalive(self):
-        app = webui.make_app(self.config, self.ctl, TOKEN, status_interval=10,
+        app = webui.make_app(self.config, self.ctl, allowed_hosts=[], status_interval=10,
                              keepalive_interval=0.05, static_dir=self.static)
         async with TestClient(TestServer(app)) as c:
-            r = await c.get("/api/events", headers=AUTH)
+            r = await c.get("/api/events")
             await read_event(r)
             line = await asyncio.wait_for(r.content.readline(), 2)
             while line.strip() in (b"", b"event: status") or line.startswith((b"data:", b"event:")):
@@ -393,88 +333,335 @@ class SSETests(Base):
             r.close()
 
 
-class HardeningTests(Base):
-    async def test_bad_tokens_rejected(self):
-        for t in ("", "x" * 23):
-            with self.assertRaises(ValueError):
-                webui.make_app(self.config, self.ctl, t, static_dir=self.static)
-
-    async def test_header_parsing(self):
-        r = await self.client.get("/api/state", headers={"Authorization": f"bearer {TOKEN}"})
-        self.assertEqual(r.status, 200)
-        r = await self.client.get("/api/state", headers={"Authorization": f"Basic {TOKEN}"})
-        self.assertEqual(r.status, 401)
-        r = await self.client.get("/api/state", headers={"Authorization": "Bearer "})
-        self.assertEqual(r.status, 401)
-
-
 class ShutdownTests(unittest.IsolatedAsyncioTestCase):
     async def test_open_sse_does_not_block_cleanup(self):
         import time
         with tempfile.TemporaryDirectory() as d:
             cfg = ConfigStore(os.path.join(d, "c.json"))
-            app = webui.make_app(cfg, FakeController(), TOKEN, static_dir=d)
-            runner = await webui.start_webui(app, "127.0.0.1", 0)
+            app = webui.make_app(cfg, FakeController(), allowed_hosts=[], static_dir=d)
+            quiet_loggers(self)
+            with self.assertLogs("webui", "INFO"):
+                runner = await webui.start_webui(app, ["127.0.0.1"], 0)
             port = runner.addresses[0][1]
-            import aiohttp
             async with aiohttp.ClientSession() as s:
-                r = await s.get(f"http://127.0.0.1:{port}/api/events", headers=AUTH)
+                r = await s.get(f"http://127.0.0.1:{port}/api/events")
                 await r.content.readline()
                 t0 = time.monotonic()
                 await runner.cleanup()
                 self.assertLess(time.monotonic() - t0, 3)
+                r.close()
             self.assertEqual(cfg.hub.subscriber_count, 0)
 
 
-class TokenLoadTests(unittest.TestCase):
-    def setUp(self):
+def quiet_loggers(case):
+    """Silence per-request access logs / server banners in new tests (stderr stays pristine)."""
+    for name in ("aiohttp.access", "asyncio"):
+        lg = logging.getLogger(name)
+        old = lg.level
+        lg.setLevel(logging.WARNING)
+        case.addCleanup(lg.setLevel, old)
+
+
+def free_port():
+    with socket.socket() as sk:
+        sk.bind(("127.0.0.1", 0))
+        return sk.getsockname()[1]
+
+
+class BindPolicyTests(unittest.TestCase):
+    def test_accepted(self):
+        v = webui.validate_bind_hosts
+        self.assertEqual(v(["127.0.0.1"]), ["127.0.0.1"])
+        self.assertEqual(v(["127.5.6.7", "::1"]), ["127.5.6.7", "::1"])
+        self.assertEqual(v(["100.64.0.1", "100.127.255.254"]), ["100.64.0.1", "100.127.255.254"])
+        self.assertEqual(v(["fd7a:115c:a1e0::1", "FD7A:115C:A1E0:0:0:0:0:2"]),
+                         ["fd7a:115c:a1e0::1", "fd7a:115c:a1e0::2"])
+        self.assertEqual(v([" 127.0.0.1 "]), ["127.0.0.1"])
+
+    def test_localhost_mapped_and_deduped(self):
+        self.assertEqual(webui.validate_bind_hosts(["localhost", "LocalHost", "127.0.0.1", "::1", "::1"]),
+                         ["127.0.0.1", "::1"])
+
+    def test_rejected_names_the_entry(self):
+        for bad in ("0.0.0.0", "::", "192.168.1.5", "10.0.0.1", "172.16.0.1", "100.128.0.1", "100.63.255.255",
+                    "fe80::1", "fd7b::1", "fd7a:115c:a1e1::1", "example.com", "tailnet.ts.net", "",
+                    "::ffff:127.0.0.1", "fd7a:115c:a1e0::1%eth0", "8.8.8.8", "127.0.0.1/8"):
+            with self.assertRaises(ValueError, msg=bad) as cm:
+                webui.validate_bind_hosts(["127.0.0.1", bad])
+            self.assertIn(repr(bad.strip()), str(cm.exception))
+
+    def test_empty(self):
+        with self.assertRaises(ValueError):
+            webui.validate_bind_hosts([])
+
+
+class TailscaleParseTests(unittest.TestCase):
+    def test_tailscale_ip(self):
+        p = webui.parse_tailscale_ip
+        self.assertEqual(p("100.101.102.103\n"), ["100.101.102.103"])
+        self.assertEqual(p("100.101.102.103\nfd7a:115c:a1e0::1234\n"),
+                         ["100.101.102.103", "fd7a:115c:a1e0::1234"])
+        self.assertEqual(p("garbage\n192.168.1.5\n0.0.0.0\n100.64.0.9\n"), ["100.64.0.9"])
+        self.assertEqual(p(""), [])
+        self.assertEqual(p("no ts here\n\x00\xff"), [])
+
+    def test_ip_addr(self):
+        p = webui.parse_ip_addr
+        v4 = "5: tailscale0    inet 100.101.102.103/32 scope global tailscale0\\       valid_lft forever\n"
+        self.assertEqual(p(v4), ["100.101.102.103"])
+        both = v4 + ("5: tailscale0    inet6 fd7a:115c:a1e0::1234/128 scope global \\       valid_lft forever\n"
+                     "5: tailscale0    inet6 fe80::1/64 scope link \\       valid_lft forever\n")
+        self.assertEqual(p(both), ["100.101.102.103", "fd7a:115c:a1e0::1234"])
+        self.assertEqual(p("5: tailscale0    inet 192.168.1.2/24 scope global\n"), [])
+        self.assertEqual(p("junk inet"), [])
+        self.assertEqual(p(""), [])
+
+    def test_detect_prefers_tailscale_cli_then_ip(self):
+        outs = {"tailscale": "100.64.0.5\n", "ip": "5: tailscale0 inet 100.64.0.6/32 scope global\n"}
+        with mock.patch.object(webui, "_run", side_effect=lambda cmd: outs[cmd[0]]):
+            self.assertEqual(webui.detect_tailscale_addrs(), ["100.64.0.5"])
+        outs["tailscale"] = None
+        with mock.patch.object(webui, "_run", side_effect=lambda cmd: outs[cmd[0]]):
+            self.assertEqual(webui.detect_tailscale_addrs(), ["100.64.0.6"])
+
+    def test_detect_failure_is_empty(self):
+        with mock.patch.object(webui, "_run", return_value=None):
+            with self.assertLogs("webui", "INFO"):
+                self.assertEqual(webui.detect_tailscale_addrs(), [])
+        with mock.patch.object(webui, "_run", side_effect=RuntimeError("boom")):
+            with self.assertLogs("webui", "INFO"):
+                self.assertEqual(webui.detect_tailscale_addrs(), [])
+
+    def test_run_handles_missing_binary_and_timeout(self):
+        import subprocess
+        with mock.patch("subprocess.run", side_effect=FileNotFoundError()):
+            self.assertIsNone(webui._run(["tailscale", "ip"]))
+        with mock.patch("subprocess.run", side_effect=subprocess.TimeoutExpired("x", 3)):
+            self.assertIsNone(webui._run(["tailscale", "ip"]))
+
+
+class HostParseTests(unittest.TestCase):
+    def test_host_of(self):
+        h = webui.host_of
+        self.assertEqual(h("LocalHost:8765"), "localhost")
+        self.assertEqual(h("127.0.0.1"), "127.0.0.1")
+        self.assertEqual(h("[::1]:8765"), "::1")
+        self.assertEqual(h("[FD7A:115C:A1E0:0:0:0:0:1]"), "fd7a:115c:a1e0::1")
+        self.assertEqual(h("Box.Tail.ts.net.:80"), "box.tail.ts.net")
+        self.assertIsNone(h(""))
+        self.assertIsNone(h("[::1"))
+
+    def test_parse_allowed_hosts(self):
+        with self.assertLogs("webui", "WARNING") as cm:
+            out = webui.parse_allowed_hosts(" Box.ts.net , ,*.ts.net,a b,other.example:8080")
+        self.assertEqual(out, ["box.ts.net", "other.example"])
+        self.assertEqual(len(cm.output), 2)
+        self.assertEqual(webui.parse_allowed_hosts(None), [])
+
+
+class HostOriginTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        quiet_loggers(self)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
+        for n, c in (("index.html", "<h1>hi</h1>"), ("app.js", "//js"), ("app.css", "/*css*/")):
+            with open(os.path.join(self.tmp.name, n), "w") as f:
+                f.write(c)
+        self.config = ConfigStore(os.path.join(self.tmp.name, "c.json"))
+        self.app = webui.make_app(self.config, FakeController(),
+                                  allowed_hosts=["100.64.0.5", "Box.tail.ts.net"],
+                                  status_interval=0.05, static_dir=self.tmp.name)
+        self.client = TestClient(TestServer(self.app))
+        await self.client.start_server()
+        self.addAsyncCleanup(self.client.close)
 
-    def write(self, name, text):
-        p = os.path.join(self.tmp.name, name)
-        with open(p, "w") as f:
-            f.write(text)
-        return p
+    def get(self, path, host):
+        return self.client.get(path, headers={"Host": host})
 
-    def env(self, **kw):
-        base = {k: v for k, v in os.environ.items()
-                if k not in ("CREDENTIALS_DIRECTORY", "WEBUI_TOKEN_FILE", "WEBUI_TOKEN")}
-        base.update(kw)
-        return mock.patch.dict(os.environ, base, clear=True)
+    async def test_allowed_hosts(self):
+        for host in ("localhost", "localhost:8765", "LOCALHOST:1", "127.0.0.1:8765", "[::1]:8765", "[::1]",
+                     "100.64.0.5", "100.64.0.5:8765", "box.tail.ts.net:8765", "BOX.tail.ts.net"):
+            r = await self.get("/api/state", host)
+            self.assertEqual(r.status, 200, host)
 
-    def test_order(self):
-        cred = os.path.join(self.tmp.name, "cred")
-        os.mkdir(cred)
-        with open(os.path.join(cred, "gui_token"), "w") as f:
-            f.write("c" * 30 + "\n")
-        tf = self.write("tf", "f" * 30)
-        with self.env(CREDENTIALS_DIRECTORY=cred, WEBUI_TOKEN_FILE=tf, WEBUI_TOKEN="e" * 30):
-            self.assertEqual(webui.load_gui_token(), "c" * 30)
-        with self.env(WEBUI_TOKEN_FILE=tf, WEBUI_TOKEN="e" * 30):
-            self.assertEqual(webui.load_gui_token(), "f" * 30)
-        with self.env(WEBUI_TOKEN_FILE=os.path.join(self.tmp.name, "missing"), WEBUI_TOKEN=" " + "e" * 30 + " "):
-            self.assertEqual(webui.load_gui_token(), "e" * 30)
+    async def test_denied_hosts(self):
+        for host in ("evil.example", "evil.example:8765", "192.168.1.5:8765", "127.0.0.1.evil.example",
+                     "[::2]:8765", "tail.ts.net", ""):
+            r = await self.get("/api/state", host)
+            self.assertEqual(r.status, 403, host)
+            self.assertEqual(await r.json(), {"error": "bad_host"})
+            self.assertEqual(r.headers["X-Content-Type-Options"], "nosniff")
+            self.assertIn("default-src 'none'", r.headers["Content-Security-Policy"])
 
-    def test_none_and_short(self):
-        with self.env(WEBUI_TOKEN_FILE=os.path.join(self.tmp.name, "missing")):
-            self.assertIsNone(webui.load_gui_token())
-        tf = self.write("short", "abc123")
-        with self.env(WEBUI_TOKEN_FILE=tf):
-            with self.assertLogs("webui", "WARNING") as cm:
-                self.assertIsNone(webui.load_gui_token())
-            self.assertNotIn("abc123", "".join(cm.output))
-        with self.env(WEBUI_TOKEN_FILE=os.path.join(self.tmp.name, "missing"), WEBUI_TOKEN="x" * 23):
-            self.assertIsNone(webui.load_gui_token())
+    async def test_missing_host_header(self):
+        reader, writer = await asyncio.open_connection(self.client.server.host, self.client.server.port)
+        writer.write(b"GET /api/state HTTP/1.0\r\n\r\n")
+        data = await asyncio.wait_for(reader.read(), 3)
+        writer.close()
+        self.assertIn(b" 403 ", data.split(b"\r\n")[0])
+        self.assertIn(b'"bad_host"', data)
+
+    async def test_applies_to_static_and_events(self):
+        for path in ("/", "/app.js", "/app.css", "/api/events", "/nope"):
+            r = await self.get(path, "evil.example")
+            self.assertEqual(r.status, 403, path)
+        self.assertEqual(self.config.hub.subscriber_count, 0)
+        r = await self.get("/", "box.tail.ts.net")
+        self.assertEqual(r.status, 200)
+        r = await self.get("/api/events", "100.64.0.5:8765")
+        self.assertEqual(r.status, 200)
+        ev, _ = await read_event(r)
+        self.assertEqual(ev, "hello")
+        r.close()
+
+    async def test_writes_denied_on_bad_host(self):
+        r = await self.client.put("/api/guilds/1/enabled", json={"enabled": False, "rev": None},
+                                  headers={"Host": "evil.example", "X-Editor": "a"})
+        self.assertEqual(r.status, 403)
+        self.assertTrue(self.config.is_enabled(1))
+
+    async def test_origin_rules(self):
+        base = {"X-Editor": "a"}
+        put = lambda h: self.client.put("/api/guilds/1/enabled", json={"enabled": False, "rev": None},
+                                        headers={**base, **h})
+        r = await put({"Origin": "http://box.tail.ts.net:8765", "Host": "box.tail.ts.net:8765"})
+        self.assertEqual(r.status, 200)
+        r = await put({"Origin": "http://[::1]:8765", "Host": "[::1]:8765"})
+        self.assertEqual(r.status, 200)
+        r = await put({})  # curl: no Origin
+        self.assertEqual(r.status, 200)
+        for origin in ("http://evil.example", "http://evil.example:8765", "null", "garbage", "http://localhost.evil.example"):
+            r = await put({"Origin": origin})
+            self.assertEqual(r.status, 403, origin)
+            self.assertEqual(await r.json(), {"error": "bad_origin"})
+            self.assertEqual(r.headers["X-Content-Type-Options"], "nosniff")
+        r = await put({"Sec-Fetch-Site": "cross-site"})
+        self.assertEqual(r.status, 403)
+        self.assertEqual((await r.json())["error"], "bad_origin")
+        for site in ("same-origin", "same-site", "none"):
+            r = await put({"Sec-Fetch-Site": site})
+            self.assertEqual(r.status, 200, site)
+
+    async def test_origin_not_checked_on_get(self):
+        r = await self.client.get("/api/state", headers={"Origin": "http://evil.example",
+                                                         "Sec-Fetch-Site": "cross-site"})
+        self.assertEqual(r.status, 200)
+
+    async def test_bad_origin_does_not_change_state(self):
+        r = await self.client.put("/api/guilds/1/enabled", json={"enabled": False, "rev": None},
+                                  headers={"X-Editor": "a", "Origin": "http://evil.example"})
+        self.assertEqual(r.status, 403)
+        self.assertTrue(self.config.is_enabled(1))
+        self.assertEqual(self.config.rev, 0)
 
 
 class StartTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        quiet_loggers(self)
+
+    def app(self, d):
+        return webui.make_app(ConfigStore(os.path.join(d, "c.json")), FakeController(),
+                              allowed_hosts=[], static_dir=d)
+
     async def test_start_and_cleanup(self):
         with tempfile.TemporaryDirectory() as d:
-            app = webui.make_app(ConfigStore(os.path.join(d, "c.json")), FakeController(), TOKEN,
-                                 static_dir=d)
-            runner = await webui.start_webui(app, "127.0.0.1", 0)
+            with self.assertLogs("webui", "INFO"):
+                runner = await webui.start_webui(self.app(d), ["127.0.0.1"], 0)
+            self.assertIsNone(runner.retry_task)
             await runner.cleanup()
+
+    async def test_policy_enforced_in_start(self):
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(ValueError):
+                await webui.start_webui(self.app(d), ["0.0.0.0"], 0)
+
+    async def test_partial_bind_serves_and_retries(self):
+        port = free_port()
+        real = webui._bind_site
+        blocked = {"on": True}
+
+        async def fake(runner, host, p):
+            if host == "100.64.0.5":
+                if blocked["on"]:
+                    raise OSError(99, "Cannot assign requested address")
+                host = "127.0.0.1"
+                p = port + 1
+            await real(runner, host, p)
+
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(webui, "_bind_site", fake):
+            with self.assertLogs("webui", "WARNING") as cm:
+                runner = await webui.start_webui(self.app(d), ["127.0.0.1", "100.64.0.5"], port,
+                                                 retry_interval=0.02)
+            self.assertTrue(any("100.64.0.5" in m for m in cm.output))
+            try:
+                async with aiohttp.ClientSession() as s:
+                    r = await s.get(f"http://127.0.0.1:{port}/api/state")
+                    self.assertEqual(r.status, 200)
+                self.assertFalse(runner.retry_task.done())
+                blocked["on"] = False
+                with self.assertLogs("webui", "INFO"):
+                    for _ in range(100):
+                        if runner.retry_task.done():
+                            break
+                        await asyncio.sleep(0.02)
+                self.assertTrue(runner.retry_task.done())
+                async with aiohttp.ClientSession() as s:
+                    r = await s.get(f"http://127.0.0.1:{port + 1}/api/state")
+                    self.assertEqual(r.status, 200)
+            finally:
+                await runner.cleanup()
+
+    async def test_real_unbindable_address_does_not_stop_loopback(self):
+        # 100.64.0.1 is policy-valid but (almost certainly) not assigned to this host: EADDRNOTAVAIL.
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertLogs("webui", "WARNING"):
+                runner = await webui.start_webui(self.app(d), ["127.0.0.1", "100.64.0.1"], 0,
+                                                 retry_interval=60)
+            try:
+                if runner.retry_task is None:
+                    self.skipTest("100.64.0.1 is assigned on this host")
+                port = runner.addresses[0][1]
+                async with aiohttp.ClientSession() as s:
+                    r = await s.get(f"http://127.0.0.1:{port}/api/state")
+                    self.assertEqual(r.status, 200)
+            finally:
+                await runner.cleanup()
+
+    async def test_all_fail_raises_and_leaves_nothing(self):
+        async def fail(runner, host, p):
+            raise OSError(98, "in use")
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(webui, "_bind_site", fail):
+            before = {t for t in asyncio.all_tasks()}
+            with self.assertLogs("webui", "WARNING"):
+                with self.assertRaises(OSError):
+                    await webui.start_webui(self.app(d), ["127.0.0.1", "::1"], 0)
+            leftover = [t for t in asyncio.all_tasks() - before if "retry" in (t.get_name() or "")]
+            self.assertEqual(leftover, [])
+
+    async def test_cleanup_cancels_retry_and_is_quick_with_sse(self):
+        import time
+        real = webui._bind_site
+
+        async def fake(runner, host, p):
+            if host == "100.64.0.5":
+                raise OSError(99, "nope")
+            await real(runner, host, p)
+
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(webui, "_bind_site", fake):
+            with self.assertLogs("webui", "WARNING"):
+                runner = await webui.start_webui(self.app(d), ["127.0.0.1", "100.64.0.5"], 0,
+                                                 retry_interval=0.02)
+            task = runner.retry_task
+            port = runner.addresses[0][1]
+            async with aiohttp.ClientSession() as s:
+                r = await s.get(f"http://127.0.0.1:{port}/api/events")
+                await r.content.readline()
+                t0 = time.monotonic()
+                await runner.cleanup()
+                self.assertLess(time.monotonic() - t0, 3)
+                r.close()
+            self.assertTrue(task.cancelled() or task.done())
+            self.assertIsNone(runner.retry_task)
 
 
 if __name__ == "__main__":

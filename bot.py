@@ -12,7 +12,8 @@ from dotenv import load_dotenv
 
 from config_store import ConfigStore, atomic_write_json
 from tts_engine import TTSEngine, clean_discord_text
-from webui import load_gui_token, make_app, start_webui
+from webui import (detect_tailscale_addrs, make_app, parse_allowed_hosts, start_webui,
+                   validate_bind_hosts)
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -54,7 +55,6 @@ MAX_CHARS = int(os.getenv("MAX_CHARS", "300"))
 MAX_QUEUE = int(os.getenv("MAX_QUEUE", "20"))
 STATE_FILE = os.getenv("STATE_FILE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json"))
 CONFIG_FILE = os.getenv("CONFIG_FILE", os.path.join(os.path.dirname(STATE_FILE), "config.json"))
-WEBUI_HOST = os.getenv("WEBUI_HOST", "127.0.0.1")
 
 
 def parse_port(raw: str | None, default: int = 8765) -> int:
@@ -539,17 +539,26 @@ async def on_guild_available(guild):  # guild (re)appeared after an outage or la
 
 
 # ---------- lifecycle ----------
-async def maybe_start_webui(cfg, ctl, host: str, port: int):
-    """Start the web UI; return its runner, or None if disabled/failed. Never raises."""
+async def maybe_start_webui(cfg, ctl, port: int):
+    """Start the web UI; return its runner, or None if disabled/failed. Never raises.
+
+    Addresses: WEBUI_HOSTS (validated: loopback / Tailscale only), else 127.0.0.1 plus any detected
+    Tailscale address. Host allowlist: loopback names + those addresses + WEBUI_ALLOWED_HOSTS."""
     try:
-        token = load_gui_token()
-        if not token:
-            log.warning("Web UI disabled: no usable GUI token (see scripts/gen_gui_token.sh)")
-            return None
-        runner = await start_webui(make_app(cfg, ctl, token), host, port)
-    except Exception:
-        log.exception("Web UI failed to start on %s:%s; continuing without it", host, port)
+        raw = (os.getenv("WEBUI_HOSTS") or "").strip()
+        if raw:
+            hosts = validate_bind_hosts([h for h in raw.split(",") if h.strip()])
+        else:
+            hosts = validate_bind_hosts(["127.0.0.1"] + await asyncio.to_thread(detect_tailscale_addrs))
+        allowed = hosts + parse_allowed_hosts(os.getenv("WEBUI_ALLOWED_HOSTS"))
+        runner = await start_webui(make_app(cfg, ctl, allowed_hosts=allowed), hosts, port)
+    except ValueError as e:
+        log.error("Web UI disabled: %s", e)
         return None
+    except Exception:
+        log.exception("Web UI failed to start on port %s; continuing without it", port)
+        return None
+    log.info("Web UI addresses: %s port %s", ", ".join(hosts), port)
     return runner
 
 
@@ -585,7 +594,7 @@ async def main() -> None:
     global _watcher_task
     _watcher_task = asyncio.create_task(config_watcher(), name="config-watcher")
     global _webui_runner
-    _webui_runner = await maybe_start_webui(config, controller, WEBUI_HOST, WEBUI_PORT)
+    _webui_runner = await maybe_start_webui(config, controller, WEBUI_PORT)
     async with bot:
         await bot.start(TOKEN)
 

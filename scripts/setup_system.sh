@@ -15,7 +15,6 @@ CONF=/etc/tts-bot
 CONDA="${CONDA:-/home/jb/miniconda3/bin/conda}"
 GROUP="${TEAM_GROUP:-devteam}"
 
-[ -f "$CONF/gui_token" ] || { echo "$CONF/gui_token missing; the unit would fail to start. Run: sudo $SRC/scripts/gen_gui_token.sh --system, then re-run this script."; exit 1; }
 getent group "$GROUP" >/dev/null || { echo "group $GROUP missing"; exit 1; }
 [ -x "$CONDA" ] || { echo "conda not found at $CONDA (set CONDA=...)"; exit 1; }
 

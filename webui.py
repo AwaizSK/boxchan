@@ -1,12 +1,15 @@
-"""Web backend: REST + SSE + bearer auth. Duck-typed on the controller; never imports bot.py."""
+"""Web backend: REST + SSE. No application-layer auth: the network layer (loopback + Tailscale ACLs)
+is the trust boundary; this module enforces a bind-address policy, a Host allowlist and an Origin
+check on writes. Duck-typed on the controller; never imports bot.py."""
 import asyncio
-import hmac
+import contextlib
+import ipaddress
 import json
 import logging
 import os
-import time
+import subprocess
 import unicodedata
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit
 
 from aiohttp import web
 
@@ -14,10 +17,12 @@ from config_store import ConflictError
 
 log = logging.getLogger("webui")
 
-MIN_TOKEN_LEN = 24
 MAX_BODY = 4096
-THROTTLE_FAILS = 5
-THROTTLE_WINDOW = 60.0
+RETRY_INTERVAL = 15.0
+SAFE_METHODS = frozenset({"GET", "HEAD"})
+# Bind policy: loopback, Tailscale CGNAT, Tailscale ULA. Nothing else may ever be listened on.
+BIND_NETWORKS = tuple(ipaddress.ip_network(n) for n in (
+    "127.0.0.0/8", "::1/128", "100.64.0.0/10", "fd7a:115c:a1e0::/48"))
 CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; "
        "base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
 STATIC_FILES = (
@@ -28,31 +33,113 @@ STATIC_FILES = (
 DEFAULT_STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
 
-def load_gui_token() -> str | None:
-    """First source found wins: $CREDENTIALS_DIRECTORY/gui_token, token file, $WEBUI_TOKEN."""
-    raw = None
-    cred = os.environ.get("CREDENTIALS_DIRECTORY")
-    paths = []
-    if cred:
-        paths.append(os.path.join(cred, "gui_token"))
-    paths.append(os.environ.get("WEBUI_TOKEN_FILE") or os.path.expanduser("~/.config/tts-bot/gui_token"))
-    for p in paths:
-        try:
-            with open(p) as f:
-                raw = f.read().strip()
-        except OSError:
+def _normalize_ip(entry: str) -> str | None:
+    """Canonical text of `entry` if it is an IP literal inside the bind policy, else None."""
+    if "%" in entry:
+        return None
+    try:
+        ip = ipaddress.ip_address(entry)
+    except ValueError:
+        return None
+    if any(ip.version == n.version and ip in n for n in BIND_NETWORKS):
+        return str(ip)
+    return None
+
+
+def validate_bind_hosts(hosts: list[str]) -> list[str]:
+    """Fail-closed bind policy. Returns normalized, de-duplicated addresses or raises ValueError."""
+    out: list[str] = []
+    for raw in hosts:
+        entry = str(raw).strip()
+        addr = "127.0.0.1" if entry.lower() == "localhost" else _normalize_ip(entry)
+        if addr is None:
+            raise ValueError(f"bind address {entry!r} is not loopback or a Tailscale address")
+        if addr not in out:
+            out.append(addr)
+    if not out:
+        raise ValueError("no bind addresses given")
+    return out
+
+
+def parse_tailscale_ip(text: str) -> list[str]:
+    """Parse `tailscale ip` output (one address per line); keeps only policy-compliant ones."""
+    out = []
+    for line in text.splitlines():
+        addr = _normalize_ip(line.strip())
+        if addr and addr not in out:
+            out.append(addr)
+    return out
+
+
+def parse_ip_addr(text: str) -> list[str]:
+    """Parse `ip -o addr show dev tailscale0` output (inet/inet6 fields); policy-compliant only."""
+    out = []
+    parts = text.split()
+    for i, word in enumerate(parts[:-1]):
+        if word in ("inet", "inet6"):
+            addr = _normalize_ip(parts[i + 1].split("/")[0])
+            if addr and addr not in out:
+                out.append(addr)
+    return out
+
+
+def _run(cmd: list[str]) -> str | None:
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=3, check=True)
+    except (OSError, subprocess.SubprocessError) as e:
+        log.debug("%s failed: %s", cmd[0], e)
+        return None
+    return r.stdout
+
+
+def detect_tailscale_addrs() -> list[str]:
+    """Blocking. This host's Tailscale addresses, or [] (never raises)."""
+    try:
+        for cmd, parse in ((["tailscale", "ip"], parse_tailscale_ip),
+                           (["ip", "-o", "addr", "show", "dev", "tailscale0"], parse_ip_addr)):
+            out = _run(cmd)
+            addrs = parse(out) if out else []
+            if addrs:
+                return addrs
+    except Exception:
+        log.debug("tailscale address detection failed", exc_info=True)
+    log.info("no Tailscale address detected")
+    return []
+
+
+def host_of(value: str) -> str | None:
+    """Lowercased hostname from a Host header value ('h', 'h:port', '[v6]:port'); IPs canonicalized."""
+    v = (value or "").strip().lower()
+    if not v:
+        return None
+    if v.startswith("["):
+        end = v.find("]")
+        if end < 0:
+            return None
+        h = v[1:end]
+    elif v.count(":") == 1:
+        h = v.split(":")[0]
+    else:
+        h = v
+    h = h.rstrip(".")
+    try:
+        return str(ipaddress.ip_address(h))
+    except ValueError:
+        return h or None
+
+
+def parse_allowed_hosts(raw: str | None) -> list[str]:
+    """WEBUI_ALLOWED_HOSTS: comma-separated hostnames, no wildcards (such entries are dropped)."""
+    out = []
+    for item in (raw or "").split(","):
+        if not item.strip():
             continue
-        if raw:
-            break
-        raw = None
-    if raw is None:
-        raw = (os.environ.get("WEBUI_TOKEN") or "").strip() or None
-    if raw is None:
-        return None
-    if len(raw) < MIN_TOKEN_LEN:
-        log.warning("GUI token is too short (%d chars, need >= %d); web UI disabled", len(raw), MIN_TOKEN_LEN)
-        return None
-    return raw
+        h = host_of(item)
+        if h is None or any(c in h for c in "*/@ \t"):
+            log.warning("ignoring invalid WEBUI_ALLOWED_HOSTS entry %r (hostnames only, no wildcards)", item.strip())
+            continue
+        out.append(h)
+    return out
 
 
 def sanitize_editor(value) -> str | None:
@@ -92,15 +179,11 @@ def _err(code, status):
     return _json({"error": code}, status)
 
 
-def make_app(config, controller, token: str, *, status_interval: float = 3.0,
-             keepalive_interval: float = 15.0, static_dir: str | None = None,
-             clock=time.monotonic) -> web.Application:
-    if not token or len(token) < MIN_TOKEN_LEN:
-        raise ValueError(f"GUI token must be at least {MIN_TOKEN_LEN} characters")
-    token_b = token.encode()
+def make_app(config, controller, *, allowed_hosts, status_interval: float = 3.0,
+             keepalive_interval: float = 15.0, static_dir: str | None = None) -> web.Application:
+    allowed = {"localhost", "127.0.0.1", "::1"}
+    allowed.update(h for h in (host_of(x) for x in allowed_hosts) if h)
     streams: set[asyncio.Task] = set()
-    fails: dict[str, list[float]] = {}
-    blocked: dict[str, float] = {}
     static_dir = static_dir or DEFAULT_STATIC_DIR
 
     @web.middleware
@@ -120,26 +203,25 @@ def make_app(config, controller, token: str, *, status_interval: float = 3.0,
         resp.headers["Cache-Control"] = "no-store" if request.path.startswith("/api/") else "no-cache"
 
     @web.middleware
-    async def auth(request, handler):
-        if not request.path.startswith("/api/"):
-            return await handler(request)
-        header = request.headers.get("Authorization", "")
-        scheme, _, presented = header.partition(" ")
-        if (scheme.lower() == "bearer"
-                and hmac.compare_digest(presented.strip().encode(), token_b)):
-            return await handler(request)  # valid token: always allowed, never counted
-        ip = request.remote or "?"
-        now = clock()
-        if blocked.get(ip, 0) > now:
-            return _err("too_many_attempts", 429)
-        recent = [t for t in fails.get(ip, []) if now - t < THROTTLE_WINDOW] + [now]
-        fails[ip] = recent
-        if len(recent) >= THROTTLE_FAILS:
-            blocked[ip] = now + THROTTLE_WINDOW
-            fails.pop(ip, None)
-        return _err("unauthorized", 401)
+    async def host_guard(request, handler):
+        # DNS-rebinding defense: a page on evil.example resolving to our IP sends Host: evil.example.
+        if host_of(request.headers.get("Host", "")) not in allowed:
+            return _err("bad_host", 403)
+        if request.method not in SAFE_METHODS:
+            # Browsers always send Origin on cross-origin writes; curl/scripts send none, so absent is OK.
+            origin = request.headers.get("Origin")
+            if origin is not None:
+                try:
+                    oh = host_of(urlsplit(origin).netloc.rpartition("@")[2]) if origin != "null" else None
+                except ValueError:
+                    oh = None
+                if oh not in allowed:
+                    return _err("bad_origin", 403)
+            if request.headers.get("Sec-Fetch-Site", "").lower() == "cross-site":
+                return _err("bad_origin", 403)
+        return await handler(request)
 
-    app = web.Application(middlewares=[security_headers, auth], client_max_size=MAX_BODY)
+    app = web.Application(middlewares=[security_headers, host_guard], client_max_size=MAX_BODY)
 
     # --- static ---
     def static_handler(name, ctype):
@@ -301,13 +383,67 @@ def make_app(config, controller, token: str, *, status_interval: float = 3.0,
     return app
 
 
-async def start_webui(app: web.Application, host: str, port: int) -> web.AppRunner:
-    runner = web.AppRunner(app, shutdown_timeout=5.0)
-    await runner.setup()
+class WebUIRunner(web.AppRunner):
+    """AppRunner whose cleanup also stops the bind-retry task."""
+
+    retry_task: asyncio.Task | None = None
+
+    async def cleanup(self) -> None:
+        t, self.retry_task = self.retry_task, None
+        if t:
+            t.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await t
+        await super().cleanup()
+
+
+async def _bind_site(runner: web.AppRunner, host: str, port: int) -> None:
+    site = web.TCPSite(runner, host, port)
     try:
-        await web.TCPSite(runner, host, port).start()
+        await site.start()
+    except BaseException:
+        await site.stop()  # unregister the half-started site
+        raise
+
+
+async def _retry_binds(runner, pending: list[str], port: int, interval: float) -> None:
+    while pending:
+        await asyncio.sleep(interval)
+        for host in list(pending):
+            try:
+                await _bind_site(runner, host, port)
+            except OSError as e:
+                log.debug("web UI still cannot bind %s:%s (%s)", host, port, e)
+            else:
+                pending.remove(host)
+                log.info("web UI now listening on %s:%s", host, port)
+
+
+async def start_webui(app: web.Application, hosts: list[str], port: int, *,
+                      retry_interval: float = RETRY_INTERVAL) -> WebUIRunner:
+    """Bind every policy-compliant address independently; retry failed ones in the background.
+    Raises ValueError (policy) or OSError (nothing bound)."""
+    hosts = validate_bind_hosts(hosts)
+    runner = WebUIRunner(app, shutdown_timeout=5.0)
+    await runner.setup()
+    pending: list[str] = []
+    last: OSError | None = None
+    try:
+        for host in hosts:
+            try:
+                await _bind_site(runner, host, port)
+            except OSError as e:
+                last = e
+                pending.append(host)
+                log.warning("web UI cannot bind %s:%s (%s); will retry", host, port, e)
+            else:
+                log.info("web UI listening on %s:%s", host, port)
+        if len(pending) == len(hosts):
+            raise OSError(f"web UI could not bind any of {hosts} on port {port}") from last
     except BaseException:
         await runner.cleanup()
         raise
-    log.info("web UI listening on %s:%s", host, port)
+    if pending:
+        runner.retry_task = asyncio.create_task(_retry_binds(runner, pending, port, retry_interval),
+                                                name="webui-bind-retry")
     return runner

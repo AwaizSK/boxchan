@@ -9,7 +9,6 @@ APP=/opt/tts-bot
 PY="$APP/env/bin/python"
 
 [ -x "$PY" ] || { echo "Run scripts/setup_system.sh first."; exit 1; }
-[ -f /etc/tts-bot/gui_token ] || { echo "/etc/tts-bot/gui_token missing; the unit would fail to start. Run: sudo scripts/gen_gui_token.sh --system"; exit 1; }
 
 # Validate + snapshot everything before touching /opt: all later steps read only from $snap
 # (closes the check/copy race; root never follows repo symlinks).

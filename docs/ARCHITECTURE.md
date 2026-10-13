@@ -51,12 +51,12 @@ A Discord bot that reads messages from a chosen set of users ("watched" users) a
                        |   Controller (sync view/actions for web UI)         |       in <tmp>/tts_bot (/tmp/tts_bot in service)  |
                        |             ^                                       v                                                  |
                        |             |                              ffmpeg (discord.FFmpegPCMAudio) --> Opus --> voice UDP      |
-                       |   aiohttp web UI (webui.py)  127.0.0.1:8765         |                                                  |
+                       |   aiohttp web UI (webui.py)  loopback+tailnet :8765   |                                                  |
                        +-------------|-------------------------------------- | ------------------------------------------------+
                                      |  REST (JSON) + SSE (/api/events)      v
- Browsers (devs) <--- SSH tunnel ----+                               Discord voice server
+ Browsers (devs) <-- Tailscale ------+                               Discord voice server
    static/index.html, app.js, app.css
-   fetch() streaming, Bearer token, X-Editor header
+   fetch() streaming, X-Editor header (no token; Host allowlist + Origin check)
 ```
 
 Key points the diagram encodes: one process and one event loop; the web UI never talks to Discord or Piper directly (only through `Controller` and `ConfigStore`); `EventHub` is the only fan-out path from config changes to browsers and to `config_watcher`; Piper inference is the only code that runs off-loop (single dedicated thread).
@@ -67,34 +67,33 @@ Key points the diagram encodes: one process and one event loop; the web UI never
 
 | File | Responsibility | Public interface |
 |---|---|---|
-| `bot.py` | Entry point. Discord events and commands, per-guild queue/worker, WatchStore, Controller, config watcher, lifecycle (startup, signals, shutdown). | Run `python bot.py`. Module-level: `config` (ConfigStore), `store` (WatchStore), `engine` (TTSEngine), `audio` (dict guild_id -> GuildAudio), `controller` (Controller), `load_token()`, `parse_port()`, `maybe_start_webui()`, `shutdown()`, `main()`. |
+| `bot.py` | Entry point. Discord events and commands, per-guild queue/worker, WatchStore, Controller, config watcher, lifecycle (startup, signals, shutdown). | Run `python bot.py`. Module-level: `config` (ConfigStore), `store` (WatchStore), `engine` (TTSEngine), `audio` (dict guild_id -> GuildAudio), `controller` (Controller), `load_token()`, `parse_port()`, `maybe_start_webui(cfg, ctl, port)`, `shutdown()`, `main()`. |
 | `tts_engine.py` | Piper wrapper (CUDA with CPU fallback) and Discord-text normalizer. | `TTSEngine(model_path, config_path)`: `load() -> bool` (never raises), `async synthesize(text) -> path\|None`, `purge_tmp()`, `close()`, attrs `ready`, `cuda_active`. `clean_discord_text(message, max_chars=300) -> str\|None`. |
 | `config_store.py` | Runtime config with revision counter, atomic persistence, pub/sub. | `atomic_write_json(data, path)`, `ConflictError(snapshot)`, `EventHub` (`subscribe/unsubscribe/publish/subscriber_count`), `ConfigStore` (`snapshot`, `channel_for`, `is_enabled`, `is_listen_channel`, `is_command_channel`, `async set_channel`, `async set_enabled`, `async seed_channel`, `.rev`, `.hub`). |
-| `webui.py` | aiohttp backend: bearer auth, throttle, REST, SSE, static serving. Duck-typed on the controller; never imports `bot.py`. | `load_gui_token() -> str\|None`, `make_app(config, controller, token, *, status_interval=3.0, keepalive_interval=15.0, static_dir=None, clock=time.monotonic)`, `async start_webui(app, host, port) -> AppRunner`, `sanitize_editor()`, `wire_snapshot()`, `wire_event()`. |
+| `webui.py` | aiohttp backend: bind-address policy (`validate_bind_hosts`, Tailscale detection), Host allowlist + Origin check, REST, SSE, static serving. No token auth. Duck-typed on the controller; never imports `bot.py`. | `validate_bind_hosts(hosts)`, `detect_tailscale_addrs()`, `parse_tailscale_ip()`, `parse_ip_addr()`, `parse_allowed_hosts()`, `host_of()`, `make_app(config, controller, *, allowed_hosts, status_interval=3.0, keepalive_interval=15.0, static_dir=None)`, `async start_webui(app, hosts, port, *, retry_interval=15.0) -> WebUIRunner` (binds each address independently, retries failures every 15 s, raises `OSError` if none bind), `sanitize_editor()`, `wire_snapshot()`, `wire_event()`. |
 | `static/index.html`, `app.js`, `app.css` | Vanilla-JS single-page UI. No framework, no CDN, no inline script/style (CSP). `app.js` also exports pure helpers under node for tests. | Served at `/`, `/app.js`, `/app.css`. |
-| `tts_bot.service` | systemd unit: user `ttsbot`, credentials, env, sandboxing. | Installed to `/etc/systemd/system/` by `setup_system.sh`. |
+| `tts_bot.service` | systemd unit: user `ttsbot`, Discord-token credential, env, sandboxing, ordered after `tailscaled`. | Installed to `/etc/systemd/system/` by `setup_system.sh`. |
 | `scripts/setup_system.sh` | One-time root setup: service user, `/opt/tts-bot`, private conda env, sudoers rule, journal group, unit install. | `sudo scripts/setup_system.sh` (env: `CONDA`, `TEAM_GROUP`). |
 | `scripts/deploy.sh` | Admin deploy: validate, snapshot, compile, install, prune, restart. | `sudo scripts/deploy.sh`. |
 | `scripts/lib/deploy_validate.sh` | Sourced function `snapshot_sources SRC SNAP` (validation + snapshot). | Tested by `tests/test_deploy_validation.sh`. |
 | `scripts/install_token.sh` | Hidden prompt, shape-checks and stores the Discord token (mode 600). | `[--system]`; `TOKEN_DIR` env override (undocumented in README). |
-| `scripts/gen_gui_token.sh` | Generates GUI token (openssl, >= 48 chars), prints it once. | `[--system] [--rotate]`; refuses to overwrite without `--rotate`. |
 | `tests/` | See section 11. | `python -m unittest discover -s tests` |
 | `requirements.txt` | `discord.py[voice]>=2.4`, `PyNaCl>=1.5`, `piper-tts==1.2.0`, `onnxruntime-gpu>=1.18,<1.21`, `python-dotenv>=1.0`. | |
 | `.env.example` | Non-secret dev settings template. | |
 
 ### Web API (all under `webui.py`)
 
-| Route | Auth | Purpose |
+| Route | Guard | Purpose |
 |---|---|---|
-| `GET /`, `/app.js`, `/app.css` | none (no secrets in them) | Three explicit routes; files read once at app creation. No directory serving, so no path traversal. |
-| `GET /api/state` | Bearer | `{"config": snapshot, "guilds": guilds_view}` |
-| `PUT /api/guilds/{gid}/channel` | Bearer + `X-Editor` | Body `{"channel_id": "<digits>"\|null, "rev": int\|null}`. 400 `bad_channel`, 409 `conflict` (with snapshot), 200 `{"snapshot"}`. |
-| `PUT /api/guilds/{gid}/enabled` | Bearer + `X-Editor` | Body `{"enabled": bool, "rev": int\|null}`. |
-| `POST /api/guilds/{gid}/skip` | Bearer + `X-Editor` | `{"skipped": bool}` |
-| `POST /api/guilds/{gid}/clear` | Bearer + `X-Editor` | `{"cleared": int}` |
-| `GET /api/events` | Bearer | SSE: `hello` (snapshot+guilds) on connect, then `config`, `channels`, `status` (only when changed), `: keepalive` comment every 15 s. |
+| `GET /`, `/app.js`, `/app.css` | Host allowlist (no secrets in them) | Three explicit routes; files read once at app creation. No directory serving, so no path traversal. |
+| `GET /api/state` | Host | `{"config": snapshot, "guilds": guilds_view}` |
+| `PUT /api/guilds/{gid}/channel` | Host/Origin + `X-Editor` | Body `{"channel_id": "<digits>"\|null, "rev": int\|null}`. 400 `bad_channel`, 409 `conflict` (with snapshot), 200 `{"snapshot"}`. |
+| `PUT /api/guilds/{gid}/enabled` | Host/Origin + `X-Editor` | Body `{"enabled": bool, "rev": int\|null}`. |
+| `POST /api/guilds/{gid}/skip` | Host/Origin + `X-Editor` | `{"skipped": bool}` |
+| `POST /api/guilds/{gid}/clear` | Host/Origin + `X-Editor` | `{"cleared": int}` |
+| `GET /api/events` | Host | SSE: `hello` (snapshot+guilds) on connect, then `config`, `channels`, `status` (only when changed), `: keepalive` comment every 15 s. |
 
-Error codes: 401 `unauthorized`, 429 `too_many_attempts` (invalid credentials only), 500 `persist_failed` (config write raised `OSError`; no detail leaked), 400 `editor_required` / `bad_request` / `bad_channel`, 404 (unknown or non-digit guild id; body is not JSON), 409 `conflict`, 413 for bodies > 4096 bytes (aiohttp `client_max_size`). Bad JSON, non-object body, or a `rev` that is not an int (bools rejected) -> 400 `bad_request`.
+Error codes: 403 `bad_host` (Host not on the allowlist, any route) / `bad_origin` (write with a foreign `Origin` or `Sec-Fetch-Site: cross-site`), 500 `persist_failed` (config write raised `OSError`; no detail leaked), 400 `editor_required` / `bad_request` / `bad_channel`, 404 (unknown or non-digit guild id; body is not JSON), 409 `conflict`, 413 for bodies > 4096 bytes (aiohttp `client_max_size`). Bad JSON, non-object body, or a `rev` that is not an int (bools rejected) -> 400 `bad_request`.
 
 All IDs on the wire are strings (JS numbers lose precision above 2^53). `wire_snapshot`/`wire_event` convert `channel_id` and `change.guild_id/old/new`; internally the store uses ints.
 
@@ -121,8 +120,8 @@ All IDs on the wire are strings (JS numbers lose precision above 2^53). `wire_sn
 11. Worker awaits `play_done` with `PLAY_TIMEOUT`=180 s (safety net: `vc.stop()` on timeout), then loops.
 
 ### (b) A dev switches the channel in the GUI
-1. Browser: user clicks a row (or Enter). `app.js` updates the UI optimistically and sends `PUT /api/guilds/{gid}/channel` with `Authorization: Bearer`, `X-Editor: <percent-encoded name>`, body `{channel_id, rev}`.
-2. Server middleware order: `security_headers` -> `auth` (throttle, constant-time compare). Handler: validates guild (404), editor (400), body (400), channel via `Controller.is_text_channel` (400 `bad_channel`).
+1. Browser: user clicks a row (or Enter). `app.js` updates the UI optimistically and sends `PUT /api/guilds/{gid}/channel` with `X-Editor: <percent-encoded name>`, body `{channel_id, rev}`.
+2. Server middleware order: `security_headers` -> `host_guard` (Host allowlist on every request; Origin / `Sec-Fetch-Site` check on non-GET/HEAD). Handler: validates guild (404), editor (400), body (400), channel via `Controller.is_text_channel` (400 `bad_channel`).
 3. `ConfigStore.set_channel` is invoked inside `asyncio.shield`. Under the store lock: rev check, no-op check, mutate, `rev += 1`, persist via `atomic_write_json` in a thread, then `hub.publish`.
 4. The hub event reaches (i) every SSE stream (all browsers get `config`, flash the row and toast "X switched to #name"), and (ii) `config_watcher` in bot.py, which sees `change.field == "channel_id"` and `drain`s that guild's queue.
 5. Effect on the live bot: from the next `on_message`, the old channel is ignored and the new one is listened to (`is_listen_channel` reads the in-memory dict directly; there is no cache to invalidate). Pending queued clips are dropped; the clip currently playing is NOT interrupted; a clip already mid-synthesis will still play (accepted).
@@ -146,7 +145,7 @@ Toggling `enabled` follows the same path but `config_watcher` ignores it (the qu
 | Listen channel + pause flag | `config.json` (`CONFIG_FILE`; default: next to `STATE_FILE`; `/var/lib/tts-bot/config.json` in production) | The snapshot dict: `rev`, `updated_by`, `updated_at` (epoch float), `guilds{gid: {channel_id, enabled}}`. Pretty-printed JSON. | `ConfigStore._mutate` |
 | Watch list | `state.json` (`STATE_FILE`; default next to `bot.py`; `/var/lib/tts-bot/state.json` in production) | `{"watched": {"<gid>": [user ids]}}` | `WatchStore.mutate` |
 | Queues, workers, voice connections, playing clip | memory | `GuildAudio` per guild | |
-| EventHub subscribers, throttle counters, SSE tasks | memory | | |
+| EventHub subscribers, SSE tasks, bind-retry task | memory | | |
 | Temp `.wav` clips | `<tempdir>/tts_bot` (`/tmp/tts_bot`; under `PrivateTmp` in the service) | deleted by `after`; `purge_tmp()` at start and in `engine.close()` | |
 
 **`rev` semantics.** Starts at 0 for a fresh store; +1 for every effective change (channel set to a different value, enabled flipped, or first seed of a guild); persisted, so it survives restarts. No-op writes (same value on an existing guild entry) return the current snapshot without bumping rev or publishing. Quirk: the first `set_*` on a guild with no entry always counts as a change, even when the value equals the default (`enabled=True`, `channel_id=None`), so it bumps rev. `expected_rev=None` bypasses conflict detection.
@@ -187,26 +186,29 @@ Other state-changing behaviors: `leave` and auto-leave (no humans left in the bo
 ### Actors and boundaries
 | Actor | Can | Cannot |
 |---|---|---|
-| Admin (real sudo) | run `setup_system.sh`, `deploy.sh`, `install_token.sh --system`, `gen_gui_token.sh --system`; read both tokens | |
-| Dev (group `devteam`) | edit the repo; `sudo systemctl start\|stop\|restart tts_bot` (exact commands, no wildcards); `systemctl status`, `journalctl -u tts_bot` (via `systemd-journal` group); use the GUI with the GUI token if given it | read `/etc/tts-bot/*`; modify `/opt/tts-bot`; use any other sudo command |
+| Admin (real sudo) | run `setup_system.sh`, `deploy.sh`, `install_token.sh --system`; read the Discord token | |
+| Dev (group `devteam`) | edit the repo; `sudo systemctl start\|stop\|restart tts_bot` (exact commands, no wildcards); `systemctl status`, `journalctl -u tts_bot` (via `systemd-journal` group); use the GUI if Tailscale ACLs let them reach it | read `/etc/tts-bot/*`; modify `/opt/tts-bot`; use any other sudo command |
 | Service (`ttsbot` user) | read `/opt/tts-bot` (root-owned), write `/var/lib/tts-bot`, `/tmp` (private) | write code, see home dirs, gain privileges |
-| GUI user (token holder) | change channel, pause, skip, clear for any guild the bot is in | read the Discord token; read/write anything on the host |
+| GUI user (anyone who can reach the port: loopback, or tailnet per ACLs) | change channel, pause, skip, clear for any guild the bot is in | read the Discord token; read/write anything on the host |
 
 ### Token locations and flow (names only)
 - **Discord token**: production `/etc/tts-bot/token` (root:root 600, dir `/etc/tts-bot` 700) -> systemd `LoadCredential=discord_token:/etc/tts-bot/token` -> process sees `$CREDENTIALS_DIRECTORY/discord_token`. Dev: `~/.config/tts-bot/token` (mode 600), override `DISCORD_TOKEN_FILE`. Lookup order in `load_token()`: credential, file, then `DISCORD_TOKEN` env (last resort). Shape-validated against `TOKEN_RE` at import; on mismatch the process exits with a message containing only the length.
-- **GUI token**: production `/etc/tts-bot/gui_token` (root:root 600) -> `LoadCredential=gui_token:/etc/tts-bot/gui_token` -> `$CREDENTIALS_DIRECTORY/gui_token`. Dev: `~/.config/tts-bot/gui_token` or `WEBUI_TOKEN_FILE` (no `~` expansion there) or `WEBUI_TOKEN` env. Order in `load_gui_token()`: credential, file, env. The first source that is found and non-empty wins even if it is too short (no fallthrough to later sources); a token under 24 chars is rejected (warning logs only the length) and the GUI stays off.
-- Neither token is ever logged or returned by an endpoint (`test_token_never_in_body`). The browser keeps the GUI token in `sessionStorage` (per tab, gone on close); the editor name is in `localStorage`.
+- There is **no GUI token**: the GUI is protected by the network layer (below). The browser keeps only the editor name, in `localStorage`.
 - `.env`, `~/.config/tts-bot/`, and `/etc/tts-bot/` are off-limits for agents and must never be committed (`.gitignore` covers `.env`).
 
+### Web UI trust boundary (network layer, no application auth)
+**The trust boundary is who can reach the port.** The GUI listens only on loopback and this host's Tailscale address(es); access control is Tailscale ACLs (and, later, a zero-trust proxy in front of a domain). Anyone who can reach it can change the bot's channel, pause, skip and clear. Because there is no token any more, three cheap application-layer defenses are mandatory:
+- **Fail-closed bind policy** (`validate_bind_hosts`): every bind address must be an IP literal in `127.0.0.0/8`, `::1`, Tailscale CGNAT `100.64.0.0/10` or Tailscale ULA `fd7a:115c:a1e0::/48` (`localhost` maps to `127.0.0.1`). Anything else (`0.0.0.0`, `::`, LAN addresses, hostnames) raises `ValueError` and `maybe_start_webui` disables the GUI (logged), so a typo can never publish the GUI on the LAN/Wi-Fi. `start_webui` re-validates. Default: `127.0.0.1` plus auto-detected Tailscale addresses (`tailscale ip`, fallback `ip -o addr show dev tailscale0`, 3 s timeout, no shell; failure -> loopback only). Each address is bound independently; one that cannot bind yet (Tailscale not up at boot) is retried every 15 s by a background task that `runner.cleanup()` cancels.
+- **Host allowlist** (DNS-rebinding defense), on every route including static and `/api/events`: a malicious web page can rebind its own hostname to `127.0.0.1` or the tailnet IP and then talk to the GUI same-origin from the victim's browser, which no CORS or Origin rule would stop; but the browser still sends `Host: evil.example`. Allowed: `localhost`, `127.0.0.1`, `::1`, every configured bind address, plus `WEBUI_ALLOWED_HOSTS` (hostnames, no wildcards, e.g. the MagicDNS name or later the domain). Case-insensitive, port ignored, `[v6]:port` handled. Otherwise `403 {"error":"bad_host"}`.
+- **Origin check on writes**: for non-GET/HEAD, if `Origin` is present its hostname must be allowed, and `Sec-Fetch-Site: cross-site` is refused (`403 bad_origin`). A missing Origin is allowed on purpose: browsers always send Origin on cross-origin writes (and on same-origin non-GET fetches), so absence means a non-browser client such as curl, which is not the CSRF threat and is already inside the network boundary. The JSON-only `Content-Type` plus the required `X-Editor` header (a non-simple header that forces a CORS preflight, which is never granted) are additional CSRF barriers.
+- **Accepted limitation**: any local process or account on the server can reach `127.0.0.1:8765` and change the channel (loopback is shared by all local users). Run no untrusted local users on this host. Traffic is plain HTTP (Tailscale encrypts the tailnet hop; loopback needs none); a domain deployment must terminate TLS and authenticate at the proxy.
+
 ### Web UI hardening
-- **Loopback bind** by default (`WEBUI_HOST=127.0.0.1`, port 8765). Remote use: `ssh -L 8765:127.0.0.1:8765 <host>` or a TLS reverse proxy. Traffic is plain HTTP; do not expose it directly.
-- **Bearer auth** via `Authorization: Bearer <token>` header only, compared with `hmac.compare_digest`. No cookies means no CSRF surface. All `/api/*` routes need it; static files do not (they contain no secrets).
-- **Fail closed**: no usable token -> server not started (warning). `make_app` raises `ValueError` for an empty or < 24 char token, so a programming or config error can never produce an open server. A guild without a configured channel reads nothing.
-- **CSP** on every response: `default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`, plus `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `Cache-Control: no-store` for `/api/*` and `no-cache` for static. The UI uses `textContent`/DOM APIs only (channel names are attacker-influenced); `tests/test_static.py` forbids `innerHTML`, `eval`, inline handlers/styles and external URLs.
-- **Auth throttle**: the token is verified first. A valid token is always accepted, even while its IP is blocked, and is never counted. Only invalid or missing credentials count: 5 within 60 s from one `request.remote` block that IP for 60 s, during which invalid attempts get 429 (`too_many_attempts`) and are not counted further. The client shows a toast on 429 and keeps its token and stream. See the caveats in section 9.
+- **CSP** on every response (including 403s): `default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`, plus `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `Cache-Control: no-store` for `/api/*` and `no-cache` for static. The UI uses `textContent`/DOM APIs only (channel names are attacker-influenced); `tests/test_static.py` forbids `innerHTML`, `eval`, inline handlers/styles and external URLs. No cookies.
 - **Body limit** 4096 bytes. Guild ids and channel ids must be ASCII digits; `is_text_channel` confirms the channel exists in that guild and the bot can view it.
 - **Editor attribution** (`X-Editor`) is self-declared: it names who changed what in the UI and logs; it is not authentication. The client percent-encodes it (`encodeURIComponent`) because a raw non-Latin-1 name would make `fetch` throw; the server `unquote`s then sanitizes (strip control chars, collapse whitespace, truncate to 40, reject empty).
-- **Never crash the bot**: `maybe_start_webui` wraps token loading, `make_app` and the bind; any failure (bad token, bad port, port in use) logs and the bot continues without the GUI. `parse_port` falls back to 8765 on an invalid or out-of-range `WEBUI_PORT`.
+- **Never crash the bot**: `maybe_start_webui` wraps address resolution, `make_app` and the binds; any failure (invalid `WEBUI_HOSTS`, bad port, port in use on every address) logs and the bot continues without the GUI. `parse_port` falls back to 8765 on an invalid or out-of-range `WEBUI_PORT`. A guild without a configured channel reads nothing.
+- **Client**: a 403 `bad_host`/`bad_origin` shows a toast ("This hostname is not allowed - add it to WEBUI_ALLOWED_HOSTS on the server") and stops the SSE reconnect loop (no retry storm).
 
 ### systemd sandbox (`tts_bot.service`)
 `User=ttsbot`, `NoNewPrivileges`, `PrivateTmp`, `ProtectSystem=strict` (everything read-only except `StateDirectory=tts-bot` -> `/var/lib/tts-bot`), `ProtectHome=true`, `ProtectKernelModules`, `ProtectControlGroups`, `RestrictSUIDSGID`.
@@ -233,7 +235,7 @@ Format: **Decision** / Why / Alternatives rejected / Cost if wrong.
 
 ### D2. SSE instead of WebSockets or polling
 - **Why:** only server->client push is needed (config changed, channel list changed, status). SSE is plain HTTP, simple to proxy, lighter than a WS stack, and reconnect-friendly.
-- **Client detail:** `app.js` uses `fetch` streaming plus a hand-written parser (`createSSEParser`), not `EventSource`, because `EventSource` cannot set the `Authorization` header. Putting the token in a query string or cookie was rejected (leaks in logs/history; cookies would add CSRF).
+- **Client detail:** `app.js` uses `fetch` streaming plus a hand-written parser (`createSSEParser`), not `EventSource`, because `EventSource` cannot set custom headers such as `X-Editor`, and `fetch` streaming gives control over reconnect and backoff.
 - **Rejected:** WebSockets, polling.
 - **Cost:** proxies that buffer responses break live updates (the server sends `X-Accel-Buffering: no`); a 45 s client-side idle watchdog reconnects dead streams.
 
@@ -251,14 +253,12 @@ Format: **Decision** / Why / Alternatives rejected / Cost if wrong.
 - **Why:** queued items belong to the old channel and would be spoken out of context; killing a clip mid-word is jarring and Skip exists. Pausing does not drain the queue for the same "don't surprise people" reason (use Clear).
 - **Cost:** an item already being synthesized at the moment of the swap still plays.
 
-### D6. Loopback bind + bearer token + systemd credential
-- **Why:** the GUI controls a production bot, so it is not on the network by default; the token is delivered like the Discord token (`LoadCredential`) to preserve the "devs can't read secrets" boundary.
-- **Rejected:** binding 0.0.0.0, no auth, basic auth over plain HTTP, cookie sessions.
-- **Cost:** remote use needs an SSH tunnel or a TLS proxy.
+### D6. Loopback + Tailscale bind, no bearer token (supersedes the original loopback + bearer token design)
+- See D31. The original design (loopback only, bearer token via `LoadCredential`, SSH tunnel) was replaced.
 
 ### D7. Self-declared editor name
-- **Why:** small, known team; the token is the real gate; names give "who changed this" without building accounts.
-- **Cost:** anyone with the token can impersonate a name. Attribution only.
+- **Why:** small, known team; the network boundary is the real gate; names give "who changed this" without building accounts.
+- **Cost:** anyone who can reach the GUI can impersonate a name. Attribution only.
 
 ### D8. Three explicit static routes and strict CSP
 - **Why:** reading three files at startup removes any traversal surface; CSP with no inline code limits XSS impact; channel names are untrusted strings, so `textContent` only.
@@ -278,65 +278,33 @@ Format: **Decision** / Why / Alternatives rejected / Cost if wrong.
 - **Why:** aiohttp waits up to 60 s for open handlers on `runner.cleanup()`; a connected browser would stall systemd stop (`TimeoutStopSec=20`).
 - **Cost:** a stream that is inside `resp.prepare()` at that instant is not yet tracked and is bounded only by the 5 s timeout.
 
-### D12. `make_app` refuses tokens < 24 chars (fail closed)
-- **Why:** defense in depth behind `load_gui_token`; an empty-string token would otherwise authenticate an empty bearer header.
+### D12. (removed) `make_app` token length check
+- Superseded by D31: there is no token. `make_app` now requires an explicit `allowed_hosts` argument instead.
 
 ### D13. Config writes shielded from handler cancellation
 - See section 6. **Cost:** a disconnecting client may leave a completed write the user did not see confirmed (harmless; the SSE event/refetch shows it).
 
-### D14. Per-IP auth throttle keyed on `request.remote`
-- **Why:** cheap brute-force limit with no dependencies. **Cost:** behind a reverse proxy (or the SSH tunnel) all clients share one IP, so a local process can make invalid attempts return 429 for everyone sharing that IP; it cannot lock out valid tokens, because the (288-bit) token is checked before the block and valid requests are never counted (final-review fix F2). Throttle dicts are not pruned (entries only per distinct IP).
+### D14. (removed) Per-IP auth throttle
+- Superseded by D31: without credentials there is nothing to brute-force.
 
 ### D15. Unconfigured guild reads nothing
 - **Why:** fail closed; a bot invited to a new server must not start reading channels. `is_listen_channel`/`is_command_channel` return false without an entry. Slash replies say "No channel configured - set one in the web UI."
 
 ### D16. `maybe_start_webui` never crashes the bot
-- **Why:** voice TTS is the product; the GUI is optional. Bad port, bad token, bind failure -> log and run without GUI. Tests: `tests/test_wiring.py`.
+- **Why:** voice TTS is the product; the GUI is optional. Bad port, invalid `WEBUI_HOSTS`, bind failure on every address -> log and run without GUI. Tests: `tests/test_wiring.py`.
 
 ### D17. Deploy: validate, snapshot, install from snapshot
 - See section 7. **Alternatives rejected:** copying straight from the repo as root (symlink dereference by root could publish any secret file, e.g. a symlinked token, world-readable in `/opt`). **Cost:** more script complexity; the residual microsecond race is accepted.
 
-### D18. `LoadCredential` for the GUI token and no optional-credential syntax
-- **Why:** consistent with the Discord token. systemd 249 on this host has no optional-credential (`:`-prefixed/`-`) syntax, so a missing `/etc/tts-bot/gui_token` makes the unit refuse to start. `deploy.sh` and `setup_system.sh` therefore refuse earlier with a hint.
+### D18. (removed) `LoadCredential` for the GUI token
+- Superseded by D31. The unit no longer loads `gui_token`; `deploy.sh`/`setup_system.sh` no longer refuse on it.
 
-### Pre-existing decisions
-
-### D19. piper-tts pinned to 1.2.0
-- **Why:** `tts_engine.py` uses `PiperVoice.load(..., use_cuda=...)` and `voice.synthesize_stream_raw(text)`; later piper releases changed the API. **Cost:** upgrading piper requires rewriting `_synth`.
-
-### D20. onnxruntime-gpu `>=1.18,<1.21`; uninstall CPU `onnxruntime`
-- **Why:** the GPU wheel must match the CUDA 12.x stack that Pascal supports; `piper-tts` depends on the CPU `onnxruntime`, which shadows/conflicts with the GPU build (both provide the `onnxruntime` module). `setup_system.sh` installs requirements, then `pip uninstall -y onnxruntime onnxruntime-gpu`, then reinstalls the pinned GPU wheel. **Cost:** forgetting this silently leaves CPU-only inference (`CUDAExecutionProvider` missing; the engine logs an error and falls back to CPU).
-
-### D21. FP32 / CUDA only (no FP16, no TensorRT)
-- **Why:** GTX 1060 is Pascal (no tensor cores): FP16 gives no speedup and risks accuracy. `load()` warms up the CUDA session; on failure it falls back to CPU rather than dying.
-
-### D22. Hybrid prefix + slash commands
-- **Why:** `@bot.hybrid_command` gives `!cmd` for quick typing and `/cmd` for discoverability from one definition. Slash needs the `applications.commands` invite scope; `setup_hook` syncs the tree (failure logged). A `CheckFailure` on a slash invocation must be answered (ephemeral message naming the current channel) or Discord shows "did not respond"; for prefix commands it is silent.
-
-### D23. Intents: `message_content` + `members` (plus voice_states, default)
-- **Why:** `message_content` is required to read text (also enable "Message Content Intent" in the Developer Portal); `members` resolves mentions and display names for speech and `status`. **Cost:** both are privileged intents; missing Portal toggles cause login failure or empty content.
-
-### D24. Per-guild queue, hourglass reaction on overflow
-- **Why:** bounded memory (`MAX_QUEUE`=20) and isolation between guilds; a flood must not grow the backlog or starve other guilds. A full queue drops the message and reacts with the hourglass so the author sees it was not spoken.
-
-### D25. Temp `.wav` in `<tmp>/tts_bot`, purged at start and stop
-- **Why:** ffmpeg reads from a path; clips are deleted in `after`. Crashes can orphan files, so `purge_tmp()` runs in `main()` before load and in `engine.close()`. Under the service `PrivateTmp=true` the directory is private and vanishes with the unit's namespace anyway.
-
-### D26. conda-forge only (`--override-channels`) and explicit `pip`
-- **Why:** Anaconda's default channels require a ToS acceptance per user, and `sudo`/root uses its own conda config; `--override-channels -c conda-forge` avoids that. conda-forge's python ships without pip, so `setup_system.sh` includes `pip` in `create` and installs it into pre-existing envs that lack it.
-
-### D27. `PrivateTmp`, `ProtectHome`, `ProtectSystem=strict`
-- **Why:** minimal filesystem exposure for a network-facing process. `ProtectHome=true` also means nothing in `~` is reachable, so production must not depend on `~/.config/tts-bot` (hence credentials and `/etc/tts-bot`). `StateDirectory` provides the single writable path.
-
-### D28. `LD_LIBRARY_PATH=/opt/tts-bot/env/lib`
-- **Why:** pip-installed CUDA/cuDNN libraries and conda's `libopus`/ffmpeg libs live in the env, not system paths; systemd does not source a shell profile. `bot.py` additionally prepends the env's `bin` to `PATH` (for ffmpeg) and loads `libopus.so.0` from the env.
-
-### D29. Text normalization rules and the spoiler preference
-- Rules (`clean_discord_text`, in order): URL -> "link"; code block -> "code block"; inline code keeps its text; spoilers `||x||` -> `x` (**preference: read spoilers aloud, just drop the pipes**); user mention -> "at <display name>" or "someone"; role -> "at <role>" or "role"; channel -> "channel <name>"; custom emoji -> its name; timestamp -> "timestamp"; markdown characters `* _ ~ > # ` |` -> space; runs of 3+ of `! ? , . : ; ~` collapse to one; 4+ repeated letters collapse to three; whitespace collapse; truncate at a word boundary with "..." beyond `MAX_CHARS`; if no alphanumeric remains return `None`.
-- **Why:** TTS reads punctuation and URLs badly and slowly; spoken URLs are noise.
-
-### D30. Deploy copies all root `*.py`, `static/*`, `models/*`, `requirements.txt`
-- **Divergence:** the plan did not mention models or requirements; the code also installs `models/*` and `requirements.txt`, and prunes stale deployed files. **Cost:** a stray `*.py` in the repo root ships to production (the admin should review).
+### D31. Remove the GUI token; secure the GUI at the network layer (loopback + Tailscale), Host allowlist, Origin check
+- **Decision:** no application-layer auth. Bind only loopback and Tailscale addresses (fail-closed policy), answer only allowlisted Host names, check Origin on writes.
+- **Why:** the user secures access with Tailscale ACLs (and later zero trust in front of a domain); a second shared secret in a password manager added friction and an extra credential file/unit dependency without a stronger boundary than the ACLs already give. Removing the token makes DNS-rebinding and cross-site writes the main browser-borne risks, hence the mandatory Host and Origin checks and a bind policy that cannot be mis-set to `0.0.0.0` by accident.
+- **Alternatives rejected:** keeping the token optional (an optional control silently off is the failure mode; two code paths to test); binding `0.0.0.0` and relying on a firewall (one typo exposes it on the LAN; the policy makes that impossible); keeping the bearer token behind a reverse proxy (proxy auth is the same boundary as ACLs, with extra credential handling).
+- **Why Origin is checked only when present:** browsers always send `Origin` on cross-origin writes, so a forged cross-site write is caught; scripts and curl send none and are not the CSRF threat. Requiring it would break legitimate tooling for no gain.
+- **Cost:** any local process or account on the server can reach `127.0.0.1:8765` and change the channel (accepted; run no untrusted local users). Anyone on the tailnet that ACLs allow can use the GUI. If a domain is added later it must authenticate at the proxy.
 
 ---
 
@@ -356,11 +324,10 @@ Format: **Decision** / Why / Alternatives rejected / Cost if wrong.
 - **`join` follows the caller.** Running `join` elsewhere moves the bot (`move_to`); it is not tied to the text channel's guild beyond membership.
 - **Voice state is lost on restart.** After a restart/deploy the bot is not in voice; someone must `!join` again. The watch list persists but `leave`/auto-leave flush it.
 - **SSE through proxies needs buffering off.** Nginx honors `X-Accel-Buffering: no`; other proxies need explicit config. Symptom: UI stuck on "Connecting" or updates arrive in bursts.
-- **Reverse proxy and the throttle.** All clients share the proxy IP; five bad requests make invalid attempts on that IP return 429 for a minute; valid tokens are unaffected (D14).
-- **`WEBUI_TOKEN_FILE` has no `~` expansion** (`load_gui_token` uses it verbatim), unlike `DISCORD_TOKEN_FILE` which is `expanduser`ed. Use an absolute path.
+- **Reverse proxy and the Host allowlist.** The proxy must pass `Host` unchanged, or `WEBUI_ALLOWED_HOSTS` must contain what it sends; otherwise every request gets `403 bad_host`. Keep the proxy on loopback or the tailnet (never LAN) and turn response buffering off for `/api/events`.
 - **`EnvironmentFile=-/etc/tts-bot/bot.env` is optional** (leading `-`): a fresh install starts without it. It only carries a first-boot `TTS_CHANNEL_ID` seed. No script creates it; the unit comment shows how.
-- **Unit refuses to start without `/etc/tts-bot/gui_token`** (D18). A too-short token does not stop the unit; it just disables the GUI.
-- **Upgrading: `deploy.sh` alone ships new code with the OLD unit.** The old unit lacks `LoadCredential=gui_token`, `CONFIG_FILE` and `WEBUI_*`, so the GUI silently stays disabled and `config.json` lands in the default location. Generate the token first, re-run `setup_system.sh` (or copy the unit and `daemon-reload`), then deploy.
+- **MagicDNS name gives `bad_host`.** Opening `http://box.tailnet.ts.net:8765` needs that name in `WEBUI_ALLOWED_HOSTS`; the raw Tailscale IP works without it. Tailscale not up at boot is fine: the address is retried every 15 s (look for `web UI now listening`).
+- **Upgrading: `deploy.sh` alone ships new code with the OLD unit.** The old unit still requires the `gui_token` credential file (and sets the removed `WEBUI_HOST`); re-run `setup_system.sh` (or copy the unit and `daemon-reload`) first, then deploy. Delete the unused `/etc/tts-bot/gui_token` with `sudo shred -u`.
 - **Config rollback vs disk.** `_mutate` catches `BaseException`: if a caller is cancelled while the thread-offloaded write is in flight, memory rolls back while the write may still land (disk ahead of memory). The web layer's `asyncio.shield` closes this for HTTP callers; `seed_channel` in `on_ready` is not shielded (acceptable; runs once).
 - **Persist errors surface differently.** Config: the HTTP call fails (500) and state is rolled back. Watch list: logged, memory keeps the change.
 - **Editor-name comparison.** The "X switched to ..." toast is suppressed when the event's `updated_by` equals the local `normalizeEditor(editor)`; two people using the same name will not see each other's toasts.
@@ -375,16 +342,15 @@ Format: **Decision** / Why / Alternatives rejected / Cost if wrong.
 
 ### Fresh install (order matters)
 ```
-sudo scripts/gen_gui_token.sh --system   # 1) prints GUI token once; creates /etc/tts-bot/gui_token
-sudo scripts/setup_system.sh             # 2) user, /opt/tts-bot, conda env, sudoers, unit (refuses without the gui_token file)
-sudo scripts/install_token.sh --system   # 3) prompts for the Discord token (hidden)
-sudo scripts/deploy.sh                   # 4) validate, snapshot, install, restart
-sudo systemctl enable tts_bot            # 5)
+sudo scripts/setup_system.sh             # 1) user, /opt/tts-bot, conda env, sudoers, unit
+sudo scripts/install_token.sh --system   # 2) prompts for the Discord token (hidden)
+sudo scripts/deploy.sh                   # 3) validate, snapshot, install, restart
+sudo systemctl enable tts_bot            # 4)
 ```
 Optionally create `/etc/tts-bot/bot.env` (can hold `TTS_CHANNEL_ID=<id>` for first-boot seeding; the unit starts fine without it). Put the Piper voice (`.onnx` + `.onnx.json`) in `models/` first; `deploy.sh` refuses when no model files exist. Review `scripts/` before running any of this as root (section 7).
 
 ### Upgrade an existing deployment
-Generate the GUI token first, re-run `setup_system.sh` (or copy `tts_bot.service` to `/etc/systemd/system/` and `sudo systemctl daemon-reload`), then `deploy.sh`.
+The GUI token is gone. Re-run `setup_system.sh` (installs the new unit; or copy `tts_bot.service` to `/etc/systemd/system/` and `sudo systemctl daemon-reload`), then `deploy.sh`, then delete the now-unused file: `sudo shred -u /etc/tts-bot/gui_token` (deleting it earlier would stop the OLD unit from restarting).
 
 ### Deploy a code change
 `git pull`/edit in the repo, review, run tests, then `sudo scripts/deploy.sh` (restarts the service; the bot leaves voice, so re-run `!join`).
@@ -392,23 +358,25 @@ Generate the GUI token first, re-run `setup_system.sh` (or copy `tts_bot.service
 ### Rotate the Discord token
 Developer Portal -> Bot -> Reset Token, then `sudo scripts/install_token.sh --system`, then `sudo systemctl restart tts_bot`. A leaked token: reset it first.
 
-### Rotate the GUI token
-`sudo scripts/gen_gui_token.sh --system --rotate` (prints the new token once), then `sudo systemctl restart tts_bot` (the credential is loaded at unit start). Existing browser tabs get 401 and re-prompt.
+### Reach the GUI
+- Local / on the server: `http://127.0.0.1:8765`.
+- Over Tailscale: `http://<tailscale-ip>:8765`, or `http://<machine>.<tailnet>.ts.net:8765` after setting `WEBUI_ALLOWED_HOSTS=<machine>.<tailnet>.ts.net` in the unit (uncomment the line, `systemctl daemon-reload`, restart). Restrict who may connect with Tailscale ACLs.
+- Later via a domain behind zero trust: add the domain to `WEBUI_ALLOWED_HOSTS`; keep the reverse proxy on loopback/tailnet; it must pass `Host` unchanged (or the entry must match what it sends) and must not buffer `/api/events`.
 
 ### Change the listen channel (no restart)
-Open the GUI (`ssh -L 8765:127.0.0.1:8765 <host>`, then `http://127.0.0.1:8765`), enter the GUI token and your name, search, click/Enter. Takes effect immediately; the guild's pending queue is cleared. Keyboard: `/` search, Up/Down, Enter, Esc. Use Pause/Resume to mute reading while testing.
+Open the GUI (see above), enter your name, search, click/Enter. Takes effect immediately; the guild's pending queue is cleared. Keyboard: `/` search, Up/Down, Enter, Esc. Use Pause/Resume to mute reading while testing.
 
 ### Logs
-`journalctl -u tts_bot -f` (devs are in `systemd-journal` after re-login). Useful lines: `Logged in as ...`, `Piper ready (cuda=True, ...)`, `web UI listening on ...`, `Web UI disabled: ...`, `queue full`, `worker error (continuing)`, `config watcher error`.
+`journalctl -u tts_bot -f` (devs are in `systemd-journal` after re-login). Useful lines: `Logged in as ...`, `Piper ready (cuda=True, ...)`, `web UI listening on ...`, `web UI now listening ...` (retried address came up), `Web UI disabled: ...`, `queue full`, `worker error (continuing)`, `config watcher error`.
 
 ### Common failures
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| Unit fails to start immediately | `/etc/tts-bot/gui_token` missing (`bot.env` is optional) | create it (section 10 install order) |
-| "Web UI disabled: no usable GUI token" | token missing/short (< 24) or unreadable | `gen_gui_token.sh --system --rotate`, restart |
-| GUI works locally, not remotely | loopback bind | SSH tunnel or TLS proxy (disable buffering) |
+| Unit fails to start immediately | stale old unit still loading `/etc/tts-bot/gui_token` (file deleted), or `/etc/tts-bot/token` missing (`bot.env` is optional) | re-run `setup_system.sh` (new unit); create the Discord token file |
+| "Web UI disabled: bind address ... is not loopback or a Tailscale address" | invalid `WEBUI_HOSTS` | fix or unset `WEBUI_HOSTS` (policy: loopback / Tailscale only) |
+| GUI works locally, not over Tailscale | Tailscale address not detected/up, or ACL blocks port 8765 | check `tailscale ip`, logs (`no Tailscale address detected`), ACLs; set `WEBUI_HOSTS` explicitly |
 | GUI keeps "Reconnecting" behind a proxy | response buffering | `proxy_buffering off` for `/api/events` |
-| 429 toast in the GUI | 5 invalid auth requests within 60 s from that IP (a valid token still works) | wait 60 s; fix the token; check for local scanners |
+| `403 bad_host` / toast "hostname is not allowed" | Host name not on the allowlist (MagicDNS name, domain, proxy rewriting Host) | add it to `WEBUI_ALLOWED_HOSTS`; make the proxy pass Host unchanged |
 | Bot silent, no errors | guild has no channel / paused / user not watched / not joined / Message Content intent off | check GUI, `!status`, Portal intents |
 | "CUDAExecutionProvider unavailable" | CPU `onnxruntime` installed over GPU build, or CUDA libs not on `LD_LIBRARY_PATH` | section 8 D20, D28 |
 | "Token malformed" at start | quotes/prefix/newline in token file | re-run `install_token.sh` |
@@ -422,7 +390,7 @@ Open the GUI (`ssh -L 8765:127.0.0.1:8765 <host>`, then `http://127.0.0.1:8765`)
 
 Run from the repo root:
 ```
-~/miniconda3/envs/tts-bot/bin/python -m unittest discover -s tests -v   # 62 tests at time of writing
+~/miniconda3/envs/tts-bot/bin/python -m unittest discover -s tests -v   # 103 tests at time of writing
 bash tests/test_deploy_validation.sh                                    # deploy validation, no root needed
 ```
 `unittest` only; no pytest.
@@ -430,27 +398,25 @@ bash tests/test_deploy_validation.sh                                    # deploy
 | File | Covers |
 |---|---|
 | `tests/test_config_store.py` | atomic write (no `.tmp` leftovers on success/failure), EventHub (fan-out, idempotent unsubscribe, drop-oldest), ConfigStore (rev/no-op, conflict leaves state untouched, `expected_rev=None`, round-trip, corrupt file quarantined to `.corrupt`, persist-failure rollback, truth table of `is_*`, event publishing, seed, 20 concurrent writes). |
-| `tests/test_webui.py` | auth (missing/wrong/right), throttle with injected clock (valid token passes during a block and is not counted; invalid gets 429), persist failure -> JSON 500 `persist_failed`, static headers/CSP, token never in bodies, PUT channel/enabled incl. persistence and hub events, conflict, bad inputs, editor required/sanitized/percent-encoded, skip/clear, handler cancellation mid-write stays consistent, SSE (hello, config, status only on change, keepalive, subscriber cleanup), header parsing, shutdown with an open SSE, token loader order and short tokens, start/cleanup. |
+| `tests/test_webui.py` | no auth needed on any route and a stray `Authorization` header ignored, persist failure -> JSON 500 `persist_failed`, static headers/CSP, PUT channel/enabled incl. persistence and hub events, conflict, bad inputs, editor required/sanitized/percent-encoded, skip/clear, handler cancellation mid-write stays consistent, SSE (hello, config, status only on change, keepalive, subscriber cleanup), `validate_bind_hosts` table, Tailscale output parsers and detection fallbacks, Host allowlist (ports, IPv6, case, missing Host, static/state/events, `allowed_hosts` extras), Origin / `Sec-Fetch-Site` rules, `start_webui` (policy, partial bind + retry, all-fail `OSError`, cleanup cancels retry quickly with an open SSE). |
 | `tests/test_controller.py` | `Controller` views and actions with fake guilds, `config_watcher` drain behavior (channel change drains; `enabled` change does not; other guilds and malformed events are survived). |
 | `tests/test_bot_events.py` | hot-swap path with fake objects: `on_message` (configured channel queues; paused, old channel after a swap, unconfigured guild, unwatched, bots, DMs do not; prefix goes to commands only), `only_tts_channel`, `on_command_error` slash reply, `on_ready` seeding (lowest matching id, skips existing, idempotent) and its `channels` event, channel-relay listeners, no `.env` loaded. |
-| `tests/test_wiring.py` | `maybe_start_webui` never raises (no/short token, bad `make_app`, out-of-range port, port in use, load error), `parse_port`, good token serves and cleans up. |
+| `tests/test_wiring.py` | `maybe_start_webui` never raises (invalid `WEBUI_HOSTS`, bad `make_app`, out-of-range port, port in use, unexpected error), default hosts via Tailscale detection, `WEBUI_ALLOWED_HOSTS` reaches the app, `parse_port`, good config serves and cleans up. |
 | `tests/test_static.py` | static payload < 40 KB, CSP-safe content (no `innerHTML`/`eval`/inline handlers/external URLs), served bytes equal files, and runs `tests/static_logic.js` under node if available. |
 | `tests/static_logic.js` | pure JS helpers: SSE parser, `matchChannel`, `relTime`, `backoffDelay`, `groupChannels`, `normalizeEditor`, `shouldRollback`, `shouldApplySnapshot` (stale snapshots ignored). |
 | `tests/test_deploy_validation.sh` | deploy validator: clean tree accepted; symlinked dirs/files, in-repo symlinks, subdirectories, missing `.py` rejected. |
 
-**Not covered:** anything needing live Discord, a GPU, ffmpeg/voice, or a browser. `engine.synthesize`/playback/`audio_worker`/`on_message` end to end, the real systemd unit, `setup_system.sh`/`deploy.sh` as root, and DOM behavior of `app.js` (rendering, optimistic rollback wiring, keyboard handling) have no automated tests. The frontend was verified by node logic tests, static content checks and code review only. Run the manual smoke checklist in a real browser (and a real Discord test guild) before relying on it: sign-in prompt, token rejection, channel list/search/keyboard, select + toast + undo, pause/resume, skip/clear, two browsers (conflict toast, live toast), kill/restart the bot and watch reconnect, 360 px width, dark mode.
+**Not covered:** anything needing live Discord, a GPU, ffmpeg/voice, or a browser. `engine.synthesize`/playback/`audio_worker`/`on_message` end to end, the real systemd unit, `setup_system.sh`/`deploy.sh` as root, and DOM behavior of `app.js` (rendering, optimistic rollback wiring, keyboard handling) have no automated tests. The frontend was verified by node logic tests, static content checks and code review only. Run the manual smoke checklist in a real browser (and a real Discord test guild) before relying on it: name prompt, `bad_host` toast, channel list/search/keyboard, select + toast + undo, pause/resume, skip/clear, two browsers (conflict toast, live toast), kill/restart the bot and watch reconnect, 360 px width, dark mode.
 
 ---
 
 ## 12. Known limitations
 
 - No live Discord, GPU or browser tests (section 11).
-- Editor names are self-declared attribution, not authentication; the token is the only gate and it is shared.
+- Editor names are self-declared attribution, not authentication; there is no application-layer auth at all. Any local process/account on the server can reach the loopback GUI and change the channel (accepted); the tailnet side is governed by Tailscale ACLs.
 - One channel per guild (plus pause).
-- Per-IP throttle caveats: the IP is shared behind a proxy/tunnel, so a local process can make invalid attempts return 429 (valid tokens are never blocked); counters not pruned.
-- `WEBUI_TOKEN_FILE` has no `~` expansion; `load_gui_token` does not fall through to later sources when an earlier source holds a short token.
 - Deploy copies every root `*.py` (stray files ship) plus `static/*`, `models/*`, `requirements.txt`; `deploy.sh` and `setup_system.sh` run repo-supplied scripts as root (admin review required); a microsecond check/copy race is accepted; `setup_system.sh` resolves `SRC` with `pwd`, not `pwd -P`.
-- The GUI is down whenever the bot is down; all plain HTTP (tunnel or TLS proxy required for remote use).
+- The GUI is down whenever the bot is down; all plain HTTP (Tailscale encrypts the tailnet hop; a domain needs TLS at the proxy).
 - The bot does not rejoin voice after a restart.
 - `config.json` and `state.json` corruption: starts empty; only `config.json` is kept aside as `.corrupt` (one generation).
 - Minor, deferred review items: first-set-on-unknown-guild bumps rev; `RecursionError` on pathologically nested JSON gives 500; 404 bodies are not JSON; `on_guild_channel_update` is chatty; shutdown cancels `_watcher_task` without awaiting it; DM `NoPrivateMessage` is unreachable on the prefix path; clicks while a request is in flight are silently ignored by the UI.
@@ -466,11 +432,12 @@ Example questions it should be able to answer from these files:
 - What happens to queued messages when someone changes the channel? To the clip currently playing?
 - Two people click different channels at the same time: what does each see?
 - Why does the browser not use `EventSource`?
+- Why is there no GUI login, and what stops a web page from driving the GUI (Host allowlist, Origin check)?
 - Why do deploys run from a snapshot, and who can read the Discord token?
 - Why is there only one Piper worker thread?
-- Why does the unit refuse to start after upgrading with only `deploy.sh`?
+- Why must `setup_system.sh` be re-run before `deploy.sh` when upgrading?
 - What does pause do and not do?
-- How do I rotate the GUI token? The Discord token?
+- How do I reach the GUI over Tailscale or a domain? How do I rotate the Discord token?
 - Why does `TTS_CHANNEL_ID` stop having any effect after first boot?
-- What are the throttle's failure modes behind nginx?
+- What happens if Tailscale is not up when the bot starts?
 - What is not tested?

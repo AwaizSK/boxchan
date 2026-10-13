@@ -53,7 +53,7 @@ class StaticServeTests(unittest.IsolatedAsyncioTestCase):
             def guilds_view(self): return []
             def status_view(self): return {}
 
-        app = webui.make_app(ConfigStore(os.path.join(tmp.name, "c.json")), Ctl(), "t" * 32, static_dir=STATIC)
+        app = webui.make_app(ConfigStore(os.path.join(tmp.name, "c.json")), Ctl(), allowed_hosts=[], static_dir=STATIC)
         client = TestClient(TestServer(app))
         await client.start_server()
         self.addAsyncCleanup(client.close)

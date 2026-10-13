@@ -8,7 +8,7 @@ every decision: `docs/ARCHITECTURE.md` (read it before non-trivial changes).
 
 ## Hard rules
 - NEVER read, print, log, commit or paste secrets. Off-limits: `.env`, `~/.config/tts-bot/*`,
-  `/etc/tts-bot/*`, any file named `token` or `gui_token`. Do not echo token values or lengths
+  `/etc/tts-bot/*`, any file named `token`. Do not echo token values or lengths
   beyond what existing code already logs.
 - Do not add dependencies (pip/conda) without asking. Stdlib + aiohttp (ships with discord.py) only.
 - All Piper/GPU work stays on the single worker thread in `TTSEngine` (`max_workers=1` + lock).
@@ -18,7 +18,7 @@ every decision: `docs/ARCHITECTURE.md` (read it before non-trivial changes).
 - The web UI talks to the bot only via `Controller` (bot.py); `webui.py` must not import `bot.py`.
 - Frontend: vanilla JS, no CDN/framework, no inline script/style, `textContent` only
   (strict CSP; `tests/test_static.py` enforces it). Static payload stays < 40 KB.
-- Fail closed: unconfigured guild reads nothing; GUI token < 24 chars disables the GUI;
+- Fail closed: unconfigured guild reads nothing; a GUI bind address outside loopback/Tailscale disables the GUI;
   `maybe_start_webui` must never crash the bot.
 - Do not run `scripts/deploy.sh`, `setup_system.sh` or anything with sudo unless asked.
 - Commits: conventional style, end with `Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>`.
@@ -37,10 +37,10 @@ No live Discord/GPU/browser tests exist; say so rather than claiming they passed
   `Controller`, `config_watcher`, `maybe_start_webui`, `shutdown`.
 - `tts_engine.py`: `TTSEngine` (Piper, CUDA->CPU fallback), `clean_discord_text`.
 - `config_store.py`: `ConfigStore` (rev, optimistic concurrency, `ConflictError`), `EventHub`, `atomic_write_json`.
-- `webui.py`: `make_app`, `start_webui`, `load_gui_token`; bearer auth, throttle, REST, SSE.
+- `webui.py`: `make_app`, `start_webui`, `validate_bind_hosts`, `detect_tailscale_addrs`; Host/Origin checks, REST, SSE. No token auth.
 - `static/{index,app}.{html,js}`, `static/app.css`: the UI (`app.js` helpers are node-testable).
-- `tts_bot.service`: hardened systemd unit (`ttsbot` user, `LoadCredential` for both tokens).
-- `scripts/`: `setup_system.sh`, `deploy.sh` (+ `lib/deploy_validate.sh`), `install_token.sh`, `gen_gui_token.sh`.
+- `tts_bot.service`: hardened systemd unit (`ttsbot` user, `LoadCredential` for the Discord token).
+- `scripts/`: `setup_system.sh`, `deploy.sh` (+ `lib/deploy_validate.sh`), `install_token.sh`.
 - `tests/`: unittest suites + `static_logic.js` + `test_deploy_validation.sh`.
 - `docs/ARCHITECTURE.md`: architecture, decision log, gotchas, runbook.
 
@@ -49,10 +49,9 @@ No live Discord/GPU/browser tests exist; say so rather than claiming they passed
   `TTS_CHANNEL_ID` is only a first-boot seed. `state.json` (`STATE_FILE`) = watch list.
 - Channel swap drains that guild's queue (not the playing clip); pause only stops reading new messages.
 - Wire IDs are strings (JS precision); internal IDs are ints. `X-Editor` is percent-encoded by the client.
-- GUI binds `127.0.0.1:8765` (`WEBUI_HOST`, `WEBUI_PORT`); access via SSH tunnel; SSE needs proxy buffering off.
+- GUI has NO token: network layer is the boundary. Binds loopback + auto-detected Tailscale addrs on `WEBUI_PORT` (8765); `WEBUI_HOSTS` overrides (loopback/Tailscale only, else GUI disabled); Host allowlist + `WEBUI_ALLOWED_HOSTS` (MagicDNS/domain) and Origin check on writes; SSE needs proxy buffering off. Any local process can reach loopback (accepted).
 - piper-tts is pinned to 1.2.0 (`synthesize_stream_raw`); CPU `onnxruntime` must stay uninstalled.
 - Prod layout: code root-owned `/opt/tts-bot`, state `/var/lib/tts-bot`, tokens in `/etc/tts-bot`.
   Anyone who can get code deployed can read the Discord token: review changes before deploy.
-- Unit refuses to start without `/etc/tts-bot/gui_token` (`bot.env` is optional: `EnvironmentFile=-`, only a first-boot `TTS_CHANNEL_ID` seed); upgrading needs
-  gen_gui_token -> setup_system -> deploy, not deploy alone.
+- `bot.env` is optional (`EnvironmentFile=-`, only a first-boot `TTS_CHANNEL_ID` seed). Fresh install: setup_system -> install_token --system -> deploy -> enable. Upgrade: setup_system (new unit) then deploy.
 - Importing `bot.py` has side effects; tests set env vars (`STATE_FILE`, `CONFIG_FILE`, ...) first.
