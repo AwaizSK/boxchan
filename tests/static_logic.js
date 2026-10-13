@@ -1,5 +1,6 @@
 const assert = require('assert');
-const { shouldApplySnapshot, normalizeEditor, shouldRollback, createSSEParser, matchChannel, relTime, backoffDelay, groupChannels } = require('../static/app.js');
+const { shouldApplySnapshot, normalizeEditor, shouldRollback, createSSEParser, matchChannel, relTime, backoffDelay, groupChannels,
+  voiceTitle, voiceWarning, sayBlocker, voiceSwitchText } = require('../static/app.js');
 
 const got = [];
 const feed = createSSEParser((n, d) => got.push([n, d]));
@@ -37,4 +38,28 @@ assert.strictEqual(shouldApplySnapshot({ rev: 5 }, { rev: 6 }, false), true);
 assert.strictEqual(shouldApplySnapshot({ rev: 5 }, { rev: 4 }, true), true);
 assert.strictEqual(shouldApplySnapshot(null, { rev: 0 }, false), true);
 assert.strictEqual(shouldApplySnapshot({ rev: 5 }, null, true), false);
+
+assert.strictEqual(voiceTitle('en_US-amy-medium'), 'Amy');
+assert.strictEqual(voiceTitle('en_US-hfc_female-medium'), 'Hfc Female');
+assert.strictEqual(voiceTitle('en_GB-jenny_dioco-medium'), 'Jenny Dioco');
+assert.strictEqual(voiceTitle('en_US-ljspeech-high'), 'Ljspeech');
+assert.strictEqual(voiceTitle('en_US-john-doe-x_low'), 'John Doe');
+assert.strictEqual(voiceTitle('custom'), 'Custom');
+assert.strictEqual(voiceTitle('medium'), 'Medium');
+assert.strictEqual(voiceTitle('en_US-low'), 'Low');
+assert.strictEqual(voiceTitle('a.b+c'), 'A.b+c');
+assert.strictEqual(voiceWarning(null, 'x', ['x']), null);
+assert.strictEqual(voiceWarning('x', 'x', ['x']), null);
+assert.strictEqual(voiceWarning('gone', 'en_US-amy-medium', ['en_US-amy-medium']), 'Saved voice missing \u2014 using default');
+assert.strictEqual(voiceWarning('en_GB-alba-medium', 'en_US-amy-medium', ['en_GB-alba-medium', 'en_US-amy-medium']),
+  'Saved voice could not be loaded \u2014 using Amy');
+assert.strictEqual(voiceWarning('a', 'en_US-amy-medium', null), 'Saved voice is not active \u2014 using Amy');
+assert.strictEqual(voiceWarning('a', null, null), 'Saved voice is not active \u2014 using no voice');
+assert.strictEqual(sayBlocker(false, { voice: 'Lounge' }, false), 'Offline');
+assert.ok(sayBlocker(true, { voice: null }, false).includes('not in a voice channel'));
+assert.ok(sayBlocker(true, undefined, false).includes('not in a voice channel'));
+assert.strictEqual(sayBlocker(true, { voice: 'Lounge' }, true), 'Voice is loading');
+assert.strictEqual(sayBlocker(true, { voice: 'Lounge' }, false), '');
+assert.strictEqual(voiceSwitchText('bob', 'en_US-kristin-medium'), 'bob switched voice to Kristin');
+assert.strictEqual(voiceSwitchText('bob', null), 'bob switched voice to the default voice');
 console.log('ok');

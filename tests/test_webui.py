@@ -25,6 +25,31 @@ class FakeController:
         self.status = {"1": {"playing": False, "watched": 0}}
         self.skips, self.clears = [], []
         self.text_channels = {(1, 10), (1, 11)}
+        self.voice = {"current": "amy", "configured": None, "loading": False}
+        self.voice_list = [{"name": "amy", "sample_rate": 22050, "quality": "medium",
+                            "language": "en-us", "size_mb": 60.5}]
+        self.apply_calls, self.apply_exc, self.apply_gate, self.apply_result = [], None, None, None
+        self.say_calls, self.say_exc = [], None
+
+    def voice_summary(self):
+        return dict(self.voice)
+
+    async def list_voices(self):
+        return {"voices": self.voice_list, **self.voice}
+
+    async def apply_voice(self, name, expected_rev, editor):
+        self.apply_calls.append((name, expected_rev, editor))
+        if self.apply_gate is not None:
+            await self.apply_gate.wait()
+        if self.apply_exc is not None:
+            raise self.apply_exc
+        return self.apply_result or {"rev": 1, "updated_by": editor, "updated_at": 1.0, "voice": name, "guilds": {}}
+
+    def say(self, gid, text):
+        self.say_calls.append((gid, text))
+        if self.say_exc is not None:
+            raise self.say_exc
+        return {"queued": True}
 
     def guilds_view(self):
         return [{"id": "1", "name": "G", "channels": [

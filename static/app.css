@@ -29,7 +29,7 @@ button.link{border:0;background:none;padding:0 4px;min-height:32px;color:var(--a
 .controls{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-bottom:12px}
 .controls .muted{flex:1 1 200px}
 #search{margin-bottom:8px}
-#list{list-style:none;margin:0;padding:0;border:1px solid var(--line);border-radius:10px;background:var(--card);max-height:60vh;overflow:auto;overscroll-behavior:contain}
+#list,#v-list{list-style:none;margin:0;padding:0;border:1px solid var(--line);border-radius:10px;background:var(--card);max-height:60vh;overflow:auto;overscroll-behavior:contain}
 .cat{padding:8px 12px 4px;font-size:.75rem;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:var(--muted);position:sticky;top:0;background:var(--card)}
 .opt{display:flex;align-items:center;gap:8px;padding:10px 12px;min-height:44px;cursor:pointer;border-left:4px solid transparent;word-break:break-word}
 .opt:hover{background:var(--hi)}
@@ -40,11 +40,21 @@ button.link{border:0;background:none;padding:0 4px;min-height:32px;color:var(--a
 .badge{font-size:.75rem;padding:2px 8px;border-radius:999px;background:var(--sel-line);color:#fff;white-space:nowrap}
 .opt.paused .badge{background:var(--muted)}
 .opt.missing{cursor:default;color:var(--warn);border-left-color:var(--warn)}
+.tabs{display:flex;gap:4px;border-bottom:1px solid var(--line);margin-bottom:12px}
+.tabs button{border:0;border-bottom:3px solid transparent;border-radius:8px 8px 0 0;background:none;min-width:96px}
+.tabs button[aria-selected=true]{border-bottom-color:var(--accent);font-weight:600}
+.warn{margin:0 0 8px;padding:8px 12px;border-left:4px solid var(--warn);color:var(--warn);background:var(--card)}
+.opt .meta{font-size:.75rem;color:var(--muted);white-space:nowrap}
+.badge.q{background:var(--muted)}
+.badge.saved{background:var(--warn)}
+.say{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-top:12px}
+.say input{flex:1 1 220px;width:auto}
+.say .muted{flex:1 1 100%}
 mark{background:var(--mark);color:inherit;border-radius:2px}
 .flash{animation:flash 1.2s ease-out}
 @keyframes flash{from{background:var(--mark)}to{background:transparent}}
-#list[aria-disabled=true]{opacity:.6}
-#list[aria-disabled=true] .opt{cursor:not-allowed}
+#list[aria-disabled=true],#v-list[aria-disabled=true]{opacity:.6}
+#list[aria-disabled=true] .opt,#v-list[aria-disabled=true] .opt{cursor:not-allowed}
 #toasts{position:fixed;left:12px;right:12px;bottom:12px;display:grid;gap:8px;justify-items:center;pointer-events:none;z-index:10}
 .toast{pointer-events:auto;display:flex;align-items:center;gap:12px;max-width:480px;background:var(--fg);color:var(--bg);padding:10px 14px;border-radius:10px;box-shadow:0 4px 16px rgba(0,0,0,.3);animation:rise .2s ease-out}
 .toast.err{background:var(--bad);color:#fff}

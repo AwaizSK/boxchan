@@ -30,16 +30,40 @@
       </div>
     </header>
 
-    <section class="controls" aria-label="Playback controls">
-      <button id="pause" type="button"></button>
-      <button id="skip" type="button">Skip</button>
-      <button id="clear" type="button">Clear queue</button>
-      <span id="status" class="muted" role="status"></span>
-    </section>
+    <nav class="tabs" role="tablist" aria-label="Sections">
+      <button id="tab-channel" type="button" role="tab" aria-selected="true" aria-controls="view-channel">Channel</button>
+      <button id="tab-voice" type="button" role="tab" aria-selected="false" aria-controls="view-voice">Voice</button>
+    </nav>
 
-    <input id="search" type="search" placeholder="Search channels  ( / )" aria-label="Search channels" role="combobox" aria-expanded="true" aria-controls="list" autocomplete="off" spellcheck="false" autofocus>
-    <ul id="list" role="listbox" tabindex="0" aria-label="Text channels"></ul>
-    <p id="empty" class="muted" hidden>No channels match.</p>
+    <div id="view-channel" role="tabpanel" aria-labelledby="tab-channel">
+      <section class="controls" aria-label="Playback controls">
+        <button id="pause" type="button"></button>
+        <button id="skip" type="button">Skip</button>
+        <button id="clear" type="button">Clear queue</button>
+        <span id="status" class="muted" role="status"></span>
+      </section>
+
+      <input id="search" type="search" placeholder="Search channels  ( / )" aria-label="Search channels" role="combobox" aria-expanded="true" aria-controls="list" autocomplete="off" spellcheck="false" autofocus>
+      <ul id="list" role="listbox" tabindex="0" aria-label="Text channels"></ul>
+      <p id="empty" class="muted" hidden>No channels match.</p>
+    </div>
+
+    <div id="view-voice" role="tabpanel" aria-labelledby="tab-voice" hidden>
+      <section class="controls" aria-label="Voice controls">
+        <button id="v-apply" type="button" class="primary">Apply</button>
+        <button id="v-reset" type="button">Reset to default</button>
+        <button id="v-rescan" type="button">Rescan</button>
+        <span id="v-status" class="muted" role="status"></span>
+      </section>
+      <p id="v-warn" class="warn" hidden></p>
+      <ul id="v-list" role="listbox" tabindex="0" aria-label="Voices"></ul>
+      <p id="v-empty" class="muted" hidden>No voices found in the models folder.</p>
+      <section class="say" aria-label="Test the voice">
+        <input id="say-text" type="text" maxlength="200" value="Hello! This is how I sound." aria-label="Test phrase" autocomplete="off">
+        <button id="say-btn" type="button">Say it</button>
+        <span id="say-note" class="muted"></span>
+      </section>
+    </div>
   </div>
 </main>
 <div id="toasts" aria-live="polite" aria-atomic="false"></div>

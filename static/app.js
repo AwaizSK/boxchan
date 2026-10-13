@@ -86,8 +86,39 @@ function shouldRollback(currentId, optimisticId) {
   return currentId === optimisticId;
 }
 
+// 'en_US-hfc_female-medium' -> 'Hfc Female' (language prefix and quality suffix dropped).
+function voiceTitle(stem) {
+  const p = String(stem).split('-');
+  if (p.length > 1 && /^[a-z]{2,3}(_[A-Za-z0-9]+)?$/.test(p[0])) p.shift();
+  if (p.length > 1 && /^(x_low|low|medium|high)$/.test(p[p.length - 1])) p.pop();
+  const t = p.join(' ').split(/[_\s]+/).filter(Boolean).map((w) => w[0].toUpperCase() + w.slice(1)).join(' ');
+  return t || String(stem);
+}
+
+// Warning for a saved voice that is not the active one. names = installed stems, or null if not scanned yet.
+function voiceWarning(configured, current, names) {
+  if (!configured || configured === current) return null;
+  const now = current ? voiceTitle(current) : 'no voice';
+  if (!names) return 'Saved voice is not active \u2014 using ' + now;
+  if (names.indexOf(configured) < 0) return 'Saved voice missing \u2014 using default';
+  return 'Saved voice could not be loaded \u2014 using ' + now;
+}
+
+// Why the test phrase cannot be sent right now ('' = it can).
+function sayBlocker(live, st, loading) {
+  if (!live) return 'Offline';
+  if (!st || !st.voice) return 'Bot is not in a voice channel in this server (use !join)';
+  if (loading) return 'Voice is loading';
+  return '';
+}
+
+function voiceSwitchText(editor, name) {
+  return editor + ' switched voice to ' + (name ? voiceTitle(name) : 'the default voice');
+}
+
 if (typeof module !== 'undefined') {
-  module.exports = { shouldApplySnapshot, normalizeEditor, shouldRollback, createSSEParser, matchChannel, relTime, backoffDelay, groupChannels };
+  module.exports = { shouldApplySnapshot, normalizeEditor, shouldRollback, createSSEParser, matchChannel, relTime, backoffDelay, groupChannels,
+    voiceTitle, voiceWarning, sayBlocker, voiceSwitchText };
 }
 
 /* ---------- app ---------- */
@@ -121,6 +152,11 @@ if (typeof document !== 'undefined') (function () {
     visible: [],
     abort: null,
     started: false,
+    tab: store.get(sessionStorage, 'tab') === 'voice' ? 'voice' : 'channel',
+    voice: { list: null, current: null, configured: null, loading: false },
+    vsel: null,           // highlighted (not yet applied) voice stem
+    vbusy: false,         // our own apply/say request in flight
+    vsig: '',
   };
 
   /* --- toasts --- */
@@ -351,6 +387,7 @@ if (typeof document !== 'undefined') (function () {
     $('pause').textContent = c.enabled ? 'Pause' : 'Resume';
     renderMeta();
     renderControls();
+    renderVoice();
   }
 
   function renderMeta() {
@@ -364,6 +401,7 @@ if (typeof document !== 'undefined') (function () {
     $('status').textContent = st
       ? 'Voice: ' + (st.voice || 'not connected') + ' · Queue: ' + st.queue + ' · Watched: ' + st.watched + (st.playing ? ' · Playing' : '')
       : '';
+    renderVoiceControls();
   }
 
   const CONN_TEXT = { live: 'Live', connecting: 'Connecting…', reconnecting: 'Reconnecting…', down: 'Offline' };
@@ -378,6 +416,134 @@ if (typeof document !== 'undefined') (function () {
     const off = S.conn !== 'live' || S.busy || !S.cfg;
     for (const id of ['pause', 'skip', 'clear']) $(id).disabled = off;
     $('list').setAttribute('aria-disabled', off ? 'true' : 'false');
+    renderVoiceControls();
+  }
+
+  /* --- voice tab --- */
+  const V = () => S.voice;
+  const configuredVoice = () => (S.cfg ? S.cfg.voice || null : V().configured);
+
+  function setTab(tab) {
+    S.tab = tab;
+    store.set(sessionStorage, 'tab', tab);
+    for (const t of ['channel', 'voice']) {
+      $('view-' + t).hidden = t !== tab;
+      $('tab-' + t).setAttribute('aria-selected', t === tab ? 'true' : 'false');
+    }
+    if (tab === 'voice' && !V().list) loadVoices(false);
+    renderVoice();
+  }
+
+  function mergeVoiceSummary(v) {
+    if (!v) return;
+    V().current = v.current == null ? null : v.current;
+    V().configured = v.configured == null ? null : v.configured;
+    V().loading = !!v.loading;
+    renderVoice();
+  }
+
+  let vlBusy = false;
+  async function loadVoices(manual) {
+    if (vlBusy) return;
+    vlBusy = true;
+    try {
+      const d = await api('GET', '/api/voices');
+      V().list = d.voices || [];
+      mergeVoiceSummary(d);
+      if (manual) toast('Found ' + V().list.length + ' voice' + (V().list.length === 1 ? '' : 's'));
+    } catch (e) {
+      if (!e.denied) toast('Could not load voices: ' + friendly(e), { error: true });
+    } finally { vlBusy = false; }
+  }
+
+  function renderVoice() {
+    renderVoiceList();
+    renderVoiceControls();
+  }
+
+  function renderVoiceList() {
+    const v = V(), names = v.list ? v.list.map((x) => x.name) : null, conf = configuredVoice();
+    const sig = JSON.stringify([v.list, v.current, conf, S.vsel]);
+    const warn = voiceWarning(conf, v.current, names);
+    $('v-warn').hidden = !warn;
+    $('v-warn').textContent = warn || '';
+    if (sig === S.vsig) return;
+    S.vsig = sig;
+    const ul = $('v-list'), top = ul.scrollTop;
+    ul.textContent = '';
+    for (const x of v.list || []) {
+      const li = el('li', 'opt' + (x.name === v.current ? ' sel' : '') + (x.name === S.vsel ? ' hi' : ''));
+      li.dataset.name = x.name;
+      li.title = x.name;
+      li.setAttribute('role', 'option');
+      li.setAttribute('aria-selected', x.name === (S.vsel || v.current) ? 'true' : 'false');
+      li.appendChild(el('span', 'nm', voiceTitle(x.name)));
+      if (x.quality) li.appendChild(el('span', 'badge q', x.quality));
+      li.appendChild(el('span', 'meta', [x.language, x.size_mb + ' MB'].filter(Boolean).join(' \u00b7 ')));
+      if (x.name === v.current) li.appendChild(el('span', 'badge', 'Active'));
+      else if (x.name === conf) li.appendChild(el('span', 'badge saved', 'Saved'));
+      ul.appendChild(li);
+    }
+    ul.scrollTop = top;
+    $('v-empty').hidden = !v.list || v.list.length > 0;
+  }
+
+  function renderVoiceControls() {
+    const v = V(), live = S.conn === 'live' && !!S.cfg;
+    const off = !live || v.loading || S.vbusy, conf = configuredVoice();
+    $('v-apply').disabled = off || !S.vsel || (S.vsel === v.current && S.vsel === conf);
+    $('v-reset').disabled = off || !conf;
+    $('v-rescan').disabled = S.conn !== 'live';
+    $('v-list').setAttribute('aria-disabled', off ? 'true' : 'false');
+    $('v-status').textContent = v.loading ? 'Loading voice\u2026 this takes a few seconds'
+      : v.current ? 'Active: ' + voiceTitle(v.current) : 'No voice loaded';
+    const why = sayBlocker(live, S.status[S.gid], v.loading);
+    $('say-btn').disabled = !!why || S.vbusy;
+    $('say-note').textContent = why;
+  }
+
+  function pickVoice(name) {
+    S.vsel = name === V().current && name === configuredVoice() ? null : name;
+    renderVoice();
+  }
+
+  async function applyVoice(name) {
+    if (S.vbusy || V().loading || S.conn !== 'live' || !S.cfg) return;
+    S.vbusy = true; renderVoiceControls();
+    try {
+      const d = await api('PUT', '/api/voice', { name, rev: S.cfg.rev });
+      S.vsel = null;
+      applySnapshot(d.snapshot, false);
+      toast(name ? 'Voice changed to ' + voiceTitle(name) : 'Voice reset to default');
+    } catch (e) {
+      if (e.status === 409 && e.body && e.body.snapshot) {
+        applySnapshot(e.body.snapshot, true);
+        toast('Changed by ' + (e.body.snapshot.updated_by || 'someone') + ' \u2014 your change was not applied', { error: true });
+      } else if (e.status === 422) {
+        toast('Could not load that voice \u2014 the previous voice is still active', { error: true });
+      } else if (e.message === 'bad_voice') {
+        S.vsel = null;
+        toast('That voice is no longer installed', { error: true });
+      } else if (!e.denied) toast('Could not change voice: ' + friendly(e), { error: true });
+    } finally {
+      S.vbusy = false;
+      await loadVoices(false);
+      renderVoice();
+    }
+  }
+
+  async function sayIt() {
+    const text = $('say-text').value.trim();
+    if (!text || S.vbusy || sayBlocker(S.conn === 'live' && !!S.cfg, S.status[S.gid], V().loading)) return;
+    S.vbusy = true; renderVoiceControls();
+    try {
+      await api('POST', '/api/guilds/' + S.gid + '/say', { text });
+      toast('Test phrase queued');
+    } catch (e) {
+      const msg = { not_connected: 'The bot is not in a voice channel in this server', queue_full: 'The queue is full, try again shortly',
+        tts_unavailable: 'The TTS engine is not loaded', bad_request: 'Enter some speakable text', too_long: 'Text is too long (max 200)' }[e.message];
+      if (!e.denied) toast(msg || 'Could not play the test phrase: ' + friendly(e), { error: true });
+    } finally { S.vbusy = false; renderVoiceControls(); }
   }
 
   /* --- actions --- */
@@ -453,6 +619,7 @@ if (typeof document !== 'undefined') (function () {
     try { d = JSON.parse(raw); } catch (e) { return; }
     if (name === 'hello') {
       applyState({ config: d.snapshot, guilds: d.guilds }, true);
+      mergeVoiceSummary(d.voices);
     } else if (name === 'config') {
       const ch = d.change || {};
       applySnapshot(d.snapshot, false);
@@ -466,6 +633,14 @@ if (typeof document !== 'undefined') (function () {
           toast(d.snapshot.updated_by + (ch.new ? ' resumed' : ' paused') + ' the bot');
         }
       }
+      if (ch.field === 'voice' && !mine) toast(voiceSwitchText(d.snapshot.updated_by, ch.new));
+    } else if (name === 'voice') {
+      V().loading = !!d.loading;
+      if (!d.loading) {
+        if ('current' in d) V().current = d.current;
+        if (V().list) loadVoices(false);
+      }
+      renderVoice();
     } else if (name === 'channels') {
       scheduleRefetch();   // guild_id may be null (bot just became ready)
     } else if (name === 'status') {
@@ -521,7 +696,8 @@ if (typeof document !== 'undefined') (function () {
     $('who').textContent = 'Editing as ' + S.editor;
     setConn('connecting');
     attempt = 0;
-    refetch().then(() => $('search').focus());
+    setTab(S.tab);
+    refetch().then(() => { if (S.tab === 'channel') $('search').focus(); });
     connectLoop();
   }
 
@@ -545,6 +721,17 @@ if (typeof document !== 'undefined') (function () {
   $('pause').addEventListener('click', doPause);
   $('skip').addEventListener('click', doSkip);
   $('clear').addEventListener('click', doClear);
+  $('tab-channel').addEventListener('click', () => setTab('channel'));
+  $('tab-voice').addEventListener('click', () => setTab('voice'));
+  $('v-apply').addEventListener('click', () => { if (S.vsel) applyVoice(S.vsel); });
+  $('v-reset').addEventListener('click', () => applyVoice(null));
+  $('v-rescan').addEventListener('click', () => loadVoices(true));
+  $('say-btn').addEventListener('click', sayIt);
+  $('say-text').addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); sayIt(); } });
+  $('v-list').addEventListener('click', (e) => {
+    const li = e.target.closest('.opt[data-name]');
+    if (li) pickVoice(li.dataset.name);
+  });
   $('search').addEventListener('input', (e) => { S.query = e.target.value; applyFilter(); });
   $('list').addEventListener('click', (e) => {
     const li = e.target.closest('.opt[data-id]');
@@ -562,6 +749,16 @@ if (typeof document !== 'undefined') (function () {
   document.addEventListener('keydown', (e) => {
     if ($('ui').hidden || e.isComposing || e.ctrlKey || e.metaKey || e.altKey) return;
     const t = e.target, typing = t && (t.tagName === 'INPUT' || t.tagName === 'SELECT' || t.tagName === 'TEXTAREA');
+    if (S.tab === 'voice') {
+      const list = V().list || [];
+      if (t === $('v-list') && (e.key === 'ArrowDown' || e.key === 'ArrowUp') && list.length) {
+        e.preventDefault();
+        const cur = list.findIndex((x) => x.name === (S.vsel || V().current));
+        const i = Math.min(list.length - 1, Math.max(0, (cur < 0 ? 0 : cur) + (e.key === 'ArrowDown' ? 1 : -1)));
+        pickVoice(list[i].name);
+      }
+      return;
+    }
     if (e.key === '/' && !typing) { e.preventDefault(); $('search').focus(); return; }
     const onNav = t === $('search') || t === $('list') || t === document.body;
     if (e.key === 'ArrowDown' && onNav) { e.preventDefault(); move(1); }

@@ -30,6 +30,18 @@ class StaticContentTests(unittest.TestCase):
             total += size
         self.assertLess(total, 40960)
 
+    def test_voice_tab_ids_are_wired(self):
+        html, js = read("index.html"), read("app.js")
+        for ident in ("tab-channel", "tab-voice", "view-channel", "view-voice", "v-apply", "v-reset", "v-rescan",
+                      "v-list", "v-status", "v-warn", "say-text", "say-btn", "say-note"):
+            self.assertIn('id="%s"' % ident, html, ident)
+            if not ident.startswith(("view-", "tab-")):  # those two are built as 'view-' + name in JS
+                self.assertIn(ident, js, ident)
+        self.assertIn('maxlength="200"', html)
+        self.assertIn("Hello! This is how I sound.", html)
+        # the global shortcuts must not hijack typing in the test box
+        self.assertIn("t.tagName === 'INPUT'", js)
+
     def test_csp_safe_content(self):
         for n in FILES:
             s = read(n)
