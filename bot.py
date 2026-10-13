@@ -437,6 +437,75 @@ async def status(ctx: commands.Context):
     )
 
 
+@bot.hybrid_command(name="voices", description="List available TTS voices")
+@commands.guild_only()
+async def voices(ctx: commands.Context):
+    """Show available Piper voices and which one is currently active."""
+    try:
+        result = await controller.list_voices()
+    except Exception:
+        log.exception("list_voices failed")
+        await ctx.send("Could not list voices; check logs.", allowed_mentions=discord.AllowedMentions.none())
+        return
+
+    voice_list = result.get("voices", [])
+    current = result.get("current")
+    configured = result.get("configured")
+    loading = result.get("loading")
+    cuda = result.get("cuda")
+
+    if loading:
+        await ctx.send("Voice is loading; please wait...", allowed_mentions=discord.AllowedMentions.none())
+        return
+
+    lines = []
+
+    if not voice_list:
+        if current is None:
+            lines.append("TTS engine not loaded.")
+        else:
+            lines.append("No voices available.")
+    else:
+        lines.append("**Available Voices**")
+
+        # Show up to 25 voices
+        for i, v in enumerate(voice_list[:25]):
+            name = v.get("name", "?")
+            quality = v.get("quality", "?")
+            language = v.get("language", "?")
+            size_mb = v.get("size_mb", "?")
+
+            line = f"• {name} — {quality}, {language}, {size_mb} MB"
+
+            # Mark active voice
+            if name == current:
+                cuda_str = " (CPU)" if cuda is False else ""
+                line += f" ◀ active{cuda_str}"
+            elif name == configured and configured != current:
+                line += " (saved, not loaded)"
+
+            lines.append(line)
+
+        # Truncation
+        if len(voice_list) > 25:
+            extra = len(voice_list) - 25
+            lines.append(f"… +{extra} more")
+
+        lines.append("")
+        if current:
+            lines.append(f"Current voice: **{current}**. Change voices in the web UI.")
+        else:
+            lines.append("Using default voice. Change in the web UI.")
+
+    reply = "\n".join(lines)
+
+    # Truncate to 2000 chars if needed
+    if len(reply) > 2000:
+        reply = reply[:1996] + "…"
+
+    await ctx.send(reply, allowed_mentions=discord.AllowedMentions.none())
+
+
 @bot.hybrid_command(name="help", description="Show available commands and current status")
 @commands.guild_only()
 async def help(ctx: commands.Context):
