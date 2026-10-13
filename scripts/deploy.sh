@@ -5,7 +5,8 @@
 set -euo pipefail
 
 [ "$EUID" -eq 0 ] || { echo "Run with sudo."; exit 1; }
-SRC="$(cd "$(dirname "$0")/.." && pwd -P)"
+SRC="${1:-$(cd "$(dirname "$0")/.." && pwd -P)}"
+SRC="$(cd "$SRC" && pwd -P)"
 APP=/opt/tts-bot
 PY="$APP/env/bin/python"
 
