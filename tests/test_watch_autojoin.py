@@ -149,6 +149,24 @@ class WatchAutoJoinTest(CommandTestBase):
         # Should not try to join since already connected
         self.assertNotIn("Joined", message)
 
+    async def test_watch_joins_when_voice_client_is_stale_disconnected(self):
+        """A voice client whose is_connected() is False is NOT connected: watch must attempt the join."""
+        vc = mock.MagicMock()
+        vc.is_connected.return_value = False
+        vc.move_to = mock.AsyncMock()
+        guild = make_guild(1, [make_text_channel(10), make_voice_channel(20)], vc=vc)
+        await self.config.set_channel(1, 10, expected_rev=None, editor="t")
+        ctx = make_context(guild, make_member(1, "author"))
+        ctx.voice_client = vc
+        vch = guild.get_channel(20)
+        vch.permissions_for = mock.MagicMock(return_value=mock.MagicMock(connect=True, speak=True))
+        ctx.author.voice.channel = vch
+
+        await bot.watch(ctx, make_member(2, "watched"))
+
+        vc.move_to.assert_awaited_once_with(vch)
+        self.assertIn("Joined", ctx.send.await_args[0][0])
+
     async def test_watch_persists_even_on_join_failure(self):
         """Test that watch list is updated even if join fails."""
         guild = make_guild(1, [make_text_channel(10), make_voice_channel(20)])

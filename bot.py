@@ -334,6 +334,11 @@ async def on_voice_state_update(member, before, after):
 
 
 # ---------- commands (work as !cmd and /cmd) ----------
+def voice_connected(vc) -> bool:
+    """True only for a live voice client; a stale, disconnected one counts as not connected."""
+    return bool(vc and vc.is_connected())
+
+
 async def join_author_voice(ctx: commands.Context) -> tuple[bool, str]:
     """Helper to join the author's voice channel. Returns (ok, message).
 
@@ -390,7 +395,7 @@ async def watch(ctx: commands.Context, member: discord.Member):
     reply = f"Watching **{member.display_name}**."
 
     # Try to auto-join if not connected and author in voice
-    if not ctx.voice_client:  # not connected
+    if not voice_connected(ctx.voice_client):
         if ctx.author.voice and ctx.author.voice.channel:  # author in voice
             ok, join_msg = await join_author_voice(ctx)
             reply += f" {join_msg}"
@@ -428,7 +433,7 @@ async def status(ctx: commands.Context):
         m = ctx.guild.get_member(uid)
         names.append(m.display_name if m else str(uid))
     vc = ctx.voice_client
-    voice = f"connected to **{vc.channel.name}**" if vc and vc.is_connected() else "not connected"
+    voice = f"connected to **{vc.channel.name}**" if voice_connected(vc) else "not connected"
     ga = audio.get(ctx.guild.id)
     await ctx.send(
         f"Voice: {voice}\nWatched: {', '.join(names) or 'none'}\n"
@@ -533,7 +538,7 @@ async def help(ctx: commands.Context):
 
     # Voice connection
     vc = ctx.voice_client
-    if vc and vc.is_connected():
+    if voice_connected(vc):
         lines.append(f"Voice: connected to **{vc.channel.name}**")
     else:
         lines.append("Voice: not connected")
