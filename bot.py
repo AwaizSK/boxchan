@@ -343,7 +343,8 @@ async def join_author_voice(ctx: commands.Context) -> tuple[bool, str]:
     """Helper to join the author's voice channel. Returns (ok, message).
 
     Handles all permission checks, connection attempts, and error handling.
-    Defers the interaction immediately before connecting.
+    Validation failures return without deferring; the interaction is deferred only after
+    validation passes, just before the (slow) connect/move.
     """
     # Early validation (no defer yet)
     if not ctx.author.voice or not ctx.author.voice.channel:
@@ -353,7 +354,7 @@ async def join_author_voice(ctx: commands.Context) -> tuple[bool, str]:
     if not (perms.connect and perms.speak):
         return False, f"Missing Connect/Speak permission in {channel.name}."
 
-    # Now defer (this is the expensive operation)
+    # Validation passed: ack the interaction before the slow connect
     await ctx.defer()
     try:
         if ctx.voice_client:
@@ -514,7 +515,7 @@ async def voices(ctx: commands.Context):
 
 @bot.hybrid_command(name="help", description="Show available commands and current status")
 @commands.guild_only()
-async def help(ctx: commands.Context):
+async def help_cmd(ctx: commands.Context):
     """Show all registered commands and current bot state."""
     lines = []
 

@@ -82,7 +82,7 @@ class HelpCommandTest(CommandTestBase):
             await self.config.set_channel(1, 10, expected_rev=None, editor="t")
         ctx = make_context(guild, make_member(1, "testuser"))
         ctx.voice_client = vc
-        await bot.help(ctx)
+        await bot.help_cmd(ctx)
         ctx.send.assert_awaited_once()
         return ctx, ctx.send.await_args[0][0]
 
