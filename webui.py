@@ -2,6 +2,7 @@
 is the trust boundary; this module enforces a bind-address policy, a Host allowlist and an Origin
 check on writes. Duck-typed on the controller; never imports bot.py."""
 import asyncio
+import base64
 import contextlib
 import hashlib
 import hmac
@@ -12,13 +13,14 @@ import os
 import re
 import secrets
 import subprocess
+import threading
 import time
 import unicodedata
 from urllib.parse import unquote, urlsplit
 
 from aiohttp import web
 
-from config_store import ConflictError
+from config_store import ConflictError, atomic_write_json
 from features import FeatureStore
 from messages import MAX_MESSAGE_CHARS, MessageError
 from voices import VOICE_NAME_RE, BadVoiceError, SayError, VoiceLoadError
@@ -32,6 +34,105 @@ LOGIN_RATE_WINDOW = 60.0  # seconds
 AUTH_MANAGER_KEY = web.AppKey("auth_manager", object)
 FEATURE_STORE_KEY = web.AppKey("feature_store", object)
 USER_KEY = web.RequestKey("user", str)
+
+
+# ---------- password hashing (stdlib scrypt) ----------
+SCRYPT_N, SCRYPT_R, SCRYPT_P, SCRYPT_DKLEN = 2 ** 14, 8, 1, 32
+SCRYPT_MAXMEM = 64 * 1024 * 1024
+MIN_PASSWORD_LEN, MAX_PASSWORD_LEN = 10, 200
+# Passwords that shipped in examples/docs: never accepted, whatever is stored.
+KNOWN_BAD_PASSWORDS = frozenset({"changeme", "testerpassword", "password", "admin"})
+
+
+def hash_password(password: str) -> str:
+    """`scrypt$N$r$p$<salt_b64>$<hash_b64>` with a fresh 16-byte random salt."""
+    salt = secrets.token_bytes(16)
+    dk = hashlib.scrypt(password.encode("utf-8"), salt=salt, n=SCRYPT_N, r=SCRYPT_R, p=SCRYPT_P,
+                        maxmem=SCRYPT_MAXMEM, dklen=SCRYPT_DKLEN)
+    return "$".join(["scrypt", str(SCRYPT_N), str(SCRYPT_R), str(SCRYPT_P),
+                     base64.b64encode(salt).decode("ascii"), base64.b64encode(dk).decode("ascii")])
+
+
+def _parse_int(s: str) -> int | None:
+    return int(s) if s.isascii() and s.isdigit() and len(s) <= 9 else None
+
+
+def verify_hash(stored: str, password: str) -> bool:
+    """Constant-time check against a `scrypt$...` value. Strict parsing; any malformed or
+    out-of-range (tampered) value returns False. Never raises."""
+    try:
+        parts = stored.split("$")
+        if len(parts) != 6 or parts[0] != "scrypt":
+            return False
+        n, r, p = (_parse_int(x) for x in parts[1:4])
+        if n is None or r is None or p is None:
+            return False
+        if not (2 ** 10 <= n <= 2 ** 17 and n & (n - 1) == 0 and 1 <= r <= 16 and 1 <= p <= 4):
+            return False
+        salt = base64.b64decode(parts[4], validate=True)
+        want = base64.b64decode(parts[5], validate=True)
+        if not (8 <= len(salt) <= 64 and 16 <= len(want) <= 64):
+            return False
+        got = hashlib.scrypt(password.encode("utf-8"), salt=salt, n=n, r=r, p=p,
+                             maxmem=SCRYPT_MAXMEM, dklen=len(want))
+        return hmac.compare_digest(got, want)
+    except Exception:
+        return False
+
+
+def password_policy_error(password) -> str | None:
+    """Return an error code for a password the Admin tab / CLI must refuse, else None."""
+    if not isinstance(password, str) or not (MIN_PASSWORD_LEN <= len(password) <= MAX_PASSWORD_LEN):
+        return "weak_password"
+    if password.strip().lower() in KNOWN_BAD_PASSWORDS:
+        return "weak_password"
+    return None
+
+
+# Verified against when the username is unknown, so both paths cost one scrypt.
+_DUMMY_HASH = hash_password(secrets.token_urlsafe(16))
+
+
+class PasswordRequired(ValueError):
+    pass
+
+
+def _split_raw(raw):
+    """Return (records, rebuild) for any supported users.json layout. `records` is a list of
+    entries (dicts for users); `rebuild(records)` gives the JSON value to write back, keeping the
+    wrapper object and its other fields when there is one."""
+    if isinstance(raw, list):
+        return raw, lambda recs: recs
+    if not isinstance(raw, dict):
+        raise ValueError("users file must hold a JSON list or object")
+    wrapped = "users" in raw
+    inner = raw["users"] if wrapped else raw
+    if isinstance(inner, list):
+        return inner, lambda recs: {**raw, "users": recs}
+    if not isinstance(inner, dict):
+        raise ValueError("users file has an unsupported layout")
+    recs = []
+    for k, v in inner.items():
+        if isinstance(v, str):
+            recs.append({"username": str(k), "password": v})
+        elif isinstance(v, dict):
+            recs.append({**v, "username": str(k)})
+    return recs, (lambda r: {**raw, "users": r}) if wrapped else (lambda r: r)
+
+
+def _groups_of(rec: dict) -> set[str]:
+    groups: set[str] = set()
+    if rec.get("role"):
+        groups.add(str(rec["role"]).strip().lower())
+    if rec.get("is_admin") is True:
+        groups.add("admin")
+    if isinstance(rec.get("groups"), list):
+        groups.update(str(g).strip().lower() for g in rec["groups"] if g)
+    return groups
+
+
+def _is_user_rec(rec, name_lower: str) -> bool:
+    return isinstance(rec, dict) and str(rec.get("username", "")).strip().lower() == name_lower
 
 
 class AuthManager:
@@ -55,6 +156,7 @@ class AuthManager:
         self._cached_admins: set[str] = set()
         self._cached_groups: dict[str, set[str]] = {}
         self._cached_mtime: float = -1.0
+        self._lock = threading.RLock()
 
     @property
     def enabled(self) -> bool:
@@ -151,49 +253,44 @@ class AuthManager:
             result.append({"username": uname, "groups": grps})
         return result
 
+    def _read_records(self):
+        """(records, rebuild) of the file on disk; ([], identity) when it does not exist yet."""
+        try:
+            with open(self.users_file, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+        except FileNotFoundError:
+            return [], (lambda recs: recs)
+        return _split_raw(raw)
+
+    def _write_records(self, rebuild, records) -> None:
+        atomic_write_json(rebuild(records), self.users_file)
+        self._cached_mtime = -1.0
+        self.load_users()
+
     def save_user(self, username: str, password: str | None, groups: list[str]) -> bool:
+        """Create/update a user. `password` is PLAINTEXT here and is stored only as a scrypt hash;
+        None/"" keeps the existing hash (a new user needs one). Callers enforce the password policy."""
         if not self.users_file:
             return False
         uname = username.strip()
         uname_lower = uname.lower()
-        grps = [str(g).strip().lower() for g in groups if str(g).strip()]
-        if not grps:
-            grps = ["user"]
-        if uname_lower == "admin" and "admin" not in grps:
-            grps.append("admin")
-
-        data = []
-        if os.path.exists(self.users_file):
-            try:
-                with open(self.users_file, "r", encoding="utf-8") as f:
-                    raw = json.load(f)
-                if isinstance(raw, list):
-                    data = raw
-                elif isinstance(raw, dict):
-                    if "users" in raw and isinstance(raw["users"], list):
-                        data = raw["users"]
-                    else:
-                        for k, v in raw.items():
-                            p = v if isinstance(v, str) else (v.get("password") if isinstance(v, dict) else "")
-                            data.append({"username": str(k), "password": p, "groups": ["admin" if str(k).lower() == "admin" else "user"]})
-            except Exception:
-                data = []
-
-        found = False
-        for item in data:
-            if isinstance(item, dict) and str(item.get("username", "")).strip().lower() == uname_lower:
-                found = True
-                if password:
-                    item["password"] = password
-                item["groups"] = grps
-                break
-        if not found:
-            data.append({"username": uname, "password": password or "", "groups": grps})
-
-        from config_store import atomic_write_json
-        atomic_write_json(data, self.users_file)
-        self._cached_mtime = -1.0
-        self.load_users()
+        grps = [str(g).strip().lower() for g in groups if str(g).strip()] or ["user"]
+        new_hash = hash_password(password) if password else None  # slow: outside the lock
+        with self._lock:
+            records, rebuild = self._read_records()
+            for item in records:
+                if _is_user_rec(item, uname_lower):
+                    if new_hash:
+                        item["password"] = new_hash
+                    item.pop("role", None)
+                    item.pop("is_admin", None)
+                    item["groups"] = grps
+                    break
+            else:
+                if not new_hash:
+                    raise PasswordRequired("a password is required for a new user")
+                records.append({"username": uname, "password": new_hash, "groups": grps})
+            self._write_records(rebuild, records)
         return True
 
     def delete_user(self, username: str) -> bool:
@@ -203,29 +300,32 @@ class AuthManager:
         if uname_lower == "admin":
             return False
         try:
-            with open(self.users_file, "r", encoding="utf-8") as f:
-                raw = json.load(f)
-            data = []
-            if isinstance(raw, list):
-                data = raw
-            elif isinstance(raw, dict):
-                if "users" in raw and isinstance(raw["users"], list):
-                    data = raw["users"]
-                else:
-                    for k, v in raw.items():
-                        p = v if isinstance(v, str) else (v.get("password") if isinstance(v, dict) else "")
-                        data.append({"username": str(k), "password": p, "groups": ["admin" if str(k).lower() == "admin" else "user"]})
-            new_data = [item for item in data if not (isinstance(item, dict) and str(item.get("username", "")).strip().lower() == uname_lower)]
-            if len(new_data) == len(data):
-                return False
-            from config_store import atomic_write_json
-            atomic_write_json(new_data, self.users_file)
-            self._cached_mtime = -1.0
-            self.load_users()
+            with self._lock:
+                records, rebuild = self._read_records()
+                kept = [r for r in records if not _is_user_rec(r, uname_lower)]
+                if len(kept) == len(records):
+                    return False
+                self._write_records(rebuild, kept)
             return True
         except Exception as e:
             log.warning("failed to delete user %s: %s", username, e)
             return False
+
+    def _upgrade_hash(self, uname_lower: str, old_stored: str, password: str) -> None:
+        """Replace a legacy plaintext/sha256 value by a scrypt hash after a successful login.
+        Best effort: a failure is logged and never fails the login."""
+        try:
+            new_hash = hash_password(password)
+            with self._lock:
+                records, rebuild = self._read_records()
+                for item in records:
+                    if _is_user_rec(item, uname_lower) and str(item.get("password", "")) == old_stored:
+                        item["password"] = new_hash
+                        self._write_records(rebuild, records)
+                        log.info("upgraded stored password of user %r to scrypt", uname_lower)
+                        return
+        except Exception as e:
+            log.warning("could not upgrade stored password of user %r: %s", uname_lower, type(e).__name__)
 
     def verify_password(self, username: str, password: str) -> bool:
         users = self.load_users()
@@ -236,11 +336,21 @@ class AuthManager:
                 matched_pass = p
                 break
         if matched_pass is None:
+            verify_hash(_DUMMY_HASH, password)  # same cost as a real check; result discarded
             return False
+        if password.strip().lower() in KNOWN_BAD_PASSWORDS:
+            log.error("login refused for user %r: credential is on the known-default list", username)
+            return False
+        if matched_pass.startswith("scrypt$"):
+            return verify_hash(matched_pass, password)
         if matched_pass.startswith("sha256:"):
             h = hashlib.sha256(password.encode("utf-8")).hexdigest()
-            return hmac.compare_digest(matched_pass[7:].lower(), h.lower())
-        return hmac.compare_digest(matched_pass, password)
+            ok = hmac.compare_digest(matched_pass[7:].lower().encode("utf-8"), h.encode("ascii"))
+        else:
+            ok = hmac.compare_digest(matched_pass.encode("utf-8"), password.encode("utf-8"))
+        if ok:
+            self._upgrade_hash(uname_clean, matched_pass, password)
+        return ok
 
     def check_rate_limit(self, ip: str) -> bool:
         now = time.monotonic()
@@ -552,6 +662,7 @@ def make_app(config, controller, *, allowed_hosts, status_interval: float = 3.0,
     static_dir = static_dir or DEFAULT_STATIC_DIR
     users_file = users_file or os.getenv("USERS_FILE")
     auth_mgr = AuthManager(users_file)
+    hash_slots = asyncio.Semaphore(4)  # concurrent scrypt operations (16 MiB each)
     features_path = features_file or os.getenv("FEATURES_FILE") or (
         os.path.join(os.path.dirname(config.path), "features.json") if hasattr(config, "path") and config.path else "features.json"
     )
@@ -906,7 +1017,10 @@ def make_app(config, controller, *, allowed_hosts, status_interval: float = 3.0,
         password = str(body.get("password", ""))
         if not username or not password:
             return _err("bad_request", 400)
-        if not auth_mgr.verify_password(username, password):
+        loop = asyncio.get_running_loop()
+        async with hash_slots:  # scrypt is CPU/memory heavy: off the event loop, bounded
+            ok = await loop.run_in_executor(None, auth_mgr.verify_password, username, password)
+        if not ok:
             auth_mgr.record_failure(ip)
             log.warning("failed login attempt for user %r from %s", username, ip)
             return _err("invalid_credentials", 401)
@@ -973,8 +1087,12 @@ def make_app(config, controller, *, allowed_hosts, status_interval: float = 3.0,
         body = await body_of(request)
         uname = str(body.get("username", "")).strip()
         passw = body.get("password")
-        if passw is not None:
-            passw = str(passw)
+        if passw is not None and not isinstance(passw, str):
+            return _err("bad_request", 400)
+        if passw == "":
+            passw = None
+        if passw is not None and password_policy_error(passw):
+            return _err("weak_password", 400)
         raw_groups = body.get("groups", ["user"])
         if isinstance(raw_groups, str):
             raw_groups = [g.strip() for g in raw_groups.split(",") if g.strip()]
@@ -985,8 +1103,11 @@ def make_app(config, controller, *, allowed_hosts, status_interval: float = 3.0,
             return _err("bad_request", 400)
         try:
             loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, auth_mgr.save_user, uname, passw, groups)
+            async with hash_slots:
+                await loop.run_in_executor(None, auth_mgr.save_user, uname, passw, groups)
             return _json({"ok": True, "username": uname, "groups": groups})
+        except PasswordRequired:
+            return _err("password_required", 400)
         except Exception:
             log.exception("failed to save user")
             return _err("internal", 500)
