@@ -117,6 +117,8 @@ function voiceSwitchText(editor, name) {
 }
 
 const MSG_MAX = 2000;
+const MENTION_REGEX = /<@!?([0-9]{1,20})>/g;
+const MENTION_SPLIT_REGEX = /(<@!?[0-9]{1,20}>)/g;
 const READY_PRESET = "The voice bot is ready to use! Join a voice channel, type !join here, and I'll read watched users' messages aloud.";
 const cpLen = (s) => Array.from(String(s)).length;
 
@@ -212,9 +214,8 @@ function pingTargets(finalText, chips) {
   const byId = new Map((chips || []).map((c) => [c.id, c]));
   const result = [];
   const seen = new Set();
-  const mentionRe = /<@!?(\d+)>/g;
   let m;
-  while ((m = mentionRe.exec(finalText))) {
+  while ((m = MENTION_REGEX.exec(finalText))) {
     const id = m[1];
     if (!seen.has(id)) {
       seen.add(id);
@@ -235,8 +236,6 @@ function chipText(chip) {
 }
 
 function pingSummary(targets) {
-  // targets is an array of {id, label, username, known}
-  if (!Array.isArray(targets)) return 'No pings';  // legacy compatibility
   if (!targets.length) return 'No pings';
   const names = targets.map((t) => {
     if (!t.known) return 'unknown user ' + t.id;
@@ -767,7 +766,7 @@ if (typeof document !== 'undefined') (function () {
     else for (const seg of segmentText(text, M.tags)) {
       if (seg.tag) pv.appendChild(el('span', 'tag', seg.text));
       else {
-        const parts = seg.text.split(/(<@!?[0-9]{1,20}>)/g);
+        const parts = seg.text.split(MENTION_SPLIT_REGEX);
         for (const p of parts) {
           if (p.startsWith('<@') && p.endsWith('>')) pv.appendChild(el('span', 'tag', p));
           else if (p) pv.appendChild(document.createTextNode(p));

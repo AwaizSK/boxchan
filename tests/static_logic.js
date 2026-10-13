@@ -133,7 +133,7 @@ assert.strictEqual(counterState(1900), 'near');
 assert.strictEqual(counterState(2000), 'near');
 assert.strictEqual(counterState(2001), 'over');
 assert.strictEqual(cpLen('a\u{1F600}b'), 3);
-// pingTargets and pingSummary with new format
+// pingTargets and pingSummary with new format, aligned regex (1-20 digits)
 const chips1 = [{ id: '5', label: 'Alice', username: 'alice123' }, { id: '6', label: 'Bob', username: 'bob99' }];
 assert.deepStrictEqual(pingTargets('<@5> hi', chips1), [{ id: '5', label: 'Alice', username: 'alice123', known: true }]);
 assert.deepStrictEqual(pingTargets('<@5> <@5>', chips1), [{ id: '5', label: 'Alice', username: 'alice123', known: true }]);
@@ -141,6 +141,10 @@ assert.deepStrictEqual(pingTargets('<@!6> x <@5>', chips1), [{ id: '6', label: '
 assert.deepStrictEqual(pingTargets('', []), []);
 assert.deepStrictEqual(pingTargets('<@999>', []), [{ id: '999', label: null, username: null, known: false }]);
 assert.deepStrictEqual(pingTargets('x@<@5> hi', chips1), [{ id: '5', label: 'Alice', username: 'alice123', known: true }]);
+// 21-digit token should NOT match (both regex enforce 1-20)
+assert.deepStrictEqual(pingTargets('<@123456789012345678901>', []), []);
+// 20-digit token should match
+assert.deepStrictEqual(pingTargets('<@12345678901234567890>', chips1), [{ id: '12345678901234567890', label: null, username: null, known: false }]);
 assert.strictEqual(pingSummary([]), 'No pings');
 assert.strictEqual(pingSummary([{ id: '5', label: 'Alice', username: 'alice123', known: true }]), 'Will ping: @Alice (@alice123)');
 assert.strictEqual(pingSummary([{ id: '5', label: 'Alice', username: 'alice123', known: true }, { id: '999', label: null, username: null, known: false }]), 'Will ping: @Alice (@alice123), unknown user 999');
