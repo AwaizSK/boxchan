@@ -142,6 +142,17 @@ function tokenizeMentions(text) {
   return out;
 }
 
+// Did the configured channel of guild `gid` change between two config snapshots? The first
+// snapshot (prevCfg null/undefined) is not a change; null and undefined channel ids are equal.
+function channelChanged(prevCfg, nextCfg, gid) {
+  if (!prevCfg || !nextCfg) return false;
+  const chanOf = (cfg) => {
+    const g = cfg.guilds && cfg.guilds[gid];
+    return g && g.channel_id != null ? g.channel_id : null;
+  };
+  return chanOf(prevCfg) !== chanOf(nextCfg);
+}
+
 // Split text into plain and tagged parts. Only the exact "@label" of a tagged chip matches
 // (longest label first, single pass, not glued to word characters); nothing is ever guessed.
 // There is no lookbehind (Safari < 16.4): the character before a match is checked by hand,
@@ -288,7 +299,7 @@ function mergeVoiceSummary(prev, incoming, { seqAtRequest, seqNow, live }) {
 if (typeof module !== 'undefined') {
   module.exports = { shouldApplySnapshot, normalizeEditor, shouldRollback, createSSEParser, matchChannel, relTime, backoffDelay, groupChannels,
     voiceTitle, voiceWarning, sayBlocker, voiceSwitchText, mergeVoiceSummary,
-    segmentText, substituteTags, activeTagIds, uniqueLabel, insertAtCursor, counterText, counterState, shouldApplyMembers, resetMemberCache, tokenizeMentions, MENTION_SRC, pingTargets, pingSummary, chipText, messageBlocker, cpLen, MSG_MAX, READY_PRESET };
+    segmentText, substituteTags, activeTagIds, uniqueLabel, insertAtCursor, counterText, counterState, shouldApplyMembers, resetMemberCache, tokenizeMentions, channelChanged, MENTION_SRC, pingTargets, pingSummary, chipText, messageBlocker, cpLen, MSG_MAX, READY_PRESET };
 }
 
 /* ---------- app ---------- */
@@ -404,15 +415,20 @@ if (typeof document !== 'undefined') (function () {
     return c ? '#' + c.name : null;
   };
 
+  // Every assignment of S.cfg goes through here: a changed channel for the selected server
+  // empties the member cache (the old channel's viewers are wrong) and, on the Messages tab,
+  // reloads the picker.
+  function adoptConfig(snap) {
+    const prev = S.cfg;
+    S.cfg = snap;
+    if (!channelChanged(prev, snap, S.gid)) return;
+    resetMemberCache(M);
+    if (S.tab === 'messages') { renderMessages(); fetchMembers(); }
+  }
+
   function applySnapshot(snap, force) {
     if (!shouldApplySnapshot(S.cfg, snap, force)) return;
-    const oldChanId = S.cfg && S.cfg.guilds[S.gid] && S.cfg.guilds[S.gid].channel_id;
-    S.cfg = snap;
-    const newChanId = S.cfg && S.cfg.guilds[S.gid] && S.cfg.guilds[S.gid].channel_id;
-    if (oldChanId !== newChanId) {
-      resetMemberCache(M);
-      if (S.tab === 'messages') renderMessages();
-    }
+    adoptConfig(snap);
     renderConfig();
   }
 
@@ -421,7 +437,7 @@ if (typeof document !== 'undefined') (function () {
     for (const g of S.guilds) S.status[g.id] = { voice: g.voice, queue: g.queue, playing: g.playing, watched: g.watched };
     if (!S.guilds.some((g) => g.id === S.gid)) S.gid = S.guilds.length ? S.guilds[0].id : '';
     const snap = d.config || d.snapshot;
-    if (shouldApplySnapshot(S.cfg, snap, force)) S.cfg = snap;
+    if (shouldApplySnapshot(S.cfg, snap, force)) adoptConfig(snap);
     renderGuildSelect();
     renderList();
     renderConfig();

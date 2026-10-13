@@ -1,7 +1,7 @@
 const assert = require('assert');
 const { shouldApplySnapshot, normalizeEditor, shouldRollback, createSSEParser, matchChannel, relTime, backoffDelay, groupChannels,
   voiceTitle, voiceWarning, sayBlocker, voiceSwitchText, mergeVoiceSummary,
-  segmentText, substituteTags, activeTagIds, uniqueLabel, insertAtCursor, counterText, counterState, shouldApplyMembers, resetMemberCache, tokenizeMentions, MENTION_SRC, pingTargets, pingSummary, chipText, messageBlocker,
+  segmentText, substituteTags, activeTagIds, uniqueLabel, insertAtCursor, counterText, counterState, shouldApplyMembers, resetMemberCache, tokenizeMentions, channelChanged, MENTION_SRC, pingTargets, pingSummary, chipText, messageBlocker,
   cpLen, READY_PRESET } = require('../static/app.js');
 
 const got = [];
@@ -196,7 +196,6 @@ assert.strictEqual(shouldApplyMembers('gid1', 'gid1', 2, 1), false);
   assert.strictEqual(prev.current, 'b');
   assert.strictEqual(mergeVoiceSummary(prev, null, { seqAtRequest: 1, seqNow: 1, live: true }), prev);
 }
-console.log('ok');
 
 // tokenizeMentions (shared by the preview and pingTargets) and the single mention source
 const idsOf = (t) => tokenizeMentions(t).filter((p) => p.id !== null).map((p) => p.id);
@@ -215,3 +214,18 @@ assert.deepStrictEqual(tokenizeMentions('<@5><@!6>'), [{ text: '<@5>', id: '5' }
 assert.strictEqual(MENTION_SRC, '<@!?([0-9]{1,20})>');
 assert.strictEqual(tokenizeMentions('<@5> <@5>').map((p) => p.text).join(''), '<@5> <@5>');  // no shared regex state across calls
 
+// channelChanged(prevCfg, nextCfg, gid)
+const cfgOf = (g) => ({ rev: 1, guilds: g });
+assert.strictEqual(channelChanged(cfgOf({ 1: { channel_id: '10' } }), cfgOf({ 1: { channel_id: '11' } }), '1'), true);
+assert.strictEqual(channelChanged(cfgOf({ 1: { channel_id: '10' } }), cfgOf({ 1: { channel_id: '10' } }), '1'), false);
+assert.strictEqual(channelChanged(null, cfgOf({ 1: { channel_id: '10' } }), '1'), false);        // first snapshot
+assert.strictEqual(channelChanged(undefined, cfgOf({ 1: { channel_id: '10' } }), '1'), false);
+assert.strictEqual(channelChanged(cfgOf({ 1: { channel_id: '10' }, 2: { channel_id: '5' } }), cfgOf({ 1: { channel_id: '10' }, 2: { channel_id: '6' } }), '1'), false);  // other guild
+assert.strictEqual(channelChanged(cfgOf({ 1: { channel_id: null } }), cfgOf({ 1: {} }), '1'), false);   // null vs undefined
+assert.strictEqual(channelChanged(cfgOf({}), cfgOf({ 1: { channel_id: null } }), '1'), false);
+assert.strictEqual(channelChanged(cfgOf({ 1: { channel_id: '10' } }), cfgOf({ 1: { channel_id: null } }), '1'), true);  // channel cleared
+assert.strictEqual(channelChanged(cfgOf({ 1: { channel_id: null } }), cfgOf({ 1: { channel_id: '10' } }), '1'), true);
+assert.strictEqual(channelChanged(cfgOf({ 1: { channel_id: '10' } }), null, '1'), false);
+assert.strictEqual(channelChanged(cfgOf({ 1: { channel_id: '10' }, 2: { channel_id: '5' } }), cfgOf({ 1: { channel_id: '11' }, 2: { channel_id: '5' } }), '2'), false);  // only the selected guild counts
+assert.strictEqual(channelChanged(cfgOf({ 1: { channel_id: '10' }, 2: { channel_id: '5' } }), cfgOf({ 1: { channel_id: '10' }, 2: { channel_id: '6' } }), '2'), true);
+console.log('ok');
