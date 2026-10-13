@@ -249,18 +249,21 @@ def _json(data, status=200):
     return web.json_response(data, status=status)
 
 
-def _log_shielded_task_exception(task_name: str, expected_exceptions: tuple):
-    """Returns a done-callback factory for shielded tasks that logs unexpected exceptions.
+def _make_shielded_callback(task_name: str, expected_exceptions: tuple):
+    """Returns a done-callback for shielded tasks that logs unexpected exceptions.
 
     Use when a shielded task (cancelled mid-write) needs exception tracking that doesn't emit
     "Task exception was never retrieved" warnings for expected failures.
     Example:
         task = asyncio.create_task(coro)
-        task.add_done_callback(_log_shielded_task_exception("my_task", (OSError, ConflictError)))
+        task.add_done_callback(_make_shielded_callback("my_task", (OSError, ConflictError)))
     """
     def callback(fut):
-        if not fut.cancelled() and fut.exception() and not isinstance(fut.exception(), expected_exceptions):
-            log.exception("%s failed after client disconnect", task_name, exc_info=fut.exception())
+        if fut.cancelled():
+            return
+        exc = fut.exception()
+        if exc and not isinstance(exc, expected_exceptions):
+            log.error("%s failed after client disconnect", task_name, exc_info=exc)
     return callback
 
 
@@ -384,8 +387,10 @@ def make_app(config, controller, *, allowed_hosts, status_interval: float = 3.0,
 
     async def write(coro):
         # shield: a client disconnect must not cancel a half-finished persist
+        task = asyncio.create_task(coro)
+        task.add_done_callback(_make_shielded_callback("config_write", (ConflictError, OSError)))
         try:
-            snap = await asyncio.shield(coro)
+            snap = await asyncio.shield(task)
         except ConflictError as e:
             return _json({"error": "conflict", "snapshot": wire_snapshot(e.snapshot)}, 409)
         except OSError:
@@ -409,8 +414,8 @@ def make_app(config, controller, *, allowed_hosts, status_interval: float = 3.0,
             if VOICE_NAME_RE.fullmatch(name) is None:
                 return _err("bad_voice", 400)
         task = asyncio.create_task(controller.apply_voice(name, body.get("rev"), editor))
-        task.add_done_callback(_log_shielded_task_exception("apply_voice",
-                                                           (ConflictError, BadVoiceError, VoiceLoadError, OSError)))
+        task.add_done_callback(_make_shielded_callback("apply_voice",
+                                                       (ConflictError, BadVoiceError, VoiceLoadError, OSError)))
         try:
             # shield: a client disconnect must not cancel a half-finished engine swap
             snap = await asyncio.shield(task)
@@ -480,7 +485,7 @@ def make_app(config, controller, *, allowed_hosts, status_interval: float = 3.0,
         if not isinstance(content, str) or not 1 <= len(content.strip()) <= MAX_MESSAGE_CHARS:
             return _err("bad_request", 400)
         task = asyncio.create_task(controller.send_message(gid, content, editor))
-        task.add_done_callback(_log_shielded_task_exception("send_message", (MessageError,)))
+        task.add_done_callback(_make_shielded_callback("send_message", (MessageError,)))
         try:
             # shield: a client disconnect must not cancel the send (nor invite a retry-duplicate)
             return _json(await asyncio.shield(task))

@@ -71,4 +71,47 @@ if grep -nE 'rm .*models|"\$APP"/models/\*' "$HERE/scripts/deploy.sh" | grep -v 
 bash -n "$HERE/scripts/install_voice.sh" && echo "ok   install_voice.sh syntax" || { echo "FAIL install_voice.sh syntax"; fails=$((fails+1)); }
 grep -q 'set -euo pipefail' "$HERE/scripts/install_voice.sh" && echo "ok   install_voice.sh strict mode" || { echo "FAIL strict mode"; fails=$((fails+1)); }
 
+# ---- install_voice.sh race condition tests (temp dir only, no sudo, no /opt) ----
+INSTALL_TEST_DIR="$T/install_test"
+mkdir -p "$INSTALL_TEST_DIR/models" "$INSTALL_TEST_DIR/src"
+# Create test voice files
+{ printf '\x08\x07'; head -c 1200000 /dev/urandom; } > "$INSTALL_TEST_DIR/src/test_voice.onnx"
+echo '{"audio":{"sample_rate":22050,"quality":"medium"},"num_speakers":1,"espeak":{"voice":"en-us"}}' > "$INSTALL_TEST_DIR/src/test_voice.onnx.json"
+
+# Test 1: Fresh install succeeds
+if INSTALL_VOICE_SKIP_ROOT_CHECK=1 PIPER_MODELS_DIR_OVERRIDE="$INSTALL_TEST_DIR/models" bash "$HERE/scripts/install_voice.sh" "$INSTALL_TEST_DIR/src/test_voice.onnx" "$INSTALL_TEST_DIR/src/test_voice.onnx.json" >/dev/null 2>&1; then
+  [ -f "$INSTALL_TEST_DIR/models/test_voice.onnx" ] && [ -f "$INSTALL_TEST_DIR/models/test_voice.onnx.json" ] && echo "ok   install_voice.sh fresh install succeeds" || { echo "FAIL fresh install files missing"; fails=$((fails+1)); }
+else
+  echo "FAIL install_voice.sh fresh install failed"; fails=$((fails+1));
+fi
+
+# Test 2: Second install without --force fails and leaves original untouched
+ORIG_ONNX_MD5="$(md5sum "$INSTALL_TEST_DIR/models/test_voice.onnx" | cut -d' ' -f1)"
+if INSTALL_VOICE_SKIP_ROOT_CHECK=1 PIPER_MODELS_DIR_OVERRIDE="$INSTALL_TEST_DIR/models" bash "$HERE/scripts/install_voice.sh" "$INSTALL_TEST_DIR/src/test_voice.onnx" "$INSTALL_TEST_DIR/src/test_voice.onnx.json" >/dev/null 2>&1; then
+  echo "FAIL install_voice.sh second install should have failed"; fails=$((fails+1));
+else
+  CURR_ONNX_MD5="$(md5sum "$INSTALL_TEST_DIR/models/test_voice.onnx" | cut -d' ' -f1)"
+  if [ "$ORIG_ONNX_MD5" = "$CURR_ONNX_MD5" ]; then
+    echo "ok   install_voice.sh second install fails and preserves original"
+  else
+    echo "FAIL second install overwrote the file"; fails=$((fails+1));
+  fi
+fi
+
+# Test 3: With --force it overwrites (re-install the original after the failed attempt above)
+# Recreate the original good voice files
+{ printf '\x08\x07'; head -c 1200000 /dev/urandom; } > "$INSTALL_TEST_DIR/src/test_voice.onnx"
+if INSTALL_VOICE_SKIP_ROOT_CHECK=1 PIPER_MODELS_DIR_OVERRIDE="$INSTALL_TEST_DIR/models" bash "$HERE/scripts/install_voice.sh" --force "$INSTALL_TEST_DIR/src/test_voice.onnx" "$INSTALL_TEST_DIR/src/test_voice.onnx.json" >/dev/null 2>&1; then
+  [ -f "$INSTALL_TEST_DIR/models/test_voice.onnx" ] && echo "ok   install_voice.sh --force overwrites" || { echo "FAIL --force did not create file"; fails=$((fails+1)); }
+else
+  echo "FAIL install_voice.sh --force install failed"; fails=$((fails+1));
+fi
+
+# Test 4: No staging files left behind
+if [ -z "$(find "$INSTALL_TEST_DIR/models" -name '.install.*' -type d 2>/dev/null)" ]; then
+  echo "ok   install_voice.sh no staging files left behind"
+else
+  echo "FAIL staging files left behind"; fails=$((fails+1));
+fi
+
 [ $fails -eq 0 ] && echo "all passed" || { echo "$fails failed"; exit 1; }

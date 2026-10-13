@@ -5,9 +5,11 @@
 # unless --force. Voices installed here live only in /opt/tts-bot/models (deploy.sh does not prune them).
 set -euo pipefail
 
-[ "$EUID" -eq 0 ] || { echo "Run with sudo."; exit 1; }
-APP=/opt/tts-bot
-MODELS="$APP/models"
+if [ -z "${INSTALL_VOICE_SKIP_ROOT_CHECK:-}" ]; then
+  [ "$EUID" -eq 0 ] || { echo "Run with sudo."; exit 1; }
+fi
+APP="${APP_ROOT:-/opt/tts-bot}"
+MODELS="${PIPER_MODELS_DIR_OVERRIDE:-$APP/models}"
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
 # shellcheck source=lib/deploy_validate.sh
 . "$HERE/lib/deploy_validate.sh"
@@ -52,14 +54,27 @@ cp -P --no-preserve=all -- "$src_onnx" "$stage/$stem.onnx"
 cp -P --no-preserve=all -- "$src_json" "$stage/$stem.onnx.json"
 validate_voice_files "$stage/$stem.onnx" "$stage/$stem.onnx.json" "$PY"
 
-chown root:root "$stage/$stem.onnx" "$stage/$stem.onnx.json"
+if [ "$EUID" -eq 0 ]; then
+  chown root:root "$stage/$stem.onnx" "$stage/$stem.onnx.json"
+fi
 chmod 644 "$stage/$stem.onnx" "$stage/$stem.onnx.json"
-# config first, model last: the bot lists a voice only when both exist, so a rescan never sees a half install
-# Use mv -n (no-clobber) to prevent a race between the check and the move: fail if target appeared.
+# Atomic install: .json first, .onnx last so the bot never sees a half-installed pair.
+# Use ln to create-if-absent (fails if target exists, including dangling symlinks).
 if [ "$force" -ne 1 ]; then
-  mv -n -- "$stage/$stem.onnx.json" "$MODELS/$stem.onnx.json" || { echo "Voice '$stem' was installed by another process; aborting." >&2; exit 1; }
-  mv -n -- "$stage/$stem.onnx" "$MODELS/$stem.onnx" || { echo "Voice '$stem' was installed by another process; aborting." >&2; exit 1; }
+  if ! ln -- "$stage/$stem.onnx.json" "$MODELS/$stem.onnx.json" 2>/dev/null; then
+    echo "Voice '$stem' was already installed by another process; aborting." >&2
+    exit 1
+  fi
+  if ! ln -- "$stage/$stem.onnx" "$MODELS/$stem.onnx" 2>/dev/null; then
+    # Rollback: .json was installed but .onnx failed, remove .json to prevent half-install
+    rm -f -- "$MODELS/$stem.onnx.json"
+    echo "Voice '$stem' was partially installed by another process; rolled back." >&2
+    exit 1
+  fi
+  rm -f -- "$stage/$stem.onnx.json" "$stage/$stem.onnx"
 else
+  # --force: unlink old if present, then install
+  rm -f -- "$MODELS/$stem.onnx.json" "$MODELS/$stem.onnx"
   mv -f -- "$stage/$stem.onnx.json" "$MODELS/$stem.onnx.json"
   mv -f -- "$stage/$stem.onnx" "$MODELS/$stem.onnx"
 fi
