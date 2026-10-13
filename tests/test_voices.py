@@ -79,6 +79,15 @@ class DiscoverTests(unittest.TestCase):
         write_voice(self.d, "huge", raw_json=" " * (voices.MAX_JSON_BYTES + 1))
         self.assertEqual(self.discover(), [])
 
+    def test_skips_symlinks(self):
+        write_voice(self.d, "real")
+        other = tempfile.TemporaryDirectory()
+        self.addCleanup(other.cleanup)
+        write_voice(other.name, "target")
+        os.symlink(os.path.join(other.name, "target.onnx"), os.path.join(self.d, "symlinked.onnx"))
+        os.symlink(os.path.join(other.name, "target.onnx.json"), os.path.join(self.d, "symlinked.onnx.json"))
+        self.assertEqual([v["name"] for v in self.discover()], ["real"])
+
 
 class ResolveTests(unittest.TestCase):
     def setUp(self):

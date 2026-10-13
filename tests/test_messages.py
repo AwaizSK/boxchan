@@ -25,7 +25,7 @@ class ParseMentionsTests(unittest.TestCase):
             self.assertEqual(cm.exception.code, "bad_mention")
 
     def test_malformed_tokens_ignored(self):
-        self.assertEqual(parse_mentions("<@abc> <@> <@ 5> <#5>"), [])
+        self.assertEqual(parse_mentions("<@abc> <@> <@ 5> <#5> <@٥٥>"), [])
 
 
 class SendLimiterTests(unittest.TestCase):

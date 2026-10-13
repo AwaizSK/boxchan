@@ -130,10 +130,18 @@ function segmentText(text, tags) {
   const by = new Map();
   for (const t of list) if (!by.has('@' + t.label)) by.set('@' + t.label, t);
   const alt = Array.from(by.keys()).map((k) => k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
-  const re = new RegExp('(?<![\\p{L}\\p{N}_])(?:' + alt + ')(?![\\p{L}\\p{N}_])', 'gu');
+  let re, useFallback = false;
+  try {
+    re = new RegExp('(?<![\\p{L}\\p{N}_])(?:' + alt + ')(?![\\p{L}\\p{N}_])', 'gu');
+  } catch (e) {
+    useFallback = true;
+    re = new RegExp('(?:' + alt + ')(?![\\p{L}\\p{N}_])', 'gu');
+  }
+  const isWord = (c) => /[\p{L}\p{N}_]/u.test(c);
   const out = [];
   let last = 0, m;
   while ((m = re.exec(text))) {
+    if (useFallback && m.index > 0 && isWord(text[m.index - 1])) continue;
     if (m.index > last) out.push({ text: text.slice(last, m.index), tag: null });
     out.push({ text: m[0], tag: by.get(m[0]) });
     last = m.index + m[0].length;
@@ -510,11 +518,11 @@ if (typeof document !== 'undefined') (function () {
     renderVoice();
   }
 
-  function mergeVoiceSummary(v) {
+  function mergeVoiceSummary(v, fromSse) {
     if (!v) return;
     V().current = v.current == null ? null : v.current;
     V().configured = v.configured == null ? null : v.configured;
-    V().loading = !!v.loading;
+    if (fromSse || S.conn !== 'live') V().loading = !!v.loading;
     renderVoice();
   }
 
@@ -525,7 +533,7 @@ if (typeof document !== 'undefined') (function () {
     try {
       const d = await api('GET', '/api/voices');
       V().list = d.voices || [];
-      mergeVoiceSummary(d);
+      mergeVoiceSummary(d, false);
       if (manual) toast('Found ' + V().list.length + ' voice' + (V().list.length === 1 ? '' : 's'));
     } catch (e) {
       if (!e.denied) toast('Could not load voices: ' + friendly(e), { error: true });
@@ -662,12 +670,29 @@ if (typeof document !== 'undefined') (function () {
     if (!text.trim()) pv.appendChild(el('span', 'muted', 'Nothing to send yet'));
     else for (const seg of segmentText(text, M.tags)) {
       if (seg.tag) pv.appendChild(el('span', 'tag', seg.text));
-      else pv.appendChild(document.createTextNode(seg.text));
+      else {
+        const parts = seg.text.split(/(<@!?[0-9]{1,20}>)/g);
+        for (const p of parts) {
+          if (p.startsWith('<@') && p.endsWith('>')) pv.appendChild(el('span', 'tag', p));
+          else if (p) pv.appendChild(document.createTextNode(p));
+        }
+      }
     }
-    const names = M.tags.filter((t) => act.has(t.id)).map((t) => t.label);
+    const tagById = new Map(M.tags.map((t) => [t.id, t.label]));
+    const pingNames = [];
+    const seenPing = new Set();
+    const mentionRe = /<@!?([0-9]{1,20})>/g;
+    let pm;
+    while ((pm = mentionRe.exec(content))) {
+      const pid = pm[1];
+      if (!seenPing.has(pid)) {
+        seenPing.add(pid);
+        pingNames.push(tagById.get(pid) || ('user ' + pid));
+      }
+    }
     const live = S.conn === 'live' && !!S.cfg;
     const why = messageBlocker(live, hasChannel(), content, M.busy || M.cool);
-    $('m-ping').textContent = pingSummary(names);
+    $('m-ping').textContent = pingSummary(pingNames);
     $('m-why').textContent = M.busy || M.cool ? '' : why;
     $('m-send').disabled = !!why;
     $('m-search').disabled = !hasChannel();
@@ -842,7 +867,7 @@ if (typeof document !== 'undefined') (function () {
     try { d = JSON.parse(raw); } catch (e) { return; }
     if (name === 'hello') {
       applyState({ config: d.snapshot, guilds: d.guilds }, true);
-      mergeVoiceSummary(d.voices);
+      mergeVoiceSummary(d.voices, true);
     } else if (name === 'config') {
       const ch = d.change || {};
       applySnapshot(d.snapshot, false);

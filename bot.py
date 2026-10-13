@@ -511,7 +511,7 @@ class Controller:
                         self._publish_voice(False, err)
                 raise
 
-    def say(self, guild_id: int, text: str) -> dict:
+    def say(self, guild_id: int, text: str, editor: str = "") -> dict:
         """Queue a test phrase on this guild's normal audio path. Raises SayError."""
         cleaned = clean_plain_text(text, SAY_MAX_CHARS)
         if not cleaned:
@@ -527,6 +527,7 @@ class Controller:
             ga.queue.put_nowait(cleaned)
         except asyncio.QueueFull:
             raise SayError("queue_full") from None
+        log.info("gui test phrase queued guild=%s editor=%s chars=%d", guild_id, editor, len(cleaned))
         return {"queued": True}
 
     # --- messages (Messages tab) ---
@@ -558,7 +559,12 @@ class Controller:
                  if not needle or any(n and needle in n.casefold() for n in names(m))]
         cands.sort(key=lambda m: (bool(m.bot), m.display_name.casefold(), m.id))
         out, truncated = [], False
-        for m in cands:  # permission check last and lazily: cheap for big guilds
+        for idx, m in enumerate(cands):
+            if idx > 0 and idx % 250 == 0:
+                await asyncio.sleep(0)
+            if idx >= 5000:
+                truncated = True
+                break
             if not ch.permissions_for(m).view_channel:
                 continue
             if len(out) == 25:
@@ -578,7 +584,7 @@ class Controller:
             member = guild.get_member(uid)
             if member is None or not ch.permissions_for(member).view_channel:
                 raise MessageError("bad_mention")
-        if not ch.permissions_for(guild.me).send_messages:
+        if guild.me is None or not ch.permissions_for(guild.me).send_messages:
             raise MessageError("missing_permission")
         allowed = discord.AllowedMentions(everyone=False, roles=False, replied_user=False,
                                           users=[discord.Object(id=i) for i in ids])
@@ -586,6 +592,7 @@ class Controller:
         try:
             msg = await ch.send(content, allowed_mentions=allowed)
         except discord.Forbidden:
+            log.warning("gui message forbidden guild=%s channel=%s editor=%s", guild_id, ch.id, editor)
             raise MessageError("missing_permission") from None
         except discord.HTTPException as e:
             log.warning("gui message failed guild=%s channel=%s status=%s", guild_id, ch.id, getattr(e, "status", "?"))

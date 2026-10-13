@@ -27,7 +27,7 @@ every decision: `docs/ARCHITECTURE.md` (read it before non-trivial changes).
 ```
 ~/miniconda3/envs/tts-bot/bin/python -m unittest discover -s tests -v   # unittest, no pytest
 bash tests/test_deploy_validation.sh                                    # deploy validator
-~/miniconda3/envs/tts-bot/bin/python -m py_compile bot.py webui.py config_store.py tts_engine.py
+~/miniconda3/envs/tts-bot/bin/python -m py_compile bot.py webui.py config_store.py tts_engine.py voices.py messages.py
 ~/miniconda3/envs/tts-bot/bin/python bot.py                             # dev run (needs your own dev token)
 ```
 No live Discord/GPU/browser tests exist; say so rather than claiming they passed.

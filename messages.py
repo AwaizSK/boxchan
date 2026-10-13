@@ -10,8 +10,8 @@ RATE_PER_WINDOW = 10    # sends per rolling window, per guild
 RATE_WINDOW = 60.0      # seconds
 RATE_MIN_GAP = 2.0      # minimum seconds between two sends, per guild
 
-USER_MENTION_RE = re.compile(r"<@!?(\d{1,20})>")
-ROLE_MENTION_RE = re.compile(r"<@&\d+>")
+USER_MENTION_RE = re.compile(r"<@!?([0-9]{1,20})>")
+ROLE_MENTION_RE = re.compile(r"<@&[0-9]+>")
 
 
 class MessageError(Exception):

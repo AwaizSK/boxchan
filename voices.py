@@ -54,8 +54,11 @@ def _read_config(path: str) -> dict | None:
 def _entry(models_dir: str, stem: str) -> dict | None:
     onnx = os.path.join(models_dir, stem + ".onnx")
     cfg_path = onnx + ".json"
-    if not os.path.isfile(cfg_path):
-        log.debug("voice %s has no config json; skipped", stem)
+    if os.path.islink(onnx) or os.path.islink(cfg_path):
+        log.debug("voice %s is a symlink; skipped", stem)
+        return None
+    if not os.path.isfile(cfg_path) or not os.path.isfile(onnx):
+        log.debug("voice %s has missing files; skipped", stem)
         return None
     cfg = _read_config(cfg_path)
     if cfg is None:
@@ -103,7 +106,8 @@ def discover_voices(models_dir) -> list[dict]:
         if not valid_name(stem):
             log.debug("skipping voice with unsafe file name")
             continue
-        if not os.path.isfile(os.path.join(models_dir, fname)):
+        target_path = os.path.join(models_dir, fname)
+        if os.path.islink(target_path) or not os.path.isfile(target_path):
             continue
         try:
             entry = _entry(models_dir, stem)

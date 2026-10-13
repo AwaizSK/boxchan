@@ -393,9 +393,16 @@ def make_app(config, controller, *, allowed_hosts, status_interval: float = 3.0,
                 return _err("bad_request", 400)
             if VOICE_NAME_RE.fullmatch(name) is None:
                 return _err("bad_voice", 400)
+        task = asyncio.create_task(controller.apply_voice(name, body.get("rev"), editor))
+        def _log_apply_voice_err(fut):
+            if not fut.cancelled() and fut.exception() and not isinstance(
+                fut.exception(), (ConflictError, BadVoiceError, VoiceLoadError, OSError)
+            ):
+                log.exception("apply_voice failed after client disconnect", exc_info=fut.exception())
+        task.add_done_callback(_log_apply_voice_err)
         try:
             # shield: a client disconnect must not cancel a half-finished engine swap
-            snap = await asyncio.shield(controller.apply_voice(name, body.get("rev"), editor))
+            snap = await asyncio.shield(task)
         except ConflictError as e:
             return _json({"error": "conflict", "snapshot": wire_snapshot(e.snapshot)}, 409)
         except BadVoiceError:
@@ -415,7 +422,7 @@ def make_app(config, controller, *, allowed_hosts, status_interval: float = 3.0,
 
     async def say(request):
         gid = known_guild(request)
-        editor_of(request)
+        editor = editor_of(request)
         body = await body_of(request)
         text = body.get("text")
         if not isinstance(text, str) or not text.strip():
@@ -423,7 +430,10 @@ def make_app(config, controller, *, allowed_hosts, status_interval: float = 3.0,
         if len(text) > MAX_SAY_CHARS:
             return _err("too_long", 400)
         try:
-            return _json(controller.say(gid, text))
+            try:
+                return _json(controller.say(gid, text, editor=editor))
+            except TypeError:
+                return _json(controller.say(gid, text))
         except SayError as e:
             if e.code == "bad_text":
                 return _err("bad_request", 400)
@@ -458,9 +468,14 @@ def make_app(config, controller, *, allowed_hosts, status_interval: float = 3.0,
         content = body.get("content")
         if not isinstance(content, str) or not 1 <= len(content.strip()) <= MAX_MESSAGE_CHARS:
             return _err("bad_request", 400)
+        task = asyncio.create_task(controller.send_message(gid, content, editor))
+        def _log_send_err(fut):
+            if not fut.cancelled() and fut.exception() and not isinstance(fut.exception(), MessageError):
+                log.exception("send_message failed after client disconnect", exc_info=fut.exception())
+        task.add_done_callback(_log_send_err)
         try:
             # shield: a client disconnect must not cancel the send (nor invite a retry-duplicate)
-            return _json(await asyncio.shield(controller.send_message(gid, content, editor)))
+            return _json(await asyncio.shield(task))
         except MessageError as e:
             return message_error(e)
         except Exception:

@@ -144,18 +144,18 @@ class TTSEngine:
 
     def load(self, model_path=None, config_path=None) -> bool:
         """Never raises. False (logged) if model cannot load. Optional paths replace the configured ones."""
-        if model_path is not None:
-            self.model_path = Path(model_path)
-            self.config_path = Path(config_path) if config_path else Path(str(model_path) + ".json")
-        for p in (self.model_path, self.config_path):
+        target_model = Path(model_path) if model_path is not None else self.model_path
+        target_config = (Path(config_path) if config_path else Path(str(target_model) + ".json")) if model_path is not None else self.config_path
+        for p in (target_model, target_config):
             if not p.is_file():
                 log.error("Model file missing: %s", p)
                 return False
         try:
-            voice, cuda = self._build(self.model_path, self.config_path)
+            voice, cuda = self._build(target_model, target_config)
         except Exception:
             log.exception("model load failed")
             return False
+        self.model_path, self.config_path = target_model, target_config
         self.voice, self.cuda_active = voice, cuda
         self.sample_rate = voice.config.sample_rate
         self.ready = True
@@ -183,10 +183,12 @@ class TTSEngine:
         except Exception as e:
             log.exception("voice reload failed; keeping the current voice")
             raise VoiceLoadError() from e
+        if self.cuda_active and not cuda:
+            log.warning("Voice swapped with CPU fallback (CUDA init failed for %s); performance may be degraded", model_path.name)
         old = self.voice
         # Single step on the only inference thread: no synthesis can observe a half-swapped engine.
-        self.voice, self.sample_rate, self.cuda_active = voice, rate, cuda
-        self.model_path, self.config_path, self.ready = model_path, config_path, True
+        self.model_path, self.config_path = model_path, config_path
+        self.voice, self.sample_rate, self.cuda_active, self.ready = voice, rate, cuda, True
         del old
         gc.collect()  # drop the old ORT session now so its (GPU) memory is released
         log.info("Piper voice swapped (model=%s, cuda=%s, rate=%d)", self.model_name, cuda, rate)
