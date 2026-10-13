@@ -1,7 +1,7 @@
 const assert = require('assert');
 const { shouldApplySnapshot, normalizeEditor, shouldRollback, createSSEParser, matchChannel, relTime, backoffDelay, groupChannels,
   voiceTitle, voiceWarning, sayBlocker, voiceSwitchText, mergeVoiceSummary,
-  segmentText, substituteTags, activeTagIds, uniqueLabel, insertAtCursor, counterText, counterState, shouldApplyMembers, resetMemberCache, pingTargets, pingSummary, chipText, messageBlocker,
+  segmentText, substituteTags, activeTagIds, uniqueLabel, insertAtCursor, counterText, counterState, shouldApplyMembers, resetMemberCache, tokenizeMentions, MENTION_SRC, pingTargets, pingSummary, chipText, messageBlocker,
   cpLen, READY_PRESET } = require('../static/app.js');
 
 const got = [];
@@ -197,3 +197,21 @@ assert.strictEqual(shouldApplyMembers('gid1', 'gid1', 2, 1), false);
   assert.strictEqual(mergeVoiceSummary(prev, null, { seqAtRequest: 1, seqNow: 1, live: true }), prev);
 }
 console.log('ok');
+
+// tokenizeMentions (shared by the preview and pingTargets) and the single mention source
+const idsOf = (t) => tokenizeMentions(t).filter((p) => p.id !== null).map((p) => p.id);
+const pingIds = (t) => pingTargets(t, []).map((x) => x.id);
+// preview split and pingTargets agree on which tokens count (pingTargets also dedupes)
+for (const t of ['<@5> <@!6>', '<@12345678901234567890>', '<@123456789012345678901>', '<@!123456789012345678901>', '<@5', '<@!5>', '<@5><@6>', 'x<@5>y<@5>', '<@abc>', '<@&5>', '']) {
+  assert.deepStrictEqual(pingIds(t), [...new Set(idsOf(t))], t);
+}
+assert.deepStrictEqual(idsOf('<@12345678901234567890>'), ['12345678901234567890']);   // 20 digits match
+assert.deepStrictEqual(idsOf('<@123456789012345678901>'), []);                        // 21 digits do not
+assert.deepStrictEqual(idsOf('<@!7>'), ['7']);
+assert.deepStrictEqual(idsOf('<@7'), []);
+assert.deepStrictEqual(tokenizeMentions('hi <@5>!'), [{ text: 'hi ', id: null }, { text: '<@5>', id: '5' }, { text: '!', id: null }]);
+assert.deepStrictEqual(tokenizeMentions(''), []);
+assert.deepStrictEqual(tokenizeMentions('<@5><@!6>'), [{ text: '<@5>', id: '5' }, { text: '<@!6>', id: '6' }]);
+assert.strictEqual(MENTION_SRC, '<@!?([0-9]{1,20})>');
+assert.strictEqual(tokenizeMentions('<@5> <@5>').map((p) => p.text).join(''), '<@5> <@5>');  // no shared regex state across calls
+

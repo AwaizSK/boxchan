@@ -120,6 +120,28 @@ const MSG_MAX = 2000;
 const READY_PRESET = "The voice bot is ready to use! Join a voice channel, type !join here, and I'll read watched users' messages aloud.";
 const cpLen = (s) => Array.from(String(s)).length;
 
+// The one definition of a user-mention token: <@id> or <@!id>, id = 1-20 digits. Both the preview
+// split and pingTargets build their regexes from it so they can never disagree. Fresh global
+// regexes per call (no shared lastIndex state).
+const MENTION_SRC = '<@!?([0-9]{1,20})>';
+const mentionRe = () => new RegExp(MENTION_SRC, 'g');
+
+// Split text into [{ text, id }]: id is the user id string for a mention token, null for plain text.
+function tokenizeMentions(text) {
+  text = String(text);
+  const out = [];
+  const re = mentionRe();
+  let last = 0;
+  let m;
+  while ((m = re.exec(text))) {
+    if (m.index > last) out.push({ text: text.slice(last, m.index), id: null });
+    out.push({ text: m[0], id: m[1] });
+    last = m.index + m[0].length;
+  }
+  if (last < text.length) out.push({ text: text.slice(last), id: null });
+  return out;
+}
+
 // Split text into plain and tagged parts. Only the exact "@label" of a tagged chip matches
 // (longest label first, single pass, not glued to word characters); nothing is ever guessed.
 // There is no lookbehind (Safari < 16.4): the character before a match is checked by hand,
@@ -206,15 +228,12 @@ function pingTargets(finalText, chips) {
   const byId = new Map((chips || []).map((chip) => [chip.id, chip]));
   const targets = [];
   const seen = new Set();
-  const re = /<@!?([0-9]{1,20})>/g;
-  let m;
-  while ((m = re.exec(finalText))) {
-    const id = m[1];
-    if (seen.has(id)) continue;
-    seen.add(id);
-    const chip = byId.get(id);
+  for (const part of tokenizeMentions(finalText)) {
+    if (part.id === null || seen.has(part.id)) continue;
+    seen.add(part.id);
+    const chip = byId.get(part.id);
     targets.push({
-      id: id,
+      id: part.id,
       label: chip ? chip.label : null,
       username: chip ? chip.username : null,
       known: !!chip,
@@ -269,7 +288,7 @@ function mergeVoiceSummary(prev, incoming, { seqAtRequest, seqNow, live }) {
 if (typeof module !== 'undefined') {
   module.exports = { shouldApplySnapshot, normalizeEditor, shouldRollback, createSSEParser, matchChannel, relTime, backoffDelay, groupChannels,
     voiceTitle, voiceWarning, sayBlocker, voiceSwitchText, mergeVoiceSummary,
-    segmentText, substituteTags, activeTagIds, uniqueLabel, insertAtCursor, counterText, counterState, shouldApplyMembers, resetMemberCache, pingTargets, pingSummary, chipText, messageBlocker, cpLen, MSG_MAX, READY_PRESET };
+    segmentText, substituteTags, activeTagIds, uniqueLabel, insertAtCursor, counterText, counterState, shouldApplyMembers, resetMemberCache, tokenizeMentions, MENTION_SRC, pingTargets, pingSummary, chipText, messageBlocker, cpLen, MSG_MAX, READY_PRESET };
 }
 
 /* ---------- app ---------- */
@@ -759,10 +778,9 @@ if (typeof document !== 'undefined') (function () {
     else for (const seg of segmentText(text, M.tags)) {
       if (seg.tag) pv.appendChild(el('span', 'tag', seg.text));
       else {
-        const parts = seg.text.split(/(<@!?[0-9]{1,20}>)/);
-        for (const p of parts) {
-          if (p.startsWith('<@') && p.endsWith('>')) pv.appendChild(el('span', 'tag', p));
-          else if (p) pv.appendChild(document.createTextNode(p));
+        for (const part of tokenizeMentions(seg.text)) {
+          if (part.id !== null) pv.appendChild(el('span', 'tag', part.text));
+          else pv.appendChild(document.createTextNode(part.text));
         }
       }
     }
