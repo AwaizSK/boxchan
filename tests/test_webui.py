@@ -30,6 +30,8 @@ class FakeController:
                             "language": "en-us", "size_mb": 60.5}]
         self.apply_calls, self.apply_exc, self.apply_gate, self.apply_result = [], None, None, None
         self.say_calls, self.say_exc = [], None
+        self.members_calls, self.members_result, self.members_exc = [], {"members": [], "truncated": False}, None
+        self.send_calls, self.send_exc, self.send_gate = [], None, None
 
     def voice_summary(self):
         return dict(self.voice)
@@ -44,6 +46,20 @@ class FakeController:
         if self.apply_exc is not None:
             raise self.apply_exc
         return self.apply_result or {"rev": 1, "updated_by": editor, "updated_at": 1.0, "voice": name, "guilds": {}}
+
+    async def members_for(self, gid, q):
+        self.members_calls.append((gid, q))
+        if self.members_exc is not None:
+            raise self.members_exc
+        return self.members_result
+
+    async def send_message(self, gid, content, editor):
+        self.send_calls.append((gid, content, editor))
+        if self.send_gate is not None:
+            await self.send_gate.wait()
+        if self.send_exc is not None:
+            raise self.send_exc
+        return {"ok": True, "message_id": "123456789012345678"}
 
     def say(self, gid, text):
         self.say_calls.append((gid, text))
@@ -238,7 +254,7 @@ class WriteTests(Base):
         self.assertEqual(r.status, 404)
         r = await self.put_channel({"channel_id": "10", "rev": None}, gid="x")
         self.assertEqual(r.status, 404)
-        r = await self.client.put("/api/guilds/1/channel", data=b"x" * 5000, headers=ED)
+        r = await self.client.put("/api/guilds/1/channel", data=b"x" * 17000, headers=ED)
         self.assertEqual(r.status, 413)
 
     async def test_skip_clear(self):

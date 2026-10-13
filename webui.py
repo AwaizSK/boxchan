@@ -16,11 +16,12 @@ from urllib.parse import unquote, urlsplit
 from aiohttp import web
 
 from config_store import ConflictError
+from messages import MAX_MESSAGE_CHARS, MessageError
 from voices import VOICE_NAME_RE, BadVoiceError, SayError, VoiceLoadError
 
 log = logging.getLogger("webui")
 
-MAX_BODY = 4096
+MAX_BODY = 16384  # 2000 non-ASCII chars JSON-escaped (\uXXXX) are ~12 KB
 MAX_SAY_CHARS = 200
 RETRY_INTERVAL = 15.0
 ALLOWED_HOSTS_KEY = web.AppKey("allowed_hosts", set)
@@ -428,6 +429,44 @@ def make_app(config, controller, *, allowed_hosts, status_interval: float = 3.0,
                 return _err("bad_request", 400)
             return _err(e.code, 409)
 
+    MESSAGE_STATUS = {"bad_request": 400, "bad_mention": 400, "missing_permission": 403, "no_channel": 409,
+                      "rate_limited": 429, "discord_error": 502}
+
+    def message_error(e):
+        status = MESSAGE_STATUS.get(e.code)
+        if status is None:
+            return _err("internal", 500)
+        if e.code == "rate_limited":
+            return _json({"error": "rate_limited", "retry_after": int(e.retry_after or 1)}, 429)
+        return _err(e.code, status)
+
+    async def members(request):
+        gid = known_guild(request)
+        q = request.query.get("q", "")[:100]
+        try:
+            return _json(await controller.members_for(gid, q))
+        except MessageError as e:
+            return message_error(e)
+        except Exception:
+            log.exception("member lookup failed")
+            return _err("internal", 500)
+
+    async def send_message(request):
+        gid = known_guild(request)
+        editor = editor_of(request)
+        body = await body_of(request)
+        content = body.get("content")
+        if not isinstance(content, str) or not 1 <= len(content.strip()) <= MAX_MESSAGE_CHARS:
+            return _err("bad_request", 400)
+        try:
+            # shield: a client disconnect must not cancel the send (nor invite a retry-duplicate)
+            return _json(await asyncio.shield(controller.send_message(gid, content, editor)))
+        except MessageError as e:
+            return message_error(e)
+        except Exception:
+            log.exception("message send failed")
+            return _err("internal", 500)
+
     # --- API ---
     async def state(request):
         return _json({"config": wire_snapshot(config.snapshot()), "guilds": controller.guilds_view()})
@@ -529,6 +568,8 @@ def make_app(config, controller, *, allowed_hosts, status_interval: float = 3.0,
     app.router.add_get("/api/voices", list_voices)
     app.router.add_put("/api/voice", apply_voice)
     app.router.add_post("/api/guilds/{gid}/say", say)
+    app.router.add_get("/api/guilds/{gid}/members", members)
+    app.router.add_post("/api/guilds/{gid}/send", send_message)
     app.router.add_get("/api/events", events)
     return app
 

@@ -11,6 +11,7 @@ from discord.ext import commands
 from dotenv import load_dotenv
 
 from config_store import ConfigStore, ConflictError, atomic_write_json
+from messages import MAX_MESSAGE_CHARS, MessageError, SendLimiter, parse_mentions
 from tts_engine import TTSEngine, clean_discord_text, clean_plain_text
 from voices import BadVoiceError, SayError, VoiceLoadError, discover_voices, resolve_voice
 from webui import (detect_tailscale_addrs, make_app, parse_allowed_hosts, start_webui,
@@ -453,8 +454,10 @@ class Controller:
     """The only surface the web UI touches. Methods are non-blocking; call from the event loop
     (the voice methods are async because they scan disk / reload the engine off-loop)."""
 
-    def __init__(self):
+    def __init__(self, limiter: SendLimiter | None = None):
         self._voice_lock = asyncio.Lock()  # one swap at a time (engine.reload also serializes, this orders the whole flow)
+        self._limiter = limiter or SendLimiter()   # GUI message sends, per guild
+        self._chunk_lock = asyncio.Lock()          # one member-cache fill at a time
 
     def voice_summary(self) -> dict:
         return {"current": engine.model_name if engine.ready else None,
@@ -525,6 +528,71 @@ class Controller:
         except asyncio.QueueFull:
             raise SayError("queue_full") from None
         return {"queued": True}
+
+    # --- messages (Messages tab) ---
+    def _message_channel(self, guild_id: int):
+        """(guild, configured TextChannel) or MessageError('no_channel'). Never a caller-chosen channel."""
+        guild = bot.get_guild(guild_id)
+        cid = config.channel_for(guild_id)
+        ch = guild.get_channel(cid) if guild is not None and cid else None
+        if not isinstance(ch, discord.TextChannel):
+            raise MessageError("no_channel")
+        return guild, ch
+
+    async def members_for(self, guild_id: int, q: str = "") -> dict:
+        """Members who can view the configured channel, for the tag picker (max 25)."""
+        guild, ch = self._message_channel(guild_id)
+        if not guild.chunked:
+            async with self._chunk_lock:
+                if not guild.chunked:
+                    try:
+                        await asyncio.wait_for(guild.chunk(), timeout=10)
+                    except Exception as e:  # timeout / gateway error: serve what is cached
+                        log.warning("member chunk failed for guild %s (%s); using cache", guild_id, type(e).__name__)
+        needle = (q or "").strip().casefold()
+
+        def names(m):
+            return (m.display_name, m.name, getattr(m, "global_name", None))
+
+        cands = [m for m in guild.members
+                 if not needle or any(n and needle in n.casefold() for n in names(m))]
+        cands.sort(key=lambda m: (bool(m.bot), m.display_name.casefold(), m.id))
+        out, truncated = [], False
+        for m in cands:  # permission check last and lazily: cheap for big guilds
+            if not ch.permissions_for(m).view_channel:
+                continue
+            if len(out) == 25:
+                truncated = True
+                break
+            out.append({"id": str(m.id), "name": m.display_name, "username": m.name, "bot": bool(m.bot)})
+        return {"members": out, "truncated": truncated}
+
+    async def send_message(self, guild_id: int, content: str, editor: str) -> dict:
+        """Post `content` as the bot in the guild's configured channel. Raises MessageError."""
+        content = content.strip() if isinstance(content, str) else ""
+        if not 1 <= len(content) <= MAX_MESSAGE_CHARS:
+            raise MessageError("bad_request")
+        guild, ch = self._message_channel(guild_id)
+        ids = parse_mentions(content)  # role tokens -> bad_mention
+        for uid in ids:
+            member = guild.get_member(uid)
+            if member is None or not ch.permissions_for(member).view_channel:
+                raise MessageError("bad_mention")
+        if not ch.permissions_for(guild.me).send_messages:
+            raise MessageError("missing_permission")
+        allowed = discord.AllowedMentions(everyone=False, roles=False, replied_user=False,
+                                          users=[discord.Object(id=i) for i in ids])
+        self._limiter.reserve(guild_id)  # bookkeeping BEFORE the await (cancel/duplicate safe)
+        try:
+            msg = await ch.send(content, allowed_mentions=allowed)
+        except discord.Forbidden:
+            raise MessageError("missing_permission") from None
+        except discord.HTTPException as e:
+            log.warning("gui message failed guild=%s channel=%s status=%s", guild_id, ch.id, getattr(e, "status", "?"))
+            raise MessageError("discord_error") from None
+        log.info("gui message sent guild=%s channel=%s editor=%s chars=%d mentions=%d",
+                 guild_id, ch.id, editor, len(content), len(ids))
+        return {"ok": True, "message_id": str(msg.id)}
 
     def guilds_view(self) -> list[dict]:
         return [{
