@@ -288,6 +288,87 @@ class ReloadTests(EngineBase):
         self.assertEqual(self.engine._pool._max_workers, 1)
 
 
+class StateAtomicityTests(EngineBase):
+    FIELDS = ("voice", "sample_rate", "model_path", "config_path", "cuda_active")
+
+    async def test_successful_reload_changes_all_fields_together(self):
+        self.load_a()
+        before = self.engine.state
+        self.assertEqual(self.engine.model_name, "a")
+        self.piper.plan["b"] = {"rate": 16000}
+        with self.assertLogs("tts_engine", "INFO"):
+            await self.engine.reload(self.p("b"), self.p("b") + ".json")
+        after = self.engine.state
+        self.assertIsNot(after, before)
+        self.assertEqual((after.voice.tag, after.sample_rate, after.cuda_active), ("b", 16000, True))
+        self.assertEqual((str(after.model_path), str(after.config_path)), (self.p("b"), self.p("b") + ".json"))
+        # Legacy properties read the very same snapshot.
+        for f in self.FIELDS:
+            self.assertIs(getattr(self.engine, f), getattr(after, f), f)
+        self.assertEqual(self.engine.model_name, "b")
+        # The old snapshot object is immutable and still self-consistent.
+        self.assertEqual((before.voice.tag, before.sample_rate, before.model_path.stem), ("a", 22050, "a"))
+        with self.assertRaises(Exception):
+            after.sample_rate = 1
+
+    async def test_snapshot_never_mixes_old_and_new_during_swap(self):
+        self.load_a()
+        self.piper.plan["b"] = {"rate": 16000}
+        seen = []
+        orig = self.piper.load
+
+        def load(model_path, config_path=None, use_cuda=False):
+            st = self.engine.state  # read while the candidate is being built
+            seen.append((st.voice.tag, st.sample_rate, st.model_path.stem))
+            return orig(model_path, config_path=config_path, use_cuda=use_cuda)
+
+        self.piper.load = load
+        with self.assertLogs("tts_engine", "INFO"):
+            await self.engine.reload(self.p("b"), self.p("b") + ".json")
+        self.assertTrue(seen)
+        self.assertTrue(all(s == ("a", 22050, "a") for s in seen), seen)
+
+    async def test_failed_reload_leaves_state_untouched(self):
+        self.load_a()
+        before = self.engine.state
+        self.piper.plan["b"] = {"load_fails": True}
+        with self.assertLogs("tts_engine", "ERROR"), self.assertRaises(VoiceLoadError):
+            await self.engine.reload(self.p("b"), self.p("b") + ".json")
+        self.assertIs(self.engine.state, before)
+        self.assertEqual(self.engine.model_name, "a")
+
+    def test_failed_load_leaves_previous_paths_and_state_untouched(self):
+        self.load_a()
+        before = self.engine.state
+        self.piper.plan["b"] = {"load_fails": True}
+        with self.assertLogs("tts_engine", "ERROR"):
+            self.assertFalse(self.engine.load(self.p("b"), self.p("b") + ".json"))
+        self.assertIs(self.engine.state, before)
+        self.assertEqual((self.engine.model_path, self.engine.config_path), (before.model_path, before.config_path))
+        self.assertEqual(self.engine.model_name, "a")
+        self.assertTrue(self.engine.ready)
+
+    def test_failed_load_missing_file_leaves_configured_paths(self):
+        before = self.engine.state
+        with self.assertLogs("tts_engine", "ERROR"):
+            self.assertFalse(self.engine.load(os.path.join(self.tmp.name, "zz.onnx")))
+        self.assertIs(self.engine.state, before)
+        self.assertEqual(self.engine.model_name, "a")
+
+    async def test_refused_gpu_to_cpu_swap_leaves_every_field_untouched(self):
+        self.load_a()
+        before = self.engine.state
+        legacy_before = tuple(getattr(self.engine, f) for f in self.FIELDS) + (self.engine.model_name,)
+        self.piper.plan["b"] = {"cuda_fails": True, "rate": 16000}
+        with self.assertLogs("tts_engine", "WARNING"), self.assertRaises(VoiceLoadError):
+            await self.engine.reload(self.p("b"), self.p("b") + ".json")
+        self.assertIs(self.engine.state, before)
+        legacy_after = tuple(getattr(self.engine, f) for f in self.FIELDS) + (self.engine.model_name,)
+        self.assertEqual(legacy_after, legacy_before)
+        self.assertEqual((self.engine.sample_rate, self.engine.cuda_active), (22050, True))
+        self.assertIn(("b", False), self.piper.calls)  # the CPU candidate really was built, then refused
+
+
 class CleanPlainTextTests(unittest.TestCase):
     def test_basic_pipeline(self):
         self.assertEqual(clean_plain_text("Hello!  See https://x.io  **now**"), "Hello! See link now")

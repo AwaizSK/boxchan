@@ -107,6 +107,11 @@ class TTSEngine:
         self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="piper")
         self._lock: asyncio.Lock | None = None
 
+    @property
+    def state(self) -> VoiceState:
+        """One consistent snapshot; read it once instead of several properties when fields must agree."""
+        return self._state
+
     # Backwards-compatible properties for existing code and tests
     @property
     def voice(self):
