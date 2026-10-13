@@ -5,6 +5,7 @@ import os
 import re
 import signal
 import sys
+import time
 
 import discord
 from discord.ext import commands
@@ -454,10 +455,13 @@ class Controller:
     """The only surface the web UI touches. Methods are non-blocking; call from the event loop
     (the voice methods are async because they scan disk / reload the engine off-loop)."""
 
-    def __init__(self, limiter: SendLimiter | None = None):
+    def __init__(self, limiter: SendLimiter | None = None, clock=None):
         self._voice_lock = asyncio.Lock()  # one swap at a time (engine.reload also serializes, this orders the whole flow)
         self._limiter = limiter or SendLimiter()   # GUI message sends, per guild
         self._chunk_lock = asyncio.Lock()          # one member-cache fill at a time
+        self._clock = clock or time.monotonic      # For chunk timeout cache
+        self._chunk_failures: dict[int, float] = {}  # guild_id -> timestamp of failure
+        self._chunk_timeout_window = 60.0  # Seconds to skip chunk() retry after failure
 
     def voice_summary(self) -> dict:
         return {"current": engine.model_name if engine.ready else None,
@@ -552,10 +556,15 @@ class Controller:
         if not guild.chunked:
             async with self._chunk_lock:
                 if not guild.chunked:
-                    try:
-                        await asyncio.wait_for(guild.chunk(), timeout=10)
-                    except Exception as e:  # timeout / gateway error: serve what is cached
-                        log.warning("member chunk failed for guild %s (%s); using cache", guild_id, type(e).__name__)
+                    # Skip retry if chunk failed recently (within timeout window)
+                    now = self._clock()
+                    failed_at = self._chunk_failures.get(guild_id)
+                    if failed_at is None or now - failed_at >= self._chunk_timeout_window:
+                        try:
+                            await asyncio.wait_for(guild.chunk(), timeout=10)
+                        except Exception as e:  # timeout / gateway error: serve what is cached
+                            log.warning("member chunk failed for guild %s (%s); using cache", guild_id, type(e).__name__)
+                            self._chunk_failures[guild_id] = now
         needle = (q or "").strip().casefold()
 
         def names(m):

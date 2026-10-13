@@ -348,6 +348,113 @@ class MembersForTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["members"], [])
         self.assertFalse(result["truncated"])
 
+    async def test_chunk_timeout_cache_concurrent_calls(self):
+        """Two simultaneous searches on unchunked guild call chunk() exactly once."""
+        ch = mock.MagicMock(spec=discord.TextChannel)
+        ch.id = 100
+
+        members = []
+        for i in range(10):
+            m = mock.MagicMock(spec=discord.Member)
+            m.id = i
+            m.bot = False
+            m.display_name = f"member_{i:04d}"
+            m.name = f"user{i}"
+            m.global_name = None
+            members.append(m)
+
+        def perm_for(member):
+            perm = mock.MagicMock()
+            perm.view_channel = True
+            return perm
+
+        chunk_event = asyncio.Event()
+        async def slow_chunk():
+            await chunk_event.wait()
+
+        guild = mock.MagicMock(spec=discord.Guild)
+        guild.id = 1
+        guild.members = members
+        guild.me = mock.MagicMock()
+        guild.chunked = False
+        guild.chunk = mock.AsyncMock(side_effect=slow_chunk)
+        guild.get_channel.return_value = ch
+        ch.permissions_for.side_effect = perm_for
+
+        with mock.patch.object(bot.bot, "get_guild", return_value=guild):
+            with mock.patch.object(bot.config, "channel_for", return_value=100):
+                # Start two searches concurrently
+                search1 = asyncio.create_task(bot.controller.members_for(1, ""))
+                search2 = asyncio.create_task(bot.controller.members_for(1, ""))
+                await asyncio.sleep(0.01)  # Let both start waiting
+
+                # Release the chunk call
+                guild.chunked = True  # Simulate chunking completed
+                chunk_event.set()
+
+                # Wait for both to complete
+                result1 = await search1
+                result2 = await search2
+
+        # chunk() should have been called exactly once due to the lock
+        self.assertEqual(guild.chunk.call_count, 1)
+
+    async def test_chunk_timeout_cache_prevents_retry_within_window(self):
+        """After timeout, second search within 60s doesn't call chunk()."""
+        from tests.test_messages import Clock
+
+        clk = Clock()
+        ch = mock.MagicMock(spec=discord.TextChannel)
+        ch.id = 100
+
+        members = []
+        for i in range(10):
+            m = mock.MagicMock(spec=discord.Member)
+            m.id = i
+            m.bot = False
+            m.display_name = f"member_{i:04d}"
+            m.name = f"user{i}"
+            m.global_name = None
+            members.append(m)
+
+        def perm_for(member):
+            perm = mock.MagicMock()
+            perm.view_channel = True
+            return perm
+
+        guild = mock.MagicMock(spec=discord.Guild)
+        guild.id = 1
+        guild.members = members
+        guild.me = mock.MagicMock()
+        guild.chunked = False
+        guild.chunk = mock.AsyncMock(side_effect=asyncio.TimeoutError("chunk timeout"))
+        guild.get_channel.return_value = ch
+        ch.permissions_for.side_effect = perm_for
+
+        # Use injected clock
+        controller = bot.Controller(clock=clk)
+
+        with mock.patch.object(bot.bot, "get_guild", return_value=guild):
+            with mock.patch.object(bot.config, "channel_for", return_value=100):
+                # First search: chunk fails
+                result1 = await controller.members_for(1, "")
+                self.assertEqual(guild.chunk.call_count, 1)
+
+                # Advance clock by 30s (still within 60s window)
+                clk.t += 30.0
+
+                # Second search: chunk should not be called again
+                result2 = await controller.members_for(1, "")
+                self.assertEqual(guild.chunk.call_count, 1)  # Still 1, not called again
+
+                # Advance clock by 31s more (now >60s from failure)
+                clk.t += 31.0
+
+                # Third search: chunk should be called again
+                guild.chunk.side_effect = asyncio.TimeoutError("another timeout")
+                result3 = await controller.members_for(1, "")
+                self.assertEqual(guild.chunk.call_count, 2)  # Now called again
+
 
 if __name__ == "__main__":
     unittest.main()
