@@ -114,4 +114,68 @@ else
   echo "FAIL staging files left behind"; fails=$((fails+1));
 fi
 
+# ---- root-owned deploy wrapper (scripts/deploy.sh sourced for its functions; main() does not run) ----
+. "$HERE/scripts/lib/install_deploy_lib.sh"
+( . "$HERE/scripts/deploy.sh" ) >/dev/null 2>&1 || { echo "FAIL deploy.sh must be source-safe"; fails=$((fails+1)); }
+. "$HERE/scripts/deploy.sh"   # defines assert_trusted_path/validate_src_dir; set -e is re-disabled below
+set +e
+ME="$(id -u)"
+tp() {  # name want(0|1) path [uid]
+  assert_trusted_path "$3" "${4:-$ME}" 2>/dev/null; local rc=$?
+  if { [ "$2" -eq 0 ] && [ $rc -eq 0 ]; } || { [ "$2" -ne 0 ] && [ $rc -ne 0 ]; }; then echo "ok   $1"
+  else echo "FAIL $1 (rc=$rc)"; fails=$((fails+1)); fi
+}
+W="$T/trust"; mkdir -p "$W"
+echo x > "$W/f755"; chmod 755 "$W/f755"; tp "trusted file 0755" 0 "$W/f755"
+echo x > "$W/f644"; chmod 644 "$W/f644"; tp "trusted file 0644" 0 "$W/f644"
+echo x > "$W/f775"; chmod 775 "$W/f775"; tp "group-writable file rejected" 1 "$W/f775"
+echo x > "$W/f664"; chmod 664 "$W/f664"; tp "group-writable 0664 rejected" 1 "$W/f664"
+echo x > "$W/f666"; chmod 666 "$W/f666"; tp "world-writable file rejected" 1 "$W/f666"
+tp "other owner rejected" 1 "$W/f644" 99999
+ln -s "$W/f644" "$W/lnk"; tp "symlink rejected" 1 "$W/lnk"
+tp "missing path rejected" 1 "$W/nope"
+tp "empty path rejected" 1 ""
+mkdir "$W/d755" "$W/d775"; chmod 755 "$W/d755"; chmod 775 "$W/d775"
+tp "trusted directory" 0 "$W/d755"; tp "group-writable directory rejected" 1 "$W/d775"
+tp "repo deploy.sh (real uid 0 expected) rejected for non-root" 1 "$HERE/scripts/deploy.sh" 0
+
+# the wrapper must refuse before doing anything when it is not root-owned (run as normal user)
+out="$(bash "$HERE/scripts/deploy.sh" 2>&1)"; rc=$?
+if [ $rc -eq 1 ] && echo "$out" | grep -q "not root-owned"; then echo "ok   repo copy of wrapper refuses to run"
+else echo "FAIL wrapper did not refuse (rc=$rc)"; fails=$((fails+1)); fi
+
+# the lib is sourced ONLY from the fixed path; no reference to the caller-chosen source dir's scripts
+if grep -qE '^[[:space:]]*\. "\$SRC/|\$SRC/scripts' "$HERE/scripts/deploy.sh"; then echo "FAIL deploy.sh sources from \$SRC"; fails=$((fails+1))
+else echo "ok   deploy.sh never sources from \$SRC"; fi
+grep -q '^[[:space:]]*\. "\$LIB/deploy_validate.sh"' "$HERE/scripts/deploy.sh" && echo "ok   deploy.sh sources fixed LIB" || { echo "FAIL deploy.sh fixed LIB source"; fails=$((fails+1)); }
+grep -q '^LIB=/usr/local/lib/tts-bot$' "$HERE/scripts/deploy.sh" && grep -q '^CONF=/etc/tts-bot/deploy-src$' "$HERE/scripts/deploy.sh" && echo "ok   deploy.sh paths hard-coded" || { echo "FAIL deploy.sh hard-coded paths"; fails=$((fails+1)); }
+
+sd() {  # name want path
+  validate_src_dir "$3" >/dev/null 2>&1; local rc=$?
+  if { [ "$2" -eq 0 ] && [ $rc -eq 0 ]; } || { [ "$2" -ne 0 ] && [ $rc -ne 0 ]; }; then echo "ok   $1"
+  else echo "FAIL $1 (rc=$rc)"; fails=$((fails+1)); fi
+}
+sd "src dir: existing absolute accepted" 0 "$T"
+sd "src dir: relative rejected" 1 "relative/dir"
+sd "src dir: missing rejected" 1 "$T/does-not-exist"
+sd "src dir: / rejected" 1 "/"
+sd "src dir: /opt/tts-bot rejected" 1 "/opt/tts-bot"
+sd "src dir: inside /opt/tts-bot rejected" 1 "/opt/tts-bot/static"
+sd "src dir: /opt/tts-bot/../tts-bot rejected" 1 "/opt/tts-bot/../tts-bot"
+sd "src dir: empty rejected" 1 ""
+ln -s /opt "$T/optlink"; ln -s / "$T/rootlink"
+sd "src dir: symlink to / rejected" 1 "$T/rootlink"
+
+# install_deploy.sh pure helpers
+[ "$(render_sudoers_line ghrunner)" = 'ghrunner ALL=(root) NOPASSWD: /usr/local/sbin/tts-bot-deploy ""' ] && echo "ok   sudoers line exact" || { echo "FAIL sudoers line"; fails=$((fails+1)); }
+for bad in root "" "a b" "x;y" Upper "$(printf 'a%.0s' $(seq 33))"; do
+  if render_sudoers_line "$bad" >/dev/null 2>&1; then echo "FAIL accepted bad user '$bad'"; fails=$((fails+1)); else echo "ok   rejects bad user '$bad'"; fi
+done
+valid_user_name "$(printf 'a%.0s' $(seq 32))" && echo "ok   32-char user accepted" || { echo "FAIL 32-char user"; fails=$((fails+1)); }
+valid_src_dir "$T" && echo "ok   install valid_src_dir accepted" || { echo "FAIL install valid_src_dir"; fails=$((fails+1)); }
+valid_src_dir "/opt/tts-bot/x" && { echo "FAIL install valid_src_dir inside app"; fails=$((fails+1)); } || echo "ok   install valid_src_dir rejects /opt/tts-bot/x"
+valid_src_dir "rel" && { echo "FAIL install valid_src_dir rel"; fails=$((fails+1)); } || echo "ok   install valid_src_dir rejects relative"
+bash -n "$HERE/scripts/install_deploy.sh" && bash -n "$HERE/scripts/deploy.sh" && echo "ok   bash -n deploy scripts" || { echo "FAIL bash -n"; fails=$((fails+1)); }
+bash "$HERE/scripts/install_deploy.sh" --src "$T" --runner-user ghrunner >/dev/null 2>&1; [ $? -ne 0 ] && echo "ok   install_deploy.sh refuses non-root" || { echo "FAIL install_deploy.sh ran as non-root"; fails=$((fails+1)); }
+
 [ $fails -eq 0 ] && echo "all passed" || { echo "$fails failed"; exit 1; }
