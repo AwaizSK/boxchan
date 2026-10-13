@@ -15,6 +15,14 @@ from config_store import ConfigStore
 bot = botimport.bot
 
 
+def assert_no_mentions(tc, send_mock):
+    """The reply MUST carry allowed_mentions == AllowedMentions.none() (unconditionally)."""
+    kwargs = send_mock.await_args[1]
+    tc.assertIn("allowed_mentions", kwargs)
+    tc.assertIsInstance(kwargs["allowed_mentions"], discord.AllowedMentions)
+    tc.assertEqual(kwargs["allowed_mentions"].to_dict(), discord.AllowedMentions.none().to_dict())
+
+
 def make_guild(gid, channels=()):
     g = mock.MagicMock()
     g.id = gid
@@ -64,168 +72,82 @@ class CommandTestBase(unittest.IsolatedAsyncioTestCase):
             self.addCleanup(p.stop)
 
 
+def voice(i, name=None):
+    return {"name": name or f"voice{i}", "quality": "medium", "language": "en", "size_mb": 100}
+
+
+def summary(voices, current=None, configured=None, loading=False, cuda=True):
+    return {"voices": voices, "current": current, "configured": configured, "loading": loading, "cuda": cuda}
+
+
 class VoicesCommandTest(CommandTestBase):
-    async def test_voices_lists_voices(self):
-        """Test that voices command lists available voices."""
-        guild = make_guild(1, [make_text_channel(10)])
-        await self.config.set_channel(1, 10, expected_rev=None, editor="t")
-        author = make_member(1, "author")
-        ctx = make_context(guild, author)
-
-        # Mock controller.list_voices
-        fake_voices = {
-            "voices": [
-                {"name": "voice1", "quality": "medium", "language": "en", "size_mb": 100},
-                {"name": "voice2", "quality": "high", "language": "en", "size_mb": 200},
-            ],
-            "current": "voice1",
-            "configured": "voice1",
-            "loading": False,
-            "cuda": True,
-        }
-        with mock.patch.object(bot.controller, "list_voices", return_value=fake_voices):
+    async def run_voices(self, fake):
+        ctx = make_context(make_guild(1, [make_text_channel(10)]), make_member(1, "author"))
+        with mock.patch.object(bot.controller, "list_voices", return_value=fake):
             await bot.voices(ctx)
-
         ctx.send.assert_awaited_once()
-        message = ctx.send.await_args[0][0]
-        self.assertIn("voice1", message)
-        self.assertIn("voice2", message)
+        return ctx, ctx.send.await_args[0][0]
 
-    async def test_voices_marks_active_voice(self):
-        """Test that voices command marks the active voice."""
-        guild = make_guild(1, [make_text_channel(10)])
-        await self.config.set_channel(1, 10, expected_rev=None, editor="t")
-        author = make_member(1, "author")
-        ctx = make_context(guild, author)
+    async def test_voices_lists_voices(self):
+        ctx, msg = await self.run_voices(summary([voice(1), voice(2)], "voice1", "voice1"))
+        self.assertIn("• voice1 — medium, en, 100 MB", msg)
+        self.assertIn("• voice2 — medium, en, 100 MB", msg)
+        assert_no_mentions(self, ctx.send)
 
-        fake_voices = {
-            "voices": [
-                {"name": "voice1", "quality": "medium", "language": "en", "size_mb": 100},
-            ],
-            "current": "voice1",
-            "configured": "voice1",
-            "loading": False,
-            "cuda": True,
-        }
-        with mock.patch.object(bot.controller, "list_voices", return_value=fake_voices):
-            await bot.voices(ctx)
+    async def test_voices_marks_only_the_active_voice(self):
+        _, msg = await self.run_voices(summary([voice(1), voice(2)], "voice1", "voice1"))
+        lines = {l.split(" — ")[0]: l for l in msg.split("\n") if l.startswith("•")}
+        self.assertIn("◀ active", lines["• voice1"])
+        self.assertNotIn("active", lines["• voice2"])
+        self.assertNotIn("(CPU)", lines["• voice1"])
+        self.assertNotIn("saved", msg)
 
-        message = ctx.send.await_args[0][0]
-        self.assertIn("active", message)
+    async def test_voices_marks_cpu_when_cuda_inactive(self):
+        _, msg = await self.run_voices(summary([voice(1)], "voice1", "voice1", cuda=False))
+        self.assertIn("• voice1 — medium, en, 100 MB ◀ active (CPU)", msg)
 
-    async def test_voices_shows_engine_not_loaded(self):
-        """Test that voices command shows when engine is not loaded."""
-        guild = make_guild(1, [make_text_channel(10)])
-        await self.config.set_channel(1, 10, expected_rev=None, editor="t")
-        author = make_member(1, "author")
-        ctx = make_context(guild, author)
+    async def test_voices_marks_saved_not_loaded(self):
+        _, msg = await self.run_voices(summary([voice(1), voice(2)], "voice1", "voice2"))
+        lines = {l.split(" — ")[0]: l for l in msg.split("\n") if l.startswith("•")}
+        self.assertTrue(lines["• voice2"].endswith(" (saved, not loaded)"))
+        self.assertNotIn("saved", lines["• voice1"])
+        self.assertIn("◀ active", lines["• voice1"])
 
-        fake_voices = {
-            "voices": [],
-            "current": None,
-            "configured": None,
-            "loading": False,
-            "cuda": None,
-        }
-        with mock.patch.object(bot.controller, "list_voices", return_value=fake_voices):
-            await bot.voices(ctx)
+    async def test_voices_engine_not_loaded_no_voices(self):
+        ctx, msg = await self.run_voices(summary([], None, None, cuda=None))
+        self.assertIn("not loaded", msg)
+        assert_no_mentions(self, ctx.send)
 
-        message = ctx.send.await_args[0][0]
-        self.assertIn("not loaded", message)
+    async def test_voices_no_voices_but_engine_loaded(self):
+        _, msg = await self.run_voices(summary([], "x", "x"))
+        self.assertEqual(msg, "No voices available.")
 
     async def test_voices_truncates_at_25(self):
-        """Test that voices truncates the list at 25 voices."""
-        guild = make_guild(1, [make_text_channel(10)])
-        await self.config.set_channel(1, 10, expected_rev=None, editor="t")
-        author = make_member(1, "author")
-        ctx = make_context(guild, author)
+        _, msg = await self.run_voices(summary([voice(i) for i in range(30)], "voice0", "voice0"))
+        self.assertIn("• voice24 ", msg)
+        self.assertNotIn("voice25", msg)
+        self.assertEqual(sum(1 for l in msg.split("\n") if l.startswith("•")), 25)
+        self.assertIn("\u2026 +5 more", msg)
 
-        # Create 30 voices
-        voices_list = [
-            {"name": f"voice{i}", "quality": "medium", "language": "en", "size_mb": 100}
-            for i in range(30)
-        ]
-        fake_voices = {
-            "voices": voices_list,
-            "current": "voice0",
-            "configured": "voice0",
-            "loading": False,
-            "cuda": True,
-        }
-        with mock.patch.object(bot.controller, "list_voices", return_value=fake_voices):
-            await bot.voices(ctx)
-
-        message = ctx.send.await_args[0][0]
-        # Should have truncation indicator
-        self.assertIn("+", message)
+    async def test_voices_exactly_25_has_no_more_marker(self):
+        _, msg = await self.run_voices(summary([voice(i) for i in range(25)], "voice0", "voice0"))
+        self.assertIn("• voice24 ", msg)
+        self.assertNotIn("more", msg)
 
     async def test_voices_under_2000_chars(self):
-        """Test that voices message is under 2000 characters."""
-        guild = make_guild(1, [make_text_channel(10)])
-        await self.config.set_channel(1, 10, expected_rev=None, editor="t")
-        author = make_member(1, "author")
-        ctx = make_context(guild, author)
+        long = [voice(i, name="n" * 200 + str(i)) for i in range(25)]
+        _, msg = await self.run_voices(summary(long))
+        self.assertLessEqual(len(msg), 2000)
+        self.assertTrue(msg.endswith("\u2026"))
 
-        voices_list = [
-            {"name": f"voice{i}", "quality": "medium", "language": "en", "size_mb": 100}
-            for i in range(50)
-        ]
-        fake_voices = {
-            "voices": voices_list,
-            "current": None,
-            "configured": None,
-            "loading": False,
-            "cuda": False,
-        }
-        with mock.patch.object(bot.controller, "list_voices", return_value=fake_voices):
-            await bot.voices(ctx)
-
-        message = ctx.send.await_args[0][0]
-        self.assertLess(len(message), 2000)
-
-    async def test_voices_no_allowed_mentions(self):
-        """Test that voices uses no allowed mentions."""
-        guild = make_guild(1, [make_text_channel(10)])
-        await self.config.set_channel(1, 10, expected_rev=None, editor="t")
-        author = make_member(1, "author")
-        ctx = make_context(guild, author)
-
-        fake_voices = {
-            "voices": [],
-            "current": None,
-            "configured": None,
-            "loading": False,
-            "cuda": None,
-        }
-        with mock.patch.object(bot.controller, "list_voices", return_value=fake_voices):
-            await bot.voices(ctx)
-
-        call_kwargs = ctx.send.await_args[1]
-        if "allowed_mentions" in call_kwargs:
-            am = call_kwargs["allowed_mentions"]
-            self.assertFalse(am.everyone)
-            self.assertFalse(am.roles)
-            self.assertFalse(am.users)
+    async def test_voices_sends_no_mentions(self):
+        ctx, _ = await self.run_voices(summary([voice(1, "@everyone")], "@everyone", "@everyone"))
+        assert_no_mentions(self, ctx.send)
 
     async def test_voices_shows_loading(self):
-        """Test that voices shows 'loading' message when engine is loading."""
-        guild = make_guild(1, [make_text_channel(10)])
-        await self.config.set_channel(1, 10, expected_rev=None, editor="t")
-        author = make_member(1, "author")
-        ctx = make_context(guild, author)
-
-        fake_voices = {
-            "voices": [],
-            "current": None,
-            "configured": None,
-            "loading": True,
-            "cuda": None,
-        }
-        with mock.patch.object(bot.controller, "list_voices", return_value=fake_voices):
-            await bot.voices(ctx)
-
-        message = ctx.send.await_args[0][0]
-        self.assertIn("loading", message.lower())
+        ctx, msg = await self.run_voices(summary([], loading=True, cuda=None))
+        self.assertEqual(msg, "Voice is loading; please wait...")
+        assert_no_mentions(self, ctx.send)
 
     async def test_voices_defers_before_listing_then_replies(self):
         """The interaction is acked (defer) BEFORE the slow rescan; the reply still goes out."""
@@ -268,6 +190,7 @@ class VoicesCommandTest(CommandTestBase):
             await bot.voices(ctx)
 
         ctx.send.assert_awaited_once()
+        assert_no_mentions(self, ctx.send)
         message = ctx.send.await_args[0][0]
         self.assertIn("Could not list voices", message)
         self.assertNotIn("secret-path-boom", message)
@@ -275,34 +198,16 @@ class VoicesCommandTest(CommandTestBase):
         self.assertLess(len(message), 100)
 
     async def test_voices_read_only(self):
-        """Test that voices command does not call config.set_voice or engine.reload."""
+        """voices must not change config, reload the engine or apply a voice."""
         guild = make_guild(1, [make_text_channel(10)])
-        await self.config.set_channel(1, 10, expected_rev=None, editor="t")
-        author = make_member(1, "author")
-        ctx = make_context(guild, author)
-
-        fake_voices = {
-            "voices": [
-                {"name": "voice1", "quality": "medium", "language": "en", "size_mb": 100},
-            ],
-            "current": "voice1",
-            "configured": "voice1",
-            "loading": False,
-            "cuda": True,
-        }
-
-        # Spy on config.set_voice and engine.reload
-        config_spy = mock.AsyncMock(side_effect=Exception("Should not be called"))
-        engine_spy = mock.AsyncMock(side_effect=Exception("Should not be called"))
-
-        with mock.patch.object(bot.controller, "list_voices", return_value=fake_voices), \
-             mock.patch.object(self.config, "set_voice", side_effect=lambda *a, **kw: config_spy(*a, **kw)), \
-             mock.patch.object(bot.engine, "reload", side_effect=lambda *a, **kw: engine_spy(*a, **kw)):
+        ctx = make_context(guild, make_member(1, "author"))
+        fake = summary([voice(1)], "voice1", "voice1")
+        with mock.patch.object(bot.controller, "list_voices", return_value=fake), \
+             mock.patch.object(self.config, "set_voice", side_effect=AssertionError("set_voice called")), \
+             mock.patch.object(bot.engine, "reload", side_effect=AssertionError("reload called")), \
+             mock.patch.object(bot.controller, "apply_voice", side_effect=AssertionError("apply_voice called")):
             await bot.voices(ctx)
-
-        # These should not have been called
-        config_spy.assert_not_called()
-        engine_spy.assert_not_called()
+        ctx.send.assert_awaited_once()
 
 
 if __name__ == "__main__":
