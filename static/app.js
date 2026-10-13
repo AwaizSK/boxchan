@@ -73,13 +73,21 @@ function normalizeEditor(v) {
   return Array.from(s).slice(0, 40).join('').trim();
 }
 
+// Should snapshot `snap` replace the current config (`cur`, may be null)? Older revs never do,
+// unless forced (hello after a (re)connect, or the server's authoritative 409 snapshot).
+function shouldApplySnapshot(cur, snap, force) {
+  if (!snap) return false;
+  if (force || !cur) return true;
+  return snap.rev >= cur.rev;
+}
+
 // Roll back an optimistic channel change only if nothing newer replaced it.
 function shouldRollback(currentId, optimisticId) {
   return currentId === optimisticId;
 }
 
 if (typeof module !== 'undefined') {
-  module.exports = { normalizeEditor, shouldRollback, createSSEParser, matchChannel, relTime, backoffDelay, groupChannels };
+  module.exports = { shouldApplySnapshot, normalizeEditor, shouldRollback, createSSEParser, matchChannel, relTime, backoffDelay, groupChannels };
 }
 
 /* ---------- app ---------- */
@@ -146,6 +154,17 @@ if (typeof document !== 'undefined') (function () {
     (S.token ? $('auth-name') : $('auth-token')).focus();
   }
 
+  let lastTooMany = 0;
+  function tooMany() {   // keep the session, token and stream; just tell the user (rate-limited toast)
+    const now = Date.now();
+    if (now - lastTooMany < 10000) return;
+    lastTooMany = now;
+    toast('Too many failed attempts \u2014 wait a minute', { error: true });
+  }
+
+  const friendly = (e) => (e.message === 'persist_failed'
+    ? 'the server could not save the change (storage error)' : e.message);
+
   class ApiError extends Error {
     constructor(status, body) { super((body && body.error) || ('http_' + status)); this.status = status; this.body = body; }
   }
@@ -158,7 +177,7 @@ if (typeof document !== 'undefined') (function () {
     let data = null;
     try { data = await r.json(); } catch (e) { /* no body */ }
     if (r.status === 401) { showAuth('Token rejected. Enter a valid token.'); throw new ApiError(401, data); }
-    if (r.status === 429) { showAuth('Too many failed attempts. Wait a minute and try again.'); throw new ApiError(429, data); }
+    if (r.status === 429) { tooMany(); throw new ApiError(429, data); }
     if (!r.ok) throw new ApiError(r.status, data);
     return data;
   }
@@ -173,17 +192,17 @@ if (typeof document !== 'undefined') (function () {
   };
 
   function applySnapshot(snap, force) {
-    if (!snap) return;
-    if (!force && S.cfg && snap.rev < S.cfg.rev) return;
+    if (!shouldApplySnapshot(S.cfg, snap, force)) return;
     S.cfg = snap;
     renderConfig();
   }
 
-  function applyState(d) {
+  function applyState(d, force) {
     S.guilds = d.guilds || [];
     for (const g of S.guilds) S.status[g.id] = { voice: g.voice, queue: g.queue, playing: g.playing, watched: g.watched };
     if (!S.guilds.some((g) => g.id === S.gid)) S.gid = S.guilds.length ? S.guilds[0].id : '';
-    S.cfg = d.config || d.snapshot;
+    const snap = d.config || d.snapshot;
+    if (shouldApplySnapshot(S.cfg, snap, force)) S.cfg = snap;
     renderGuildSelect();
     renderList();
     renderConfig();
@@ -191,9 +210,23 @@ if (typeof document !== 'undefined') (function () {
   }
 
   async function refetch() {
-    try { applyState(await api('GET', '/api/state')); } catch (e) {
-      if (e.status !== 401 && e.status !== 429) toast('Could not load state: ' + e.message, { error: true });
+    try { applyState(await api('GET', '/api/state'), false); } catch (e) {
+      if (e.status !== 401 && e.status !== 429) toast('Could not load state: ' + friendly(e), { error: true });
     }
+  }
+
+  // Coalesce bursts of `channels` events: ~250 ms trailing, at most one request in flight.
+  let rfTimer = null, rfBusy = false, rfAgain = false;
+  function scheduleRefetch() {
+    if (rfBusy) { rfAgain = true; return; }
+    clearTimeout(rfTimer);
+    rfTimer = setTimeout(async () => {
+      rfTimer = null; rfBusy = true; rfAgain = false;
+      try { await refetch(); } finally {
+        rfBusy = false;
+        if (rfAgain) scheduleRefetch();
+      }
+    }, 250);
   }
 
   /* --- rendering --- */
@@ -353,7 +386,7 @@ if (typeof document !== 'undefined') (function () {
     renderConfig();
     try {
       const d = await api('PUT', '/api/guilds/' + gid + '/channel', { channel_id: id, rev: prevRev });
-      applySnapshot(d.snapshot, true);
+      applySnapshot(d.snapshot, false);
       if (!opts.silent) {
         toast('Switched to ' + (chName(id) || 'channel') + (prev && chName(prev) ? ' (was ' + chName(prev) + ')' : ''),
           prev && chName(prev) ? { undo: () => selectChannel(prev, { silent: true }) } : null);
@@ -368,7 +401,7 @@ if (typeof document !== 'undefined') (function () {
           S.cfg.guilds[gid] = { ...cur, channel_id: prev };
           renderConfig();
         }
-        toast('Could not switch channel: ' + e.message, { error: true });
+        toast('Could not switch channel: ' + friendly(e), { error: true });
       }
     } finally {
       S.busy = false;
@@ -383,13 +416,13 @@ if (typeof document !== 'undefined') (function () {
       if (e.status === 409 && e.body && e.body.snapshot) {
         applySnapshot(e.body.snapshot, true);
         toast('Changed by ' + (e.body.snapshot.updated_by || 'someone') + ' — your change was not applied', { error: true });
-      } else if (e.status !== 401 && e.status !== 429) toast('Request failed: ' + e.message, { error: true });
+      } else if (e.status !== 401 && e.status !== 429) toast('Request failed: ' + friendly(e), { error: true });
     } finally { S.busy = false; renderControls(); }
   }
 
   const doPause = () => act(async () => {
     const d = await api('PUT', '/api/guilds/' + S.gid + '/enabled', { enabled: !gcfg().enabled, rev: S.cfg.rev });
-    applySnapshot(d.snapshot, true);
+    applySnapshot(d.snapshot, false);
   });
   const doSkip = () => act(async () => {
     const d = await api('POST', '/api/guilds/' + S.gid + '/skip');
@@ -413,7 +446,7 @@ if (typeof document !== 'undefined') (function () {
     let d;
     try { d = JSON.parse(raw); } catch (e) { return; }
     if (name === 'hello') {
-      applyState({ config: d.snapshot, guilds: d.guilds });
+      applyState({ config: d.snapshot, guilds: d.guilds }, true);
     } else if (name === 'config') {
       const ch = d.change || {};
       applySnapshot(d.snapshot, false);
@@ -428,7 +461,7 @@ if (typeof document !== 'undefined') (function () {
         }
       }
     } else if (name === 'channels') {
-      refetch();
+      scheduleRefetch();   // guild_id may be null (bot just became ready)
     } else if (name === 'status') {
       S.status = { ...S.status, ...d };
       renderStatus();
@@ -438,7 +471,7 @@ if (typeof document !== 'undefined') (function () {
   async function streamOnce(signal) {
     const r = await fetch('/api/events', { headers: { Authorization: 'Bearer ' + S.token }, signal, cache: 'no-store' });
     if (r.status === 401) { showAuth('Token rejected. Enter a valid token.'); return 'auth'; }
-    if (r.status === 429) { showAuth('Too many failed attempts. Wait a minute and try again.'); return 'auth'; }
+    if (r.status === 429) { tooMany(); throw new Error('http_429'); }   // backoff + retry, keep the token
     if (!r.ok || !r.body) throw new Error('http_' + r.status);
     const dec = new TextDecoder();
     const feed = createSSEParser((n, d) => { if (n === 'hello') { attempt = 0; setConn('live'); } onEvent(n, d); });
@@ -522,7 +555,7 @@ if (typeof document !== 'undefined') (function () {
   }
 
   document.addEventListener('keydown', (e) => {
-    if ($('ui').hidden || e.ctrlKey || e.metaKey || e.altKey) return;
+    if ($('ui').hidden || e.isComposing || e.ctrlKey || e.metaKey || e.altKey) return;
     const t = e.target, typing = t && (t.tagName === 'INPUT' || t.tagName === 'SELECT' || t.tagName === 'TEXTAREA');
     if (e.key === '/' && !typing) { e.preventDefault(); $('search').focus(); return; }
     const onNav = t === $('search') || t === $('list') || t === document.body;

@@ -123,23 +123,21 @@ def make_app(config, controller, token: str, *, status_interval: float = 3.0,
     async def auth(request, handler):
         if not request.path.startswith("/api/"):
             return await handler(request)
+        header = request.headers.get("Authorization", "")
+        scheme, _, presented = header.partition(" ")
+        if (scheme.lower() == "bearer"
+                and hmac.compare_digest(presented.strip().encode(), token_b)):
+            return await handler(request)  # valid token: always allowed, never counted
         ip = request.remote or "?"
         now = clock()
         if blocked.get(ip, 0) > now:
             return _err("too_many_attempts", 429)
-        header = request.headers.get("Authorization", "")
-        scheme, _, presented = header.partition(" ")
-        ok = (scheme.lower() == "bearer"
-              and hmac.compare_digest(presented.strip().encode(), token_b))
-        if not ok:
-            recent = [t for t in fails.get(ip, []) if now - t < THROTTLE_WINDOW] + [now]
-            fails[ip] = recent
-            if len(recent) >= THROTTLE_FAILS:
-                blocked[ip] = now + THROTTLE_WINDOW
-                fails.pop(ip, None)
-            return _err("unauthorized", 401)
-        fails.pop(ip, None)
-        return await handler(request)
+        recent = [t for t in fails.get(ip, []) if now - t < THROTTLE_WINDOW] + [now]
+        fails[ip] = recent
+        if len(recent) >= THROTTLE_FAILS:
+            blocked[ip] = now + THROTTLE_WINDOW
+            fails.pop(ip, None)
+        return _err("unauthorized", 401)
 
     app = web.Application(middlewares=[security_headers, auth], client_max_size=MAX_BODY)
 
@@ -197,6 +195,9 @@ def make_app(config, controller, token: str, *, status_interval: float = 3.0,
             snap = await asyncio.shield(coro)
         except ConflictError as e:
             return _json({"error": "conflict", "snapshot": wire_snapshot(e.snapshot)}, 409)
+        except OSError:
+            log.exception("config persist failed")
+            return _err("persist_failed", 500)
         return _json({"snapshot": wire_snapshot(snap)})
 
     # --- API ---

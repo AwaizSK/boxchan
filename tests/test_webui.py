@@ -91,14 +91,32 @@ class AuthTests(Base):
         self.assertEqual(body["guilds"][0]["id"], "1")
 
     async def test_throttle(self):
+        bad = {"Authorization": "Bearer x"}
         for _ in range(5):
-            r = await self.client.get("/api/state", headers={"Authorization": "Bearer x"})
+            r = await self.client.get("/api/state", headers=bad)
             self.assertEqual(r.status, 401)
-        r = await self.client.get("/api/state", headers=AUTH)
+        # blocked: invalid credentials get 429, valid token is still served
+        r = await self.client.get("/api/state", headers=bad)
         self.assertEqual(r.status, 429)
-        self.clock.t += 61
+        self.assertEqual(await r.json(), {"error": "too_many_attempts"})
+        r = await self.client.get("/api/state")
+        self.assertEqual(r.status, 429)
         r = await self.client.get("/api/state", headers=AUTH)
         self.assertEqual(r.status, 200)
+        self.clock.t += 61
+        r = await self.client.get("/api/state", headers=bad)
+        self.assertEqual(r.status, 401)
+
+    async def test_valid_token_not_counted_as_failure(self):
+        for _ in range(4):
+            await self.client.get("/api/state", headers={"Authorization": "Bearer x"})
+        for _ in range(10):
+            r = await self.client.get("/api/state", headers=AUTH)
+            self.assertEqual(r.status, 200)
+        r = await self.client.get("/api/state", headers={"Authorization": "Bearer x"})
+        self.assertEqual(r.status, 401)  # 5th failure: blocks from now on
+        r = await self.client.get("/api/state", headers={"Authorization": "Bearer x"})
+        self.assertEqual(r.status, 429)
 
     async def test_failures_outside_window_dont_count(self):
         for _ in range(4):
@@ -174,6 +192,16 @@ class WriteTests(Base):
         self.assertEqual(body["error"], "conflict")
         self.assertEqual(body["snapshot"]["rev"], 1)
         self.assertEqual(body["snapshot"]["guilds"]["1"]["channel_id"], "10")
+
+    async def test_persist_failure_is_json_500(self):
+        with mock.patch.object(config_store, "atomic_write_json",
+                               side_effect=PermissionError(13, "denied", "/secret/path")):
+            with self.assertLogs("webui", level="ERROR"):
+                r = await self.put_channel({"channel_id": "10"})
+        self.assertEqual(r.status, 500)
+        self.assertEqual(await r.json(), {"error": "persist_failed"})
+        self.assertNotIn("secret", await r.text())
+        self.assertEqual(self.config.snapshot()["rev"], 0)
 
     async def test_bad_channel(self):
         for ch in ("99", "abc", 10, "", "-1"):

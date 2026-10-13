@@ -1,5 +1,5 @@
 const assert = require('assert');
-const { normalizeEditor, shouldRollback, createSSEParser, matchChannel, relTime, backoffDelay, groupChannels } = require('../static/app.js');
+const { shouldApplySnapshot, normalizeEditor, shouldRollback, createSSEParser, matchChannel, relTime, backoffDelay, groupChannels } = require('../static/app.js');
 
 const got = [];
 const feed = createSSEParser((n, d) => got.push([n, d]));
@@ -31,4 +31,10 @@ assert.strictEqual(normalizeEditor('\u7530\u4e2d'), '\u7530\u4e2d');
 assert.strictEqual(normalizeEditor('z'.repeat(60)).length, 40);
 assert.strictEqual(shouldRollback('5', '5'), true);
 assert.strictEqual(shouldRollback('7', '5'), false);
+assert.strictEqual(shouldApplySnapshot({ rev: 5 }, { rev: 4 }, false), false);
+assert.strictEqual(shouldApplySnapshot({ rev: 5 }, { rev: 5 }, false), true);
+assert.strictEqual(shouldApplySnapshot({ rev: 5 }, { rev: 6 }, false), true);
+assert.strictEqual(shouldApplySnapshot({ rev: 5 }, { rev: 4 }, true), true);
+assert.strictEqual(shouldApplySnapshot(null, { rev: 0 }, false), true);
+assert.strictEqual(shouldApplySnapshot({ rev: 5 }, null, true), false);
 console.log('ok');
