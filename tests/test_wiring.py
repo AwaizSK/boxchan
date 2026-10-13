@@ -54,6 +54,26 @@ class MaybeStartWebui(unittest.IsolatedAsyncioTestCase):
         with mock.patch.object(bot, "make_app", side_effect=ValueError("bad")):
             self.assertIsNone(await bot.maybe_start_webui(self.cfg, FakeController(), "127.0.0.1", free_port()))
 
+    async def test_out_of_range_port(self):
+        self.write_token("x" * 40)
+        self.assertIsNone(await bot.maybe_start_webui(self.cfg, FakeController(), "127.0.0.1", 99999))
+
+    async def test_unexpected_error_contained(self):
+        self.write_token("x" * 40)
+        with mock.patch.object(bot, "start_webui", side_effect=RuntimeError("boom")):
+            self.assertIsNone(await bot.maybe_start_webui(self.cfg, FakeController(), "127.0.0.1", free_port()))
+
+    async def test_token_load_error_contained(self):
+        with mock.patch.object(bot, "load_gui_token", side_effect=RuntimeError("boom")):
+            self.assertIsNone(await bot.maybe_start_webui(self.cfg, FakeController(), "127.0.0.1", free_port()))
+
+    def test_parse_port(self):
+        for raw in ("abc", "0", "99999", "-1", "1.5"):
+            self.assertEqual(bot.parse_port(raw), 8765, raw)
+        self.assertEqual(bot.parse_port(None), 8765)
+        self.assertEqual(bot.parse_port(""), 8765)
+        self.assertEqual(bot.parse_port("9000"), 9000)
+
     async def test_port_in_use(self):
         self.write_token("x" * 40)
         with socket.socket() as s:

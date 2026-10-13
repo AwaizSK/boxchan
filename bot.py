@@ -55,7 +55,20 @@ MAX_QUEUE = int(os.getenv("MAX_QUEUE", "20"))
 STATE_FILE = os.getenv("STATE_FILE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json"))
 CONFIG_FILE = os.getenv("CONFIG_FILE", os.path.join(os.path.dirname(STATE_FILE), "config.json"))
 WEBUI_HOST = os.getenv("WEBUI_HOST", "127.0.0.1")
-WEBUI_PORT = int(os.getenv("WEBUI_PORT", "8765"))
+
+
+def parse_port(raw: str | None, default: int = 8765) -> int:
+    try:
+        port = int((raw or "").strip() or default)
+    except ValueError:
+        port = 0
+    if not 1 <= port <= 65535:
+        logging.getLogger("bot").warning("Invalid WEBUI_PORT %r; using %d", raw, default)
+        return default
+    return port
+
+
+WEBUI_PORT = parse_port(os.getenv("WEBUI_PORT"))
 RECONNECT_WAIT = 10.0   # s to wait for voice reconnect before dropping a job
 PLAY_TIMEOUT = 180.0    # safety: max s a single clip may block the worker
 
@@ -521,13 +534,13 @@ async def on_guild_remove(guild):
 # ---------- lifecycle ----------
 async def maybe_start_webui(cfg, ctl, host: str, port: int):
     """Start the web UI; return its runner, or None if disabled/failed. Never raises."""
-    token = load_gui_token()
-    if not token:
-        log.warning("Web UI disabled: no usable GUI token (see scripts/gen_gui_token.sh)")
-        return None
     try:
+        token = load_gui_token()
+        if not token:
+            log.warning("Web UI disabled: no usable GUI token (see scripts/gen_gui_token.sh)")
+            return None
         runner = await start_webui(make_app(cfg, ctl, token), host, port)
-    except (ValueError, OSError):
+    except Exception:
         log.exception("Web UI failed to start on %s:%s; continuing without it", host, port)
         return None
     return runner

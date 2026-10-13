@@ -32,9 +32,12 @@ tok="$(openssl rand -base64 36 | tr '+/' '-_' | tr -d '=\n')"
 
 umask 077
 mkdir -p "$dir" && chmod 700 "$dir"
-printf '%s' "$tok" > "$file"
-chmod 600 "$file"
-if [ "$system" -eq 1 ]; then chown root:root "$dir" "$file"; fi
+tmp="$(mktemp "$dir/.gui_token.XXXXXX")"
+trap 'rm -f "$tmp"' EXIT
+printf '%s' "$tok" > "$tmp"
+chmod 600 "$tmp"
+if [ "$system" -eq 1 ]; then chown root:root "$dir" "$tmp"; fi
+mv -f "$tmp" "$file"
 
 echo "Saved to $file. Token (shown once, store it in your password manager):"
 echo "$tok"

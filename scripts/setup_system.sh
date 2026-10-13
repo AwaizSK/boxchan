@@ -52,6 +52,7 @@ for u in $(getent group "$GROUP" | cut -d: -f4 | tr ',' ' '); do
   usermod -aG systemd-journal "$u"
 done
 
+[ -f "$CONF/gui_token" ] || { echo "$CONF/gui_token missing; the unit would fail to start. Run: sudo $SRC/scripts/gen_gui_token.sh --system, then re-run this script."; exit 1; }
 install -m 644 -o root -g root "$SRC/tts_bot.service" /etc/systemd/system/tts_bot.service
 systemctl daemon-reload
 

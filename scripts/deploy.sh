@@ -9,7 +9,7 @@ APP=/opt/tts-bot
 PY="$APP/env/bin/python"
 
 [ -x "$PY" ] || { echo "Run scripts/setup_system.sh first."; exit 1; }
-[ -f /etc/tts-bot/gui_token ] || echo "WARNING: /etc/tts-bot/gui_token missing; unit will fail to start (run scripts/gen_gui_token.sh --system)."
+[ -f /etc/tts-bot/gui_token ] || { echo "/etc/tts-bot/gui_token missing; the unit would fail to start. Run: sudo scripts/gen_gui_token.sh --system"; exit 1; }
 
 shopt -s nullglob
 pyfiles=("$SRC"/*.py)
@@ -19,6 +19,14 @@ shopt -u nullglob
 [ "${#pyfiles[@]}" -gt 0 ] || { echo "No *.py files found in $SRC"; exit 1; }
 [ "${#staticfiles[@]}" -gt 0 ] || { echo "No files found in $SRC/static"; exit 1; }
 [ "${#models[@]}" -gt 0 ] || { echo "No model files found in $SRC/models"; exit 1; }
+
+# Refuse symlinks / non-regular files: root would dereference them and publish the target world-readable
+for f in "${pyfiles[@]}" "${staticfiles[@]}" "${models[@]}" "$SRC/requirements.txt"; do
+  if [ -L "$f" ] || [ ! -f "$f" ]; then
+    echo "Refusing to deploy: $f is a symlink or not a regular file."
+    exit 1
+  fi
+done
 
 # Compile everything before touching /opt (output to a throwaway dir, no __pycache__ in the repo)
 chk="$(mktemp -d)"
@@ -34,11 +42,16 @@ install -m 644 -o root -g root "${models[@]}" "$APP/models/"
 
 # Remove deployed files that no longer exist in the repo
 for f in "$APP"/*.py; do
+  [ -e "$f" ] || continue
   [ -e "$SRC/$(basename "$f")" ] || { echo "removing stale $f"; rm -f "$f"; }
 done
 for f in "$APP"/static/*; do
   [ -e "$f" ] || continue
   [ -e "$SRC/static/$(basename "$f")" ] || { echo "removing stale $f"; rm -rf "$f"; }
+done
+for f in "$APP"/models/*; do
+  [ -e "$f" ] || continue
+  [ -e "$SRC/models/$(basename "$f")" ] || { echo "removing stale $f"; rm -rf "$f"; }
 done
 rm -rf "$APP/__pycache__"
 

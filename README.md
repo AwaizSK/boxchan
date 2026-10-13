@@ -92,4 +92,13 @@ sudo systemctl enable tts_bot
 Devs (no password) can: `sudo systemctl start|stop|restart tts_bot`, `systemctl status tts_bot`, `journalctl -u tts_bot` (after re-login for the `systemd-journal` group). They cannot read the token or change deployed code.
 Local testing: each dev should create their own dev bot application and run `scripts/install_token.sh` (personal `~/.config/tts-bot/token`). Never share the production token.
 
+### Upgrading an existing deployment
+The unit changed (it now loads `/etc/tts-bot/gui_token`), so order matters:
+```bash
+sudo scripts/gen_gui_token.sh --system   # 1) token first; the unit will not start without it
+sudo scripts/setup_system.sh             # 2) installs the new unit (or: copy tts_bot.service to /etc/systemd/system/ && sudo systemctl daemon-reload)
+sudo scripts/deploy.sh                   # 3) ship the code
+```
+`deploy.sh` alone ships new code with the OLD unit (no `gui_token` credential, no `CONFIG_FILE`/`WEBUI_*`), so the GUI would silently stay disabled. `deploy.sh` and `setup_system.sh` refuse to run if the token file is missing, and `deploy.sh` refuses symlinks or non-regular files in the repo's `*.py`, `static/`, `models/`.
+
 Known boundary: anyone who can deploy code can read the token (the code runs with it). Review changes before `deploy.sh`.
