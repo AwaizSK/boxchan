@@ -117,24 +117,9 @@ function voiceSwitchText(editor, name) {
 }
 
 const MSG_MAX = 2000;
-const MENTION_REGEX = /<@!?([0-9]{1,20})>/g;
-const MENTION_SPLIT_REGEX = /(<@!?[0-9]{1,20}>)/g;
 const READY_PRESET = "The voice bot is ready to use! Join a voice channel, type !join here, and I'll read watched users' messages aloud.";
 const cpLen = (s) => Array.from(String(s)).length;
 
-// Get the preceding code point (accounting for surrogates). Returns the code point string or empty string.
-function getPrevCodePoint(text, idx) {
-  if (idx <= 0) return '';
-  const code = text.charCodeAt(idx - 1);
-  // Low surrogate: previous code point is a surrogate pair (2 units)
-  if (code >= 0xDC00 && code <= 0xDFFF && idx >= 2) return text.slice(idx - 2, idx);
-  // Single unit or high surrogate
-  return text.slice(idx - 1, idx);
-}
-
-// Split text into plain and tagged parts. Only the exact "@label" of a tagged chip matches
-// (longest label first, single pass, not glued to word characters); nothing is ever guessed.
-// Uses manual preceding-character check instead of lookbehind for Safari < 16.4 compatibility.
 function segmentText(text, tags) {
   const list = (tags || []).filter((t) => t && t.label).sort((a, b) => b.label.length - a.label.length);
   text = String(text);
@@ -147,8 +132,13 @@ function segmentText(text, tags) {
   const out = [];
   let last = 0, m;
   while ((m = re.exec(text))) {
-    // Check preceding code point: match is valid only if not glued to a word character or at start
-    if (m.index > 0 && isWord(getPrevCodePoint(text, m.index))) continue;
+    let pc = '';
+    if (m.index > 0) {
+      const code = text.charCodeAt(m.index - 1);
+      if (code >= 0xDC00 && code <= 0xDFFF && m.index >= 2) pc = text.slice(m.index - 2, m.index);
+      else pc = text.slice(m.index - 1, m.index);
+    }
+    if (pc && isWord(pc)) continue;
     if (m.index > last) out.push({ text: text.slice(last, m.index), tag: null });
     out.push({ text: m[0], tag: by.get(m[0]) });
     last = m.index + m[0].length;
@@ -191,60 +181,29 @@ function insertAtCursor(value, start, end, ins) {
 function counterText(n) { return n + '/' + MSG_MAX; }
 function counterState(n) { return n > MSG_MAX ? 'over' : n >= 1900 ? 'near' : ''; }
 
-// Guard: only apply member search results if guild and request sequence still match (avoid stale responses).
-function shouldApplyMembers(reqGid, curGid, reqSeq, curSeq) {
-  return reqGid === curGid && reqSeq === curSeq;
-}
+function shouldApplyMembers(rg, cg, rs, cs) { return rg === cg && rs === cs; }
+function resetMemberCache(M) { M.members = []; M.hi = -1; M.gid = ''; M.q = null; M.memberSeq++; }
 
-// Reset member cache state (called when channel changes or request is stale).
-function resetMemberCache(M) {
-  M.members = [];
-  M.hi = -1;
-  M.gid = '';
-  M.q = null;
-  M.memberSeq++;
-}
-
-// Detect if channel id changed between old and new guild config (used for SSE-triggered cache reset).
-function channelChanged(oldChannelId, newChannelId) {
-  return oldChannelId !== newChannelId;
-}
-
-function pingTargets(finalText, chips) {
-  const byId = new Map((chips || []).map((c) => [c.id, c]));
-  const result = [];
-  const seen = new Set();
-  let m;
-  while ((m = MENTION_REGEX.exec(finalText))) {
-    const id = m[1];
-    if (!seen.has(id)) {
-      seen.add(id);
-      const chip = byId.get(id);
-      result.push({
-        id: id,
-        label: chip ? chip.label : null,
-        username: chip ? chip.username : null,
-        known: !!chip
-      });
-    }
+function pingTargets(t, c) {
+  const m = new Map((c || []).map((x) => [x.id, x])), r = [], s = new Set(), e = /<@!?([0-9]{1,20})>/g;
+  let n;
+  while ((n = e.exec(t))) {
+    const i = n[1];
+    if (!s.has(i)) { s.add(i); const h = m.get(i); r.push({ id: i, label: h ? h.label : null, username: h ? h.username : null, known: !!h }); }
   }
-  return result;
+  return r;
 }
 
-function chipText(chip) {
-  if (!chip.username) return '@' + chip.label;
-  // Avoid double formatting: if label already contains the username (e.g., "Bob (bob99)"), just show the label
-  if (chip.label.includes('(' + chip.username + ')')) return '@' + chip.label;
-  return '@' + chip.label + ' (@' + chip.username + ')';
+function chipText(c) {
+  if (!c.username) return '@' + c.label;
+  if (c.label.includes('(' + c.username + ')')) return '@' + c.label;
+  return '@' + c.label + ' (@' + c.username + ')';
 }
 
-function pingSummary(targets) {
-  if (!targets.length) return 'No pings';
-  const names = targets.map((t) => {
-    if (!t.known) return 'unknown user ' + t.id;
-    return chipText(t);
-  });
-  return 'Will ping: ' + names.join(', ');
+function pingSummary(t) {
+  if (!t.length) return 'No pings';
+  const n = t.map((x) => !x.known ? 'unknown user ' + x.id : chipText(x));
+  return 'Will ping: ' + n.join(', ');
 }
 
 // Why Send is disabled right now ('' = it can send).
@@ -278,7 +237,7 @@ function mergeVoiceSummary(prev, incoming, { seqAtRequest, seqNow, live }) {
 if (typeof module !== 'undefined') {
   module.exports = { shouldApplySnapshot, normalizeEditor, shouldRollback, createSSEParser, matchChannel, relTime, backoffDelay, groupChannels,
     voiceTitle, voiceWarning, sayBlocker, voiceSwitchText, mergeVoiceSummary,
-    segmentText, substituteTags, activeTagIds, uniqueLabel, insertAtCursor, counterText, counterState, shouldApplyMembers, resetMemberCache, channelChanged, pingTargets, pingSummary, chipText, messageBlocker, cpLen, MSG_MAX, READY_PRESET };
+    segmentText, substituteTags, activeTagIds, uniqueLabel, insertAtCursor, counterText, counterState, shouldApplyMembers, resetMemberCache, pingTargets, pingSummary, chipText, messageBlocker, cpLen, MSG_MAX, READY_PRESET };
 }
 
 /* ---------- app ---------- */
@@ -399,8 +358,7 @@ if (typeof document !== 'undefined') (function () {
     const oldChanId = S.cfg && S.cfg.guilds[S.gid] && S.cfg.guilds[S.gid].channel_id;
     S.cfg = snap;
     const newChanId = S.cfg && S.cfg.guilds[S.gid] && S.cfg.guilds[S.gid].channel_id;
-    // Reset member cache if the channel changed for the current guild
-    if (channelChanged(oldChanId, newChanId)) {
+    if (oldChanId !== newChanId) {
       resetMemberCache(M);
       if (S.tab === 'messages') renderMessages();
     }
@@ -769,7 +727,7 @@ if (typeof document !== 'undefined') (function () {
     else for (const seg of segmentText(text, M.tags)) {
       if (seg.tag) pv.appendChild(el('span', 'tag', seg.text));
       else {
-        const parts = seg.text.split(MENTION_SPLIT_REGEX);
+        const parts = seg.text.split(/(<@!?[0-9]{1,20}>)/);
         for (const p of parts) {
           if (p.startsWith('<@') && p.endsWith('>')) pv.appendChild(el('span', 'tag', p));
           else if (p) pv.appendChild(document.createTextNode(p));
