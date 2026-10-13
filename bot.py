@@ -601,10 +601,10 @@ class Controller:
         try:
             msg = await ch.send(content, allowed_mentions=allowed)
         except discord.Forbidden:
-            log.warning("gui message forbidden guild=%s channel=%s editor=%s", guild_id, ch.id, editor)
+            log.warning("gui message failed guild=%s channel=%s editor=%s reason=forbidden", guild_id, ch.id, editor)
             raise MessageError("missing_permission") from None
         except discord.HTTPException as e:
-            log.warning("gui message failed guild=%s channel=%s status=%s", guild_id, ch.id, getattr(e, "status", "?"))
+            log.warning("gui message failed guild=%s channel=%s editor=%s reason=http_error", guild_id, ch.id, editor)
             raise MessageError("discord_error") from None
         log.info("gui message sent guild=%s channel=%s editor=%s chars=%d mentions=%d",
                  guild_id, ch.id, editor, len(content), len(ids))

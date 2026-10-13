@@ -184,6 +184,39 @@ class ConfigWatcherTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.task.done())
 
 
+class SendMessageTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.addCleanup(lambda: mock.patch.object(bot.bot, "get_guild").stop())
+        self.addCleanup(lambda: mock.patch.object(bot.config, "channel_for").stop())
+
+    async def test_audit_forbidden_logged_with_reason_format(self):
+        """Forbidden errors log in 'reason=forbidden' format."""
+        ch = mock.MagicMock(spec=discord.TextChannel)
+        ch.id = 100
+        ch.send = mock.AsyncMock(side_effect=discord.Forbidden(mock.MagicMock(status=403), "Forbidden"))
+
+        guild = mock.MagicMock(spec=discord.Guild)
+        guild.id = 1
+        guild.me = mock.MagicMock()
+        guild.get_member.return_value = mock.MagicMock()  # All mentioned users exist and can view
+        guild.get_channel.return_value = ch
+        ch.permissions_for.return_value = mock.MagicMock(view_channel=True)
+
+        with mock.patch.object(bot.bot, "get_guild", return_value=guild):
+            with mock.patch.object(bot.config, "channel_for", return_value=100):
+                with self.assertLogs("bot", "WARNING") as log_ctx:
+                    try:
+                        await bot.controller.send_message(1, "hi <@42>", "alice")
+                    except Exception:
+                        pass  # Expected to raise MessageError
+
+        # Verify log contains the reason format
+        self.assertTrue(any("reason=forbidden" in msg for msg in log_ctx.output),
+                       f"Expected 'reason=forbidden' in logs, got: {log_ctx.output}")
+        # Verify message content is NOT in logs
+        self.assertFalse(any("secret" in msg for msg in log_ctx.output))
+
+
 class MembersForTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.addCleanup(lambda: mock.patch.object(bot.bot, "get_guild").stop())
