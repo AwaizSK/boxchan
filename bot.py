@@ -543,8 +543,12 @@ class Controller:
         return guild, ch
 
     async def members_for(self, guild_id: int, q: str = "") -> dict:
-        """Members who can view the configured channel, for the tag picker (max 25)."""
+        """Members who can view the configured channel, for the tag picker (max 25).
+        Caps permission checks at 2000 per request; yields to the event loop every ~250 members."""
         guild, ch = self._message_channel(guild_id)
+        if guild.me is None:
+            # guild.me can be None during outages; return empty result
+            return {"members": [], "truncated": False}
         if not guild.chunked:
             async with self._chunk_lock:
                 if not guild.chunked:
@@ -560,15 +564,18 @@ class Controller:
         cands = [m for m in guild.members
                  if not needle or any(n and needle in n.casefold() for n in names(m))]
         cands.sort(key=lambda m: (bool(m.bot), m.display_name.casefold(), m.id))
-        out, truncated = [], False
+        out, truncated, perm_checks = [], False, 0
+        MAX_PERM_CHECKS = 2000
         for idx, m in enumerate(cands):
             if idx > 0 and idx % 250 == 0:
                 await asyncio.sleep(0)
-            if idx >= 5000:
+            if perm_checks >= MAX_PERM_CHECKS:
                 truncated = True
                 break
             if not ch.permissions_for(m).view_channel:
+                perm_checks += 1
                 continue
+            perm_checks += 1
             if len(out) == 25:
                 truncated = True
                 break

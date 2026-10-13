@@ -184,5 +184,116 @@ class ConfigWatcherTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.task.done())
 
 
+class MembersForTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.addCleanup(lambda: mock.patch.object(bot.bot, "get_guild").stop())
+
+    async def test_permission_check_cap_at_2000(self):
+        """Scan stops at 2000 permission checks and returns truncated=true."""
+        ch = mock.MagicMock(spec=discord.TextChannel)
+        ch.id = 100
+
+        # Create 5000 members: members 2000+ can view, first 2000 cannot
+        members = []
+        for i in range(5000):
+            m = mock.MagicMock(spec=discord.Member)
+            m.id = i
+            m.bot = False
+            m.display_name = f"member_{i:04d}"
+            m.name = f"user{i}"
+            m.global_name = None
+            members.append(m)
+
+        # Mock ch.permissions_for to return view_channel based on member id
+        def perm_for(member):
+            perm = mock.MagicMock()
+            perm.view_channel = member.id >= 2000  # First 2000 cannot view
+            return perm
+
+        guild = mock.MagicMock(spec=discord.Guild)
+        guild.id = 1
+        guild.members = members
+        guild.me = mock.MagicMock()
+        guild.chunked = True
+        guild.get_channel.return_value = ch
+        ch.permissions_for.side_effect = perm_for
+
+        with mock.patch.object(bot.bot, "get_guild", return_value=guild):
+            with mock.patch.object(bot.config, "channel_for", return_value=100):
+                result = await bot.controller.members_for(1, "")
+
+        # Should have capped at 2000 permission checks (all without view), so 0 results
+        self.assertEqual(len(result["members"]), 0)
+        self.assertTrue(result["truncated"])
+        # Verify that we stopped after checking 2000 permissions
+        perm_check_count = ch.permissions_for.call_count
+        self.assertLessEqual(perm_check_count, 2001)
+
+    async def test_yields_to_event_loop(self):
+        """Scan yields to event loop every ~250 members (other tasks can run)."""
+        ch = mock.MagicMock(spec=discord.TextChannel)
+        ch.id = 100
+
+        # Create many members that all can view
+        members = []
+        for i in range(1000):
+            m = mock.MagicMock(spec=discord.Member)
+            m.id = i
+            m.bot = False
+            m.display_name = f"member_{i:04d}"
+            m.name = f"user{i}"
+            m.global_name = None
+            members.append(m)
+
+        # All members can view
+        def perm_for(member):
+            perm = mock.MagicMock()
+            perm.view_channel = True
+            return perm
+
+        guild = mock.MagicMock(spec=discord.Guild)
+        guild.id = 1
+        guild.members = members
+        guild.me = mock.MagicMock()
+        guild.chunked = True
+        guild.get_channel.return_value = ch
+        ch.permissions_for.side_effect = perm_for
+
+        task_ran = []
+        async def other_task():
+            await asyncio.sleep(0.01)
+            task_ran.append(True)
+
+        with mock.patch.object(bot.bot, "get_guild", return_value=guild):
+            with mock.patch.object(bot.config, "channel_for", return_value=100):
+                search_task = asyncio.create_task(bot.controller.members_for(1, ""))
+                other = asyncio.create_task(other_task())
+                result = await search_task
+                await other
+
+        # If the search yields, the other task should have run
+        self.assertTrue(task_ran, "other task should have run during scan")
+        # Scan should have returned truncated=true (capped at 25 results)
+        self.assertTrue(result["truncated"])
+        self.assertEqual(len(result["members"]), 25)
+
+    async def test_guild_me_is_none_returns_empty(self):
+        """When guild.me is None (outage), return empty member list."""
+        ch = mock.MagicMock(spec=discord.TextChannel)
+        ch.id = 100
+
+        guild = mock.MagicMock(spec=discord.Guild)
+        guild.id = 1
+        guild.me = None  # During outage
+        guild.get_channel.return_value = ch
+
+        with mock.patch.object(bot.bot, "get_guild", return_value=guild):
+            with mock.patch.object(bot.config, "channel_for", return_value=100):
+                result = await bot.controller.members_for(1, "")
+
+        self.assertEqual(result["members"], [])
+        self.assertFalse(result["truncated"])
+
+
 if __name__ == "__main__":
     unittest.main()
