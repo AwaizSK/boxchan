@@ -57,13 +57,36 @@ Every command works as prefix (`COMMAND_PREFIX`, default `!`) and as slash comma
 The bot reads messages and accepts commands only in the text channel chosen per guild. `config.json` (`CONFIG_FILE`, default next to `state.json`; `/var/lib/tts-bot/config.json` in production) is the source of truth and is edited from the Web UI. `TTS_CHANNEL_ID` is only a first-boot seed: it populates a guild with no entry yet and is ignored afterwards. `join` follows whoever runs it into their voice channel.
 
 ## Web UI
-A small page with three tabs: **Channel** (pick which text channel the bot listens to, pause/resume it, skip or clear the queue, per guild), **Voice** (see above) and **Messages** (post as the bot, see below). Changes apply live; no restart.
+A small page with five tabs: **Channel** (pick which text channel the bot listens to, pause/resume it, skip or clear the queue, per guild), **Voice** (see above), **Messages** (post as the bot, see below), **Features** (request features, log author, admin-only deletion), and **Admin** (admin-only user & group management). Changes apply live; no restart.
 
-Start: just run the bot. There is **no login**: the network is the security boundary (see Security notes).
+Start: just run the bot. When `users.json` (or `USERS_FILE`) is configured, the GUI provides a **Sign in** page with session authentication to control who views the app:
 ```bash
 python bot.py                          # dev: GUI on http://127.0.0.1:8765
 ```
-Open it, enter a display name (shown to other editors). Settings (all optional):
+Open it, sign in with your credentials, and optionally set a display name (shown to other editors). You can sign out anytime with **Sign out**.
+User credentials are read from `users.json` (`USERS_FILE` env override; `/var/lib/tts-bot/users.json` in production):
+```json
+[
+  { "username": "admin", "password": "yourpassword", "groups": ["admin"] },
+  { "username": "tester1", "password": "testerpassword", "groups": ["tester"] }
+]
+```
+Passwords can be plaintext or `sha256:<hex>`. Credentials reload automatically on file change without restarting the bot. Any user belonging to the `"admin"` group (or with `username: "admin"` / `"role": "admin"` / `"is_admin": true`) has admin privileges, such as deleting feature requests and accessing the Admin panel.
+
+### Features tab (feature requests)
+Submit and track feature requests directly in the GUI:
+- **Request feature:** Any signed-in user can submit a feature with a name (1–100 chars) and description (1–2000 chars).
+- **Author logging:** The server automatically records the logged-in username as the author (who requested it) along with the creation date.
+- **Admin deletion:** Only administrators can delete feature requests. Non-admins cannot see the delete button and the backend rejects unauthorized deletions with `403 Forbidden`.
+- **Storage:** Persisted in `features.json` (`FEATURES_FILE` env override; `/var/lib/tts-bot/features.json` in production).
+
+### Admin tab (user & group management)
+Available exclusively to admin users:
+- **Manage users:** Create or update users, reset passwords, and assign groups (e.g. `admin`, `tester`).
+- **Group capabilities:** Group membership is checked for privileged actions (`in_group(user, "admin")`).
+- **Admin protection:** The primary `admin` user cannot be deleted, and signed-in admins cannot delete their own active user. Non-admins cannot see the tab and all backend endpoints enforce `403 Forbidden`.
+
+Settings (all optional):
 - `WEBUI_PORT` (default `8765`).
 - `WEBUI_HOSTS`: comma-separated bind addresses. Only loopback (`127.0.0.0/8`, `::1`, or `localhost`) and Tailscale addresses (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`) are accepted; anything else (`0.0.0.0`, `::`, LAN addresses, hostnames) disables the GUI with an error log. Unset (auto mode) = `127.0.0.1` plus this machine's Tailscale addresses (`tailscale ip`, else `ip addr show dev tailscale0`). If Tailscale has no address yet at boot, detection is repeated every 15 s until one is found and bound. In explicit mode only the listed addresses are retried (every 15 s) and nothing is re-detected; always include `127.0.0.1` in the list, otherwise Tailscale being down at boot leaves nothing bound, startup fails and the GUI stays off until the bot restarts. Note a non-Tailscale address inside `100.64.0.0/10` (ISP CGNAT) also passes the range policy.
 - `WEBUI_ALLOWED_HOSTS`: extra `Host` names the GUI answers to (comma-separated hostnames, no wildcards), e.g. your MagicDNS name. Always allowed: `localhost`, `127.0.0.1`, `::1` and the configured bind addresses. Any other Host gets `403 {"error":"bad_host"}`: in a browser you see that raw JSON instead of the page (the page itself is blocked), so add the hostname you typed to `WEBUI_ALLOWED_HOSTS`. Entries must be plain hostnames (optionally `:port`); URLs, paths and wildcards are rejected with a warning.
@@ -120,6 +143,34 @@ sudo systemctl enable tts_bot
 ```
 Devs (no password) can: `sudo systemctl start|stop|restart tts_bot`, `systemctl status tts_bot`, `journalctl -u tts_bot` (after re-login for the `systemd-journal` group). They cannot read the token or change deployed code.
 Local testing: each dev should create their own dev bot application and run `scripts/install_token.sh` (personal `~/.config/tts-bot/token`). Never share the production token.
+
+### Developer Collaboration & PR Workflow
+1. **Clone & Environment Setup:**
+   ```bash
+   git clone <repo-url>
+   cd boxchan
+   conda create -n tts-bot python=3.11 -y && conda activate tts-bot
+   pip install -r requirements.txt
+   cp .env.example .env
+   cp users.example.json users.json
+   ```
+2. **Local Verification:**
+   Before pushing changes and opening a pull request, run the full validation suite:
+   ```bash
+   python -m unittest discover -s tests -v
+   bash tests/test_deploy_validation.sh
+   node tests/static_logic.js
+   ```
+3. **Pull Request Process:**
+   - Create a feature branch (`git checkout -b feature/my-enhancement`).
+   - Keep commits granular and adhere to documentation guidelines.
+   - Open a PR against `main` for review.
+
+### CI/CD & Self-Hosted Runner Deployment
+To automate deployments from PR merges:
+- Setup a self-hosted GitHub Actions / GitLab CI runner on this server.
+- The runner executes tests on incoming PRs.
+- On merge to `main`, an authorized pipeline triggers `sudo scripts/deploy.sh` to update `/opt/tts-bot` and restart `tts_bot.service`.
 
 ### Upgrading an existing deployment
 The GUI token is gone and the unit changed (Tailscale ordering, no `gui_token` credential, `WEBUI_HOST` replaced by `WEBUI_HOSTS`):

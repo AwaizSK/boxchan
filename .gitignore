@@ -4,6 +4,8 @@
 *.swp
 state.json
 config.json
+users.json
+!users.example.json
 __pycache__/
 *.pyc
 models/*.onnx
@@ -11,3 +13,4 @@ models/*.onnx.json
 .superpowers/
 .claude/settings.local.json
 repomix-output.xml
+features.json

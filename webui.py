@@ -3,11 +3,14 @@ is the trust boundary; this module enforces a bind-address policy, a Host allowl
 check on writes. Duck-typed on the controller; never imports bot.py."""
 import asyncio
 import contextlib
+import hashlib
+import hmac
 import ipaddress
 import json
 import logging
 import os
 import re
+import secrets
 import subprocess
 import time
 import unicodedata
@@ -16,10 +19,277 @@ from urllib.parse import unquote, urlsplit
 from aiohttp import web
 
 from config_store import ConflictError
+from features import FeatureStore
 from messages import MAX_MESSAGE_CHARS, MessageError
 from voices import VOICE_NAME_RE, BadVoiceError, SayError, VoiceLoadError
 
 log = logging.getLogger("webui")
+
+SESSION_COOKIE = "tts_session"
+SESSION_LIFETIME = 7 * 86400.0  # 7 days
+MAX_LOGIN_FAILURES = 5
+LOGIN_RATE_WINDOW = 60.0  # seconds
+AUTH_MANAGER_KEY = web.AppKey("auth_manager", object)
+FEATURE_STORE_KEY = web.AppKey("feature_store", object)
+USER_KEY = web.RequestKey("user", str)
+
+
+class AuthManager:
+    """Session-based authentication manager for Web UI.
+
+    Loads credentials from a JSON file (users.json).
+    Supports:
+      - [{"username": "...", "password": "..."}, ...]
+      - {"users": [{"username": "...", "password": "..."}, ...]}
+      - {"users": {"<user>": "<pass>", ...}}
+      - {"<user>": "<pass>", ...}
+      - {"<user>": {"password": "<pass>"}, ...}
+    Passwords can be plaintext or "sha256:<hex>".
+    """
+
+    def __init__(self, users_file: str | None = None):
+        self.users_file = users_file
+        self.sessions: dict[str, dict] = {}
+        self.failed_attempts: dict[str, list[float]] = {}
+        self._cached_users: dict[str, str] = {}
+        self._cached_admins: set[str] = set()
+        self._cached_groups: dict[str, set[str]] = {}
+        self._cached_mtime: float = -1.0
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.users_file and os.path.exists(self.users_file))
+
+    def load_users(self) -> dict[str, str]:
+        if not self.enabled:
+            return {}
+        try:
+            mtime = os.path.getmtime(self.users_file)
+            if mtime == self._cached_mtime:
+                return self._cached_users
+            with open(self.users_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            users: dict[str, str] = {}
+            groups_map: dict[str, set[str]] = {}
+            raw_list = []
+            if isinstance(data, list):
+                raw_list = data
+            elif isinstance(data, dict):
+                if "users" in data:
+                    u_val = data["users"]
+                    if isinstance(u_val, list):
+                        raw_list = u_val
+                    elif isinstance(u_val, dict):
+                        data = u_val
+                if not raw_list:
+                    for k, v in data.items():
+                        uname = str(k).strip()
+                        ugroups: set[str] = set()
+                        if isinstance(v, str):
+                            users[uname] = v
+                        elif isinstance(v, dict) and "password" in v:
+                            users[uname] = str(v["password"])
+                            if v.get("role"):
+                                ugroups.add(str(v["role"]).lower())
+                            if v.get("is_admin") is True or v.get("role") == "admin":
+                                ugroups.add("admin")
+                            if isinstance(v.get("groups"), list):
+                                ugroups.update(str(g).strip().lower() for g in v["groups"] if g)
+                        groups_map[uname.lower()] = ugroups
+            for item in raw_list:
+                if isinstance(item, dict) and "username" in item and "password" in item:
+                    uname = str(item["username"]).strip()
+                    users[uname] = str(item["password"])
+                    ugroups = set()
+                    if item.get("role"):
+                        ugroups.add(str(item["role"]).lower())
+                    if item.get("is_admin") is True or item.get("role") == "admin":
+                        ugroups.add("admin")
+                    if isinstance(item.get("groups"), list):
+                        ugroups.update(str(g).strip().lower() for g in item["groups"] if g)
+                    groups_map[uname.lower()] = ugroups
+            for u in users:
+                u_lower = u.lower()
+                if u_lower == "admin":
+                    groups_map.setdefault(u_lower, set()).add("admin")
+                if not groups_map.get(u_lower):
+                    groups_map[u_lower] = {"user"}
+            self._cached_users = users
+            self._cached_groups = groups_map
+            self._cached_admins = {u for u, grps in groups_map.items() if "admin" in grps}
+            self._cached_mtime = mtime
+            return users
+        except Exception as e:
+            log.warning("could not load users from %s: %s", self.users_file, e)
+            return self._cached_users
+
+    def get_user_groups(self, username: str | None) -> set[str]:
+        if not self.enabled:
+            return {"admin"}
+        if not username:
+            return set()
+        self.load_users()
+        return self._cached_groups.get(username.strip().lower(), set())
+
+    def in_group(self, username: str | None, group: str) -> bool:
+        if not self.enabled:
+            return True
+        if not username:
+            return False
+        if group.strip().lower() == "admin" and username.strip().lower() == "admin":
+            return True
+        return group.strip().lower() in self.get_user_groups(username)
+
+    def is_admin(self, username: str | None) -> bool:
+        return self.in_group(username, "admin")
+
+    def list_users(self) -> list[dict]:
+        self.load_users()
+        result = []
+        for uname in sorted(self._cached_users.keys()):
+            grps = sorted(list(self.get_user_groups(uname)))
+            result.append({"username": uname, "groups": grps})
+        return result
+
+    def save_user(self, username: str, password: str | None, groups: list[str]) -> bool:
+        if not self.users_file:
+            return False
+        uname = username.strip()
+        uname_lower = uname.lower()
+        grps = [str(g).strip().lower() for g in groups if str(g).strip()]
+        if not grps:
+            grps = ["user"]
+        if uname_lower == "admin" and "admin" not in grps:
+            grps.append("admin")
+
+        data = []
+        if os.path.exists(self.users_file):
+            try:
+                with open(self.users_file, "r", encoding="utf-8") as f:
+                    raw = json.load(f)
+                if isinstance(raw, list):
+                    data = raw
+                elif isinstance(raw, dict):
+                    if "users" in raw and isinstance(raw["users"], list):
+                        data = raw["users"]
+                    else:
+                        for k, v in raw.items():
+                            p = v if isinstance(v, str) else (v.get("password") if isinstance(v, dict) else "")
+                            data.append({"username": str(k), "password": p, "groups": ["admin" if str(k).lower() == "admin" else "user"]})
+            except Exception:
+                data = []
+
+        found = False
+        for item in data:
+            if isinstance(item, dict) and str(item.get("username", "")).strip().lower() == uname_lower:
+                found = True
+                if password:
+                    item["password"] = password
+                item["groups"] = grps
+                break
+        if not found:
+            data.append({"username": uname, "password": password or "", "groups": grps})
+
+        from config_store import atomic_write_json
+        atomic_write_json(data, self.users_file)
+        self._cached_mtime = -1.0
+        self.load_users()
+        return True
+
+    def delete_user(self, username: str) -> bool:
+        if not self.users_file or not os.path.exists(self.users_file):
+            return False
+        uname_lower = username.strip().lower()
+        if uname_lower == "admin":
+            return False
+        try:
+            with open(self.users_file, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            data = []
+            if isinstance(raw, list):
+                data = raw
+            elif isinstance(raw, dict):
+                if "users" in raw and isinstance(raw["users"], list):
+                    data = raw["users"]
+                else:
+                    for k, v in raw.items():
+                        p = v if isinstance(v, str) else (v.get("password") if isinstance(v, dict) else "")
+                        data.append({"username": str(k), "password": p, "groups": ["admin" if str(k).lower() == "admin" else "user"]})
+            new_data = [item for item in data if not (isinstance(item, dict) and str(item.get("username", "")).strip().lower() == uname_lower)]
+            if len(new_data) == len(data):
+                return False
+            from config_store import atomic_write_json
+            atomic_write_json(new_data, self.users_file)
+            self._cached_mtime = -1.0
+            self.load_users()
+            return True
+        except Exception as e:
+            log.warning("failed to delete user %s: %s", username, e)
+            return False
+
+    def verify_password(self, username: str, password: str) -> bool:
+        users = self.load_users()
+        uname_clean = username.strip().lower()
+        matched_pass = None
+        for u, p in users.items():
+            if u.lower() == uname_clean:
+                matched_pass = p
+                break
+        if matched_pass is None:
+            return False
+        if matched_pass.startswith("sha256:"):
+            h = hashlib.sha256(password.encode("utf-8")).hexdigest()
+            return hmac.compare_digest(matched_pass[7:].lower(), h.lower())
+        return hmac.compare_digest(matched_pass, password)
+
+    def check_rate_limit(self, ip: str) -> bool:
+        now = time.monotonic()
+        recent = [t for t in self.failed_attempts.get(ip, []) if now - t < LOGIN_RATE_WINDOW]
+        self.failed_attempts[ip] = recent
+        return len(recent) < MAX_LOGIN_FAILURES
+
+    def record_failure(self, ip: str) -> None:
+        self.failed_attempts.setdefault(ip, []).append(time.monotonic())
+
+    def record_success(self, ip: str) -> None:
+        self.failed_attempts.pop(ip, None)
+
+    def create_session(self, username: str) -> str:
+        now = time.time()
+        expired = [sid for sid, s in self.sessions.items() if now > s["expires_at"]]
+        for sid in expired:
+            self.sessions.pop(sid, None)
+        sid = secrets.token_urlsafe(32)
+        self.sessions[sid] = {
+            "username": username,
+            "created_at": now,
+            "expires_at": now + SESSION_LIFETIME,
+        }
+        return sid
+
+    def get_session(self, session_id: str | None) -> str | None:
+        if not session_id or session_id not in self.sessions:
+            return None
+        s = self.sessions[session_id]
+        if time.time() > s["expires_at"]:
+            self.sessions.pop(session_id, None)
+            return None
+        return s["username"]
+
+    def revoke_session(self, session_id: str | None) -> None:
+        if session_id:
+            self.sessions.pop(session_id, None)
+
+
+def _session_id_from(request) -> str | None:
+    sid = request.cookies.get(SESSION_COOKIE) or request.cookies.get("session")
+    if sid:
+        return sid
+    auth_hdr = request.headers.get("Authorization", "")
+    if auth_hdr.startswith("Bearer "):
+        return auth_hdr[7:].strip()
+    return None
+
 
 MAX_BODY = 16384  # 2000 non-ASCII chars JSON-escaped (\uXXXX) are ~12 KB
 MAX_SAY_CHARS = 200
@@ -272,12 +542,20 @@ def _err(code, status):
 
 
 def make_app(config, controller, *, allowed_hosts, status_interval: float = 3.0,
-             keepalive_interval: float = 15.0, static_dir: str | None = None) -> web.Application:
+             keepalive_interval: float = 15.0, static_dir: str | None = None,
+             users_file: str | None = None,
+             features_file: str | None = None) -> web.Application:
     allowed = {"localhost", "127.0.0.1", "::1"}
     allowed.update(h for h in (host_of(x) for x in allowed_hosts) if h)
     streams: set[asyncio.Task] = set()
     peer_logged: dict[str, float] = {}
     static_dir = static_dir or DEFAULT_STATIC_DIR
+    users_file = users_file or os.getenv("USERS_FILE")
+    auth_mgr = AuthManager(users_file)
+    features_path = features_file or os.getenv("FEATURES_FILE") or (
+        os.path.join(os.path.dirname(config.path), "features.json") if hasattr(config, "path") and config.path else "features.json"
+    )
+    feature_store = FeatureStore(features_path)
 
     @web.middleware
     async def security_headers(request, handler):
@@ -333,7 +611,22 @@ def make_app(config, controller, *, allowed_hosts, status_interval: float = 3.0,
                 return _err("bad_origin", 403)
         return await handler(request)
 
-    app = web.Application(middlewares=[security_headers, peer_guard, host_guard], client_max_size=MAX_BODY)
+    PUBLIC_PATHS = frozenset({"/", "/app.js", "/app.css", "/api/session", "/api/login", "/api/logout"})
+
+    @web.middleware
+    async def auth_guard(request, handler):
+        if not auth_mgr.enabled:
+            return await handler(request)
+        if request.path in PUBLIC_PATHS:
+            return await handler(request)
+        sid = _session_id_from(request)
+        user = auth_mgr.get_session(sid)
+        if not user:
+            return _err("unauthorized", 401)
+        request[USER_KEY] = user
+        return await handler(request)
+
+    app = web.Application(middlewares=[security_headers, peer_guard, host_guard, auth_guard], client_max_size=MAX_BODY)
 
     # --- static ---
     def static_handler(name, ctype):
@@ -366,6 +659,10 @@ def make_app(config, controller, *, allowed_hosts, status_interval: float = 3.0,
 
     def editor_of(request):
         ed = sanitize_editor(unquote(request.headers.get("X-Editor") or ""))
+        if ed is None:
+            user = request.get(USER_KEY)
+            if user:
+                ed = sanitize_editor(user)
         if ed is None:
             raise web.HTTPBadRequest(text=json.dumps({"error": "editor_required"}),
                                      content_type="application/json")
@@ -583,11 +880,154 @@ def make_app(config, controller, *, allowed_hosts, status_interval: float = 3.0,
             streams.discard(asyncio.current_task())
         return resp
 
+    async def session_status(request):
+        if not auth_mgr.enabled:
+            return _json({"authenticated": True, "auth_required": False, "username": "admin", "is_admin": True})
+        sid = _session_id_from(request)
+        user = auth_mgr.get_session(sid) if sid else None
+        if user:
+            return _json({
+                "authenticated": True,
+                "auth_required": True,
+                "username": user,
+                "is_admin": auth_mgr.is_admin(user),
+            })
+        return _json({"authenticated": False, "auth_required": True})
+
+    async def login(request):
+        if not auth_mgr.enabled:
+            return _json({"ok": True, "auth_required": False, "username": "admin", "is_admin": True})
+        peer = _peer_of(request)
+        ip = str(peer[0]) if peer else "unknown"
+        if not auth_mgr.check_rate_limit(ip):
+            return _err("rate_limited", 429)
+        body = await body_of(request)
+        username = str(body.get("username", "")).strip()
+        password = str(body.get("password", ""))
+        if not username or not password:
+            return _err("bad_request", 400)
+        if not auth_mgr.verify_password(username, password):
+            auth_mgr.record_failure(ip)
+            log.warning("failed login attempt for user %r from %s", username, ip)
+            return _err("invalid_credentials", 401)
+        auth_mgr.record_success(ip)
+        sid = auth_mgr.create_session(username)
+        resp = _json({"ok": True, "username": username, "is_admin": auth_mgr.is_admin(username)})
+        resp.set_cookie(SESSION_COOKIE, sid, max_age=int(SESSION_LIFETIME), path="/", httponly=True, samesite="Lax")
+        return resp
+
+    async def logout(request):
+        sid = _session_id_from(request)
+        if sid:
+            auth_mgr.revoke_session(sid)
+        resp = _json({"ok": True})
+        resp.del_cookie(SESSION_COOKIE, path="/")
+        resp.del_cookie("session", path="/")
+        return resp
+
+    async def get_features(request):
+        return _json({"features": feature_store.get_features()})
+
+    async def post_feature(request):
+        body = await body_of(request)
+        name = body.get("name")
+        desc = body.get("description")
+        if not isinstance(name, str) or not isinstance(desc, str):
+            return _err("bad_request", 400)
+        user = request.get(USER_KEY) or editor_of(request) or "anonymous"
+        try:
+            feat = await feature_store.add_feature(name, desc, user)
+            return _json({"ok": True, "feature": feat}, 201)
+        except ValueError:
+            return _err("bad_request", 400)
+        except Exception:
+            log.exception("failed to add feature")
+            return _err("internal", 500)
+
+    async def delete_feature(request):
+        user = request.get(USER_KEY) or editor_of(request)
+        if auth_mgr.enabled and not auth_mgr.is_admin(user):
+            return _err("forbidden", 403)
+        fid = request.match_info.get("fid", "")
+        if not fid:
+            return _err("bad_request", 400)
+        try:
+            ok = await feature_store.delete_feature(fid)
+            if not ok:
+                return _err("not_found", 404)
+            return _json({"ok": True})
+        except Exception:
+            log.exception("failed to delete feature")
+            return _err("internal", 500)
+
+    async def get_admin_users(request):
+        user = request.get(USER_KEY) or editor_of(request)
+        if auth_mgr.enabled and not auth_mgr.is_admin(user):
+            return _err("forbidden", 403)
+        return _json({"users": auth_mgr.list_users()})
+
+    async def save_admin_user(request):
+        user = request.get(USER_KEY) or editor_of(request)
+        if auth_mgr.enabled and not auth_mgr.is_admin(user):
+            return _err("forbidden", 403)
+        body = await body_of(request)
+        uname = str(body.get("username", "")).strip()
+        passw = body.get("password")
+        if passw is not None:
+            passw = str(passw)
+        raw_groups = body.get("groups", ["user"])
+        if isinstance(raw_groups, str):
+            raw_groups = [g.strip() for g in raw_groups.split(",") if g.strip()]
+        elif not isinstance(raw_groups, list):
+            raw_groups = [str(raw_groups)]
+        groups = [str(g).strip().lower() for g in raw_groups if str(g).strip()]
+        if not (1 <= len(uname) <= 40) or not re.match(r"^[A-Za-z0-9_.-]+$", uname):
+            return _err("bad_request", 400)
+        try:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, auth_mgr.save_user, uname, passw, groups)
+            return _json({"ok": True, "username": uname, "groups": groups})
+        except Exception:
+            log.exception("failed to save user")
+            return _err("internal", 500)
+
+    async def delete_admin_user(request):
+        user = request.get(USER_KEY) or editor_of(request)
+        if auth_mgr.enabled and not auth_mgr.is_admin(user):
+            return _err("forbidden", 403)
+        target = request.match_info.get("uname", "").strip()
+        if not target:
+            return _err("bad_request", 400)
+        if user and target.lower() == str(user).lower():
+            return _err("cannot_delete_self", 400)
+        if target.lower() == "admin":
+            return _err("cannot_delete_admin", 400)
+        try:
+            loop = asyncio.get_running_loop()
+            ok = await loop.run_in_executor(None, auth_mgr.delete_user, target)
+            if not ok:
+                return _err("not_found", 404)
+            return _json({"ok": True})
+        except Exception:
+            log.exception("failed to delete user")
+            return _err("internal", 500)
+
     async def end_streams(app):
         for t in list(streams):
             t.cancel()
 
     app.on_shutdown.append(end_streams)
+    app[AUTH_MANAGER_KEY] = auth_mgr
+    app[FEATURE_STORE_KEY] = feature_store
+    app.router.add_get("/api/session", session_status)
+    app.router.add_post("/api/login", login)
+    app.router.add_post("/api/logout", logout)
+    app.router.add_get("/api/features", get_features)
+    app.router.add_post("/api/features", post_feature)
+    app.router.add_delete("/api/features/{fid}", delete_feature)
+    app.router.add_get("/api/admin/users", get_admin_users)
+    app.router.add_post("/api/admin/users", save_admin_user)
+    app.router.add_delete("/api/admin/users/{uname}", delete_admin_user)
     app.router.add_get("/api/state", state)
     app.router.add_put("/api/guilds/{gid}/channel", put_channel)
     app.router.add_put("/api/guilds/{gid}/enabled", put_enabled)

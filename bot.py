@@ -61,6 +61,8 @@ MAX_CHARS = int(os.getenv("MAX_CHARS", "300"))
 MAX_QUEUE = int(os.getenv("MAX_QUEUE", "20"))
 STATE_FILE = os.getenv("STATE_FILE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json"))
 CONFIG_FILE = os.getenv("CONFIG_FILE", os.path.join(os.path.dirname(STATE_FILE), "config.json"))
+USERS_FILE = os.getenv("USERS_FILE", os.path.join(os.path.dirname(CONFIG_FILE), "users.json"))
+FEATURES_FILE = os.getenv("FEATURES_FILE", os.path.join(os.path.dirname(STATE_FILE), "features.json"))
 
 
 def parse_port(raw: str | None, default: int = 8765) -> int:
@@ -912,7 +914,7 @@ async def maybe_start_webui(cfg, ctl, port: int):
         else:
             hosts = validate_bind_hosts(["127.0.0.1"] + await asyncio.to_thread(detect_tailscale_addrs))
         allowed = hosts + parse_allowed_hosts(os.getenv("WEBUI_ALLOWED_HOSTS"))
-        runner = await start_webui(make_app(cfg, ctl, allowed_hosts=allowed), hosts, port,
+        runner = await start_webui(make_app(cfg, ctl, allowed_hosts=allowed, users_file=USERS_FILE, features_file=FEATURES_FILE), hosts, port,
                                     detect=detect_tailscale_addrs if auto else None)
     except ValueError as e:
         log.error("Web UI disabled: %s", e)

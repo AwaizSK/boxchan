@@ -80,3 +80,13 @@ textarea{font:inherit;color:inherit;background:var(--card);border:1px solid var(
 .sendrow .muted{flex:1 1 200px}
 @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important;scroll-behavior:auto!important}}
 @media (max-width:420px){#app{padding:8px 10px 48px}.controls button{flex:1 1 auto}}
+#login-msg:empty{display:none}
+.f-form{display:grid;gap:8px;margin-bottom:16px}
+.f-form textarea{min-height:80px}
+.f-list{display:grid;gap:10px}
+.f-card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px}
+.f-head{display:flex;align-items:flex-start;justify-content:space-between;gap:8px}
+.f-title{font-size:1rem;font-weight:600;margin:0 0 4px}
+.f-desc{margin:0 0 8px;white-space:pre-wrap;word-break:break-word}
+.f-del{color:var(--bad);background:none;border:0;padding:2px 8px;min-height:30px;font-size:.8125rem;cursor:pointer}
+.f-del:hover{text-decoration:underline}

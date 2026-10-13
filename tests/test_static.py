@@ -53,6 +53,22 @@ class StaticContentTests(unittest.TestCase):
         # global shortcuts must stay off while the Messages tab is active
         self.assertIn("S.tab === 'messages') return", js)
 
+    def test_features_tab_ids_are_wired(self):
+        html, js = read("index.html"), read("app.js")
+        for ident in ("tab-features", "view-features", "f-form", "f-name", "f-desc", "f-submit", "f-list", "f-empty"):
+            self.assertIn('id="%s"' % ident, html, ident)
+            if not ident.startswith(("view-", "tab-")):
+                self.assertIn(ident, js, ident)
+        self.assertIn("S.tab === 'features') return", js)
+
+    def test_admin_tab_ids_are_wired(self):
+        html, js = read("index.html"), read("app.js")
+        for ident in ("tab-admin", "view-admin", "u-form", "u-name", "u-pass", "u-groups", "u-submit", "u-list", "u-empty"):
+            self.assertIn('id="%s"' % ident, html, ident)
+            if not ident.startswith(("view-", "tab-")):
+                self.assertIn(ident, js, ident)
+        self.assertIn("S.tab === 'admin') return", js)
+
     def test_csp_safe_content(self):
         for n in FILES:
             s = read(n)

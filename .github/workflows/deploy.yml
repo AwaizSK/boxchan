@@ -1,0 +1,26 @@
+name: Deploy TTS Bot
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  test-and-deploy:
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Run Test Suite
+        run: |
+          source ~/miniconda3/etc/profile.d/conda.sh
+          conda activate tts-bot
+          python -m unittest discover -s tests -v
+          bash tests/test_deploy_validation.sh
+          node tests/static_logic.js
+
+      - name: Deploy to /opt/tts-bot & Restart Service
+        run: |
+          sudo scripts/deploy.sh

@@ -17,8 +17,9 @@ StateDirectory=tts-bot
 EnvironmentFile=-/etc/tts-bot/bot.env
 Environment=STATE_FILE=/var/lib/tts-bot/state.json
 Environment=CONFIG_FILE=/var/lib/tts-bot/config.json
-# Web UI has NO login: the network is the boundary. It binds loopback + this host's Tailscale address(es)
-# (auto-detected, re-checked every 15 s until found). Linux answers on any local address for any interface, so the
+Environment=USERS_FILE=/var/lib/tts-bot/users.json
+Environment=FEATURES_FILE=/var/lib/tts-bot/features.json
+# Web UI binds loopback + this host's Tailscale address(es) (auto-detected, re-checked every 15 s until found). Linux answers on any local address for any interface, so the
 # app also refuses connections whose SOURCE address is not loopback/Tailscale (bad_peer) and only answers allowlisted
 # Host names. Secure it with Tailscale ACLs; also recommended: host firewall rules (see docs/ARCHITECTURE.md runbook).
 # Optional overrides (loopback / Tailscale addresses only, comma-separated; anything else disables the GUI).
