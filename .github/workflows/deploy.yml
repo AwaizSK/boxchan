@@ -23,4 +23,4 @@ jobs:
 
       - name: Deploy to /opt/tts-bot & Restart Service
         run: |
-          sudo scripts/deploy.sh
+          sudo /opt/workspace/boxchan/scripts/deploy.sh "$GITHUB_WORKSPACE"
