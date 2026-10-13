@@ -114,6 +114,21 @@ All IDs on the wire are strings (JS numbers lose precision above 2^53). `wire_sn
 
 ---
 
+### Chat commands
+
+Every command is a hybrid command (prefix and slash), guild-only, and runs only in the configured text channel. The table matches `bot.commands`; `help` generates its list from the same registry.
+
+| Command | Description |
+|---|---|
+| `help` | Show available commands and current status |
+| `join` | Join your voice channel |
+| `leave` | Leave voice, clear queue and watch list |
+| `skip` | Skip the clip currently playing |
+| `status` | Show watched users and voice state |
+| `stop @user` | Stop reading this user's messages |
+| `voices` | List available TTS voices (read-only; switching is GUI-only, D44) |
+| `watch @user` | Read this user's messages aloud, optionally join voice (joins your channel when the bot is not connected) |
+
 ## 4. Data-flow walkthroughs
 
 ### (a) A watched user's message becomes speech
@@ -411,13 +426,13 @@ Format: **Decision** / Why / Alternatives rejected / Cost if wrong.
 
 ### D43. Help text is generated dynamically from the command registry
 - **Decision:** `/help` iterates `bot.commands` (sorted by name) and builds the command list from their `.name` and `.description` fields at runtime.
-- **Why:** help text is always in sync with the actual commands; there is no separate documentation to drift. A command's description is assigned once in its `@bot.hybrid_command` decorator. The list is generated every time to pick up any commands added by plugins or tests.
+- **Why:** help text is always in sync with the actual commands; there is no separate documentation to drift. A command's description is assigned once in its `@bot.hybrid_command` decorator.
 - **Alternatives rejected:** hardcoded command list (must be kept in sync, easy to drift); reading from a static file (same sync problem); a separate `help_command` handler left to discord.py default (harder to customize, usually less informative).
 - **Cost:** a small runtime cost (iterating 8 commands) on every `!help` call (negligible); each command must have a useful `.description` or `help` will say "No description" for that command. The "Right Now" block (channel, voice, watched users, status) is generated fresh each call so it always reflects the live state.
 
 ### D44. Voices command is read-only; voice switching stays GUI-only
 - **Decision:** `/voices` lists installed voices and marks the active one, but never calls `config.set_voice` or `engine.reload`. The GUI (Voice tab) is the only way to switch voices.
-- **Why:** voice switching is a system-wide change that affects all guilds; a public command that anyone could invoke is a risk (spam, accidents). The voice swap involves a multi-second GPU load and is better initiated from a UI where the operator can see the loading state and any errors. Keeping voice switching behind a UI that is local-network-only (Tailscale / zero trust) adds a natural boundary.
+- **Why:** voice switching is a system-wide change that affects all guilds; a public command that anyone could invoke is a risk (spam, accidents). The voice swap involves a multi-second GPU load and is better initiated from a UI where the operator can see the loading state and any errors. The GUI is reachable only over loopback/Tailscale (see section 7, trust boundaries), which keeps voice changes behind that network boundary.
 - **Alternatives rejected:** a public `/setvoice` command (spam risk, system-wide impact); rate-limiting on the voices command (still allows spam); requiring a manager role (still allows accidents from legitimate managers). Voice is global per system, not per-guild, so a per-guild permission model would not help.
 - **Cost:** users cannot swap voices from Discord chat; they must reach the web UI. This is intentional to keep voice changes deliberate and auditable.
 
@@ -523,7 +538,7 @@ sudo ip6tables -I INPUT -d fd7a:115c:a1e0::/48  ! -i tailscale0 -j DROP
 
 Run from the repo root:
 ```
-~/miniconda3/envs/tts-bot/bin/python -m unittest discover -s tests -v   # 307 tests
+~/miniconda3/envs/tts-bot/bin/python -m unittest discover -s tests -v   # 351 tests
 bash tests/test_deploy_validation.sh                                    # deploy validation, no root needed
 ```
 `unittest` only; no pytest.
@@ -542,6 +557,9 @@ bash tests/test_deploy_validation.sh                                    # deploy
 | `tests/test_message_routes.py` | `GET .../members` and `POST .../send` with a fake controller: bodies for every error code, string ids, X-Editor required, 16 KB body limit (2000 non-ASCII chars accepted, oversize 413), disconnect does not cancel or double-send, bad peer/host/origin/cross-site. |
 | `tests/test_controller.py` | `Controller` views and actions with fake guilds, `config_watcher` drain behavior (channel change drains; `enabled` change does not; other guilds and malformed events are survived). |
 | `tests/test_bot_events.py` | hot-swap path with fake objects: `on_message` (configured channel queues; paused, old channel after a swap, unconfigured guild, unwatched, bots, DMs do not; prefix goes to commands only), `only_tts_channel`, `on_command_error` slash reply, `on_ready` seeding (lowest matching id, skips existing, idempotent) and its `channels` event, channel-relay listeners, no `.env` loaded. |
+| `tests/test_help_command.py` | `help_cmd`: every registered command and description listed, listen channel set/unset, voice connected/stale/not connected, engine loaded (with CPU marker)/not loaded, idle/reading/paused, watched-user list capped at 15 with "+N more" (and the 2000-char backstop not what made it fit), 2000-char backstop, hostile display names (`@everyone`, markdown, unicode), `allowed_mentions` is `AllowedMentions.none()`. |
+| `tests/test_watch_autojoin.py` | `watch` auto-join (joins when not connected, stale disconnected client counts as not connected, no join when connected, join failure reports the helper's message and still watches, author not in voice gets the `!join` hint, hostile name, `allowed_mentions` none) and `join_author_voice` (connect, `ensure_audio`, engine-not-loaded note, `move_to`, not-in-voice, Forbidden, ClientException). |
+| `tests/test_voices_command.py` | `voices`: defer before the rescan, listing format, active/CPU/saved-not-loaded markers, 25-voice slice with "+N more", 2000-char backstop, engine not loaded (with and without voices), loading, `list_voices` failure gives a friendly message without exception text, read-only (no `set_voice`/`reload`/`apply_voice`), `allowed_mentions` none. |
 | `tests/test_wiring.py` | `maybe_start_webui` never raises (invalid `WEBUI_HOSTS`, bad `make_app`, out-of-range port, port in use, unexpected error), default hosts via Tailscale detection, `WEBUI_ALLOWED_HOSTS` reaches the app, `parse_port`, good config serves and cleans up. |
 | `tests/test_static.py` | static payload < 60 KB (61440 bytes), CSP-safe content (no `innerHTML`/`eval`/inline handlers/external URLs), served bytes equal files, and runs `tests/static_logic.js` under node if available. |
 | `tests/static_logic.js` | pure JS helpers: `substituteTags`/`segmentText` (longest-first, overlaps, word boundaries), `activeTagIds`, `uniqueLabel`, `insertAtCursor`, `counterText`/`counterState`, `pingTargets`, `pingSummary`, `chipText`, `messageBlocker`, `voiceTitle`, `voiceWarning`, `sayBlocker`, `voiceSwitchText`, `mergeVoiceSummary` (stale GET vs newer SSE event, fresh, not live, equal seq), `tokenizeMentions` (mention token regex), `channelChanged` (prev/next config, same gid?), `resetMemberCache`, `shouldApplyMembers`, SSE parser, `matchChannel`, `relTime`, `backoffDelay`, `groupChannels`, `normalizeEditor`, `shouldRollback`, `shouldApplySnapshot` (stale snapshots ignored). |
