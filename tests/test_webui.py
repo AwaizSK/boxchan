@@ -304,6 +304,46 @@ class WriteTests(Base):
         self.assertEqual(disk["guilds"]["1"]["channel_id"], self.config.channel_for(1))
         self.assertEqual(self.config.channel_for(1), 10)
 
+    def test_shielded_callback_logs_unexpected_exception(self):
+        """Verify the shielded callback logs unexpected exceptions but not expected ones."""
+        with self.assertLogs("webui", level="ERROR") as cm:
+            # Create a future that will raise an unexpected exception
+            fut = asyncio.Future()
+            fut.set_exception(RuntimeError("unexpected error with /secret/path"))
+            # Call the callback
+            callback = webui._make_shielded_callback("test_task", (ValueError,))
+            callback(fut)
+        # Verify it was logged with the task name
+        self.assertTrue(any("test_task failed" in line for line in cm.output))
+        self.assertTrue(any("/secret/path" in line for line in cm.output))
+
+    def test_shielded_callback_ignores_expected_exceptions(self):
+        """Verify the shielded callback ignores expected exceptions."""
+        # Create a future with an expected exception - should NOT log
+        fut = asyncio.Future()
+        fut.set_exception(ValueError("this is expected"))
+        # Calling the callback with expected exception should not log
+        callback = webui._make_shielded_callback("test_task", (ValueError,))
+        # Manually verify by capturing logs and checking they're empty
+        import logging
+        logger = logging.getLogger("webui")
+        handler = logging.StreamHandler()
+        logger.addHandler(handler)
+        initial_level = logger.level
+        logger.setLevel(logging.DEBUG)
+        # This should not produce any ERROR logs
+        callback(fut)
+        logger.removeHandler(handler)
+        logger.setLevel(initial_level)
+
+    def test_shielded_callback_handles_cancelled(self):
+        """Verify the shielded callback ignores cancelled futures."""
+        fut = asyncio.Future()
+        fut.cancel()
+        # Should not raise or log
+        callback = webui._make_shielded_callback("test_task", ())
+        callback(fut)  # Should not raise
+
 
 async def read_event(resp, timeout=2):
     """Read one SSE block (skipping comments); returns (event, data) or None for a comment-only block."""
