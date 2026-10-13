@@ -39,7 +39,7 @@ No live Discord/GPU/browser tests exist; say so rather than claiming they passed
 - `voices.py`: `discover_voices`, `resolve_voice`, `VoiceLoadError`/`BadVoiceError`/`SayError` (pure stdlib).
 - `messages.py`: `MessageError`, `parse_mentions`, `SendLimiter` (pure stdlib; used by `Controller.send_message` and `webui.py`).
 - `config_store.py`: `ConfigStore` (rev, optimistic concurrency, `ConflictError`), `EventHub`, `atomic_write_json`.
-- `webui.py`: `make_app`, `start_webui`, `validate_bind_hosts`, `detect_tailscale_addrs`; peer/Host/Origin checks, REST, SSE, session auth (`users.json`).
+- `webui.py`: `make_app`, `start_webui`, `validate_bind_hosts`, `detect_tailscale_addrs`; peer/Host/Origin checks, REST, SSE, session auth (`users.json`, scrypt hashes, fail closed), `python webui.py add-user|list-users|remove-user` CLI.
 - `static/{index,app}.{html,js}`, `static/app.css`: the UI (`app.js` helpers are node-testable).
 - `tts_bot.service`: hardened systemd unit (`ttsbot` user, `LoadCredential` for the Discord token).
 - `scripts/`: `setup_system.sh`, `deploy.sh` (+ `lib/deploy_validate.sh`), `install_token.sh`, `install_voice.sh`.
@@ -53,7 +53,7 @@ No live Discord/GPU/browser tests exist; say so rather than claiming they passed
 - Messages tab: `POST /api/guilds/{gid}/send` posts as the bot ONLY in `config.channel_for(gid)`; user mentions only (`allowed_mentions` users=validated ids, roles/everyone off, `<@&id>` rejected); every tagged user must be able to view the channel; 10 per 60 s + 2 s gap per guild (`SendLimiter`, reserved before the await); body limit 16 KB app-wide; audit log has editor + counts, never content. `GET .../members?q=` feeds the picker (max 25, `guild.chunk()` once if not chunked).
 - Channel swap drains that guild's queue (not the playing clip); pause only stops reading new messages.
 - Wire IDs are strings (JS precision); internal IDs are ints. `X-Editor` is percent-encoded by the client.
-- GUI security: network layer is the network boundary (loopback + Tailscale, bad_peer, Host allowlist, Origin check). Application layer uses session authentication backed by users.json (USERS_FILE) to control who can view and interact with the app. Binds loopback + auto-detected Tailscale addrs on WEBUI_PORT (8765); WEBUI_HOSTS overrides (loopback/Tailscale only, else GUI disabled); SSE needs proxy buffering off.
+- GUI security: network layer is the network boundary (loopback + Tailscale, bad_peer, Host allowlist, Origin check). Application layer: session login backed by users.json (USERS_FILE), FAIL CLOSED: a configured file that is missing/invalid/empty admits nobody; only `WEBUI_AUTH=off` (dev, logs a warning) or `make_app(users_file=None)` (tests) disables login. Passwords are stdlib scrypt hashes only (legacy plaintext/sha256 still log in and are upgraded on login; known example passwords are refused; Admin tab/CLI enforce 10..200 chars); admin = `admin` group in the file, not the name. Create users with `python webui.py add-user NAME --admin` (prompt, never argv/env); never read users.json. 441 unit tests. Binds loopback + auto-detected Tailscale addrs on WEBUI_PORT (8765); WEBUI_HOSTS overrides (loopback/Tailscale only, else GUI disabled); SSE needs proxy buffering off.
 - piper-tts is pinned to 1.2.0 (`synthesize_stream_raw`); CPU `onnxruntime` must stay uninstalled.
 - Prod layout: code root-owned `/opt/tts-bot`, state `/var/lib/tts-bot`, tokens in `/etc/tts-bot`.
   Anyone who can get code deployed can read the Discord token: review changes before deploy.

@@ -59,19 +59,30 @@ The bot reads messages and accepts commands only in the text channel chosen per 
 ## Web UI
 A small page with five tabs: **Channel** (pick which text channel the bot listens to, pause/resume it, skip or clear the queue, per guild), **Voice** (see above), **Messages** (post as the bot, see below), **Features** (request features, log author, admin-only deletion), and **Admin** (admin-only user & group management). Changes apply live; no restart.
 
-Start: just run the bot. When `users.json` (or `USERS_FILE`) is configured, the GUI provides a **Sign in** page with session authentication to control who views the app:
+Start: run the bot. **Login is required and fails closed**: the GUI always shows a **Sign in** page, and if the users file (`users.json` next to `config.json`, or `USERS_FILE`; `/var/lib/tts-bot/users.json` in production) is missing, unreadable, invalid or has no users, nobody can sign in (every API call answers `401`) and the problem is logged once at ERROR. There are no default credentials: create the first user with the CLI below.
 ```bash
 python bot.py                          # dev: GUI on http://127.0.0.1:8765
 ```
-Open it, sign in with your credentials, and optionally set a display name (shown to other editors). You can sign out anytime with **Sign out**.
-User credentials are read from `users.json` (`USERS_FILE` env override; `/var/lib/tts-bot/users.json` in production):
+Open it, sign in, and optionally set a display name (shown to other editors). You can sign out anytime with **Sign out**.
+
+### Managing web UI users
+Passwords are stored only as scrypt hashes (`scrypt$16384$8$1$<salt>$<hash>`, stdlib `hashlib.scrypt`); the Admin tab and the CLI enforce 10 to 200 characters and refuse well-known defaults (`changeme`, `testerpassword`, `password`, `admin`). The CLI prompts twice for the password (never on the command line or in the environment) and writes the file with mode 0600:
+```bash
+# production (the file is owned by the service user)
+sudo -u ttsbot env USERS_FILE=/var/lib/tts-bot/users.json /opt/tts-bot/env/bin/python /opt/tts-bot/webui.py add-user alice --admin
+# dev
+python webui.py --users-file users.json add-user alice --admin
+python webui.py --users-file users.json list-users     # names and groups only
+python webui.py --users-file users.json remove-user alice
+```
+`add-user` on an existing name changes that user's password (and adds `admin` with `--admin`). Credentials reload automatically on file change without restarting the bot; a user removed from the file loses their session at the next request. File layout (see `users.example.json`, which contains only invalid placeholder hashes):
 ```json
 [
-  { "username": "admin", "password": "yourpassword", "groups": ["admin"] },
-  { "username": "tester1", "password": "testerpassword", "groups": ["tester"] }
+  { "username": "alice", "password": "scrypt$16384$8$1$...$...", "groups": ["admin"] },
+  { "username": "tester1", "password": "scrypt$16384$8$1$...$...", "groups": ["user"] }
 ]
 ```
-Passwords can be plaintext or `sha256:<hex>`. Credentials reload automatically on file change without restarting the bot. Any user belonging to the `"admin"` group (or with `username: "admin"` / `"role": "admin"` / `"is_admin": true`) has admin privileges, such as deleting feature requests and accessing the Admin panel.
+Admin privileges (deleting feature requests, the Admin tab) come only from membership of the `admin` group in this file; the user name alone grants nothing. Migration: files from older versions with plaintext or `sha256:<hex>` passwords still work, and each such user's entry is rewritten to a scrypt hash automatically on their next successful login (other users and fields are untouched); a legacy user named `admin` with no groups is treated as an admin. To run the GUI without login (dev only, never on a shared host) set `WEBUI_AUTH=off`; the bot logs a warning at start.
 
 ### Features tab (feature requests)
 Submit and track feature requests directly in the GUI:
@@ -84,7 +95,7 @@ Submit and track feature requests directly in the GUI:
 Available exclusively to admin users:
 - **Manage users:** Create or update users, reset passwords, and assign groups (e.g. `admin`, `tester`).
 - **Group capabilities:** Group membership is checked for privileged actions (`in_group(user, "admin")`).
-- **Admin protection:** The primary `admin` user cannot be deleted, and signed-in admins cannot delete their own active user. Non-admins cannot see the tab and all backend endpoints enforce `403 Forbidden`.
+- **Admin protection:** A user named `admin` cannot be deleted from the tab, and signed-in admins cannot delete their own active user. Passwords set here must be 10 to 200 characters (`400 weak_password` otherwise) and a new user needs one (`400 password_required`); a request that only changes groups keeps the stored hash. Non-admins cannot see the tab and all backend endpoints enforce `403 Forbidden`.
 
 Settings (all optional):
 - `WEBUI_PORT` (default `8765`).
@@ -112,9 +123,9 @@ Multiple editors: every change carries the config revision it was based on. If s
 Pause: the bot stops reading messages for that guild (nothing new is queued). Commands (`!join`, `!skip`, ...) still work in the chosen channel, and clips already queued finish unless you press Clear/Skip.
 
 Security notes:
-- No application-layer auth. Trust boundary = who can reach the port: loopback plus Tailscale only, narrowed by your Tailscale ACLs / zero-trust proxy. Two mechanisms enforce it: the bind policy (only loopback/Tailscale addresses are listened on) and a peer-address check on every request (source must be loopback or Tailscale, else `403 bad_peer`), because Linux's weak-host model lets a LAN device route to the Tailscale IP via the LAN address. Recommended extra: host firewall rules (`iptables -I INPUT -d 100.64.0.0/10 ! -i tailscale0 -j DROP`, `ip6tables -I INPUT -d fd7a:115c:a1e0::/48 ! -i tailscale0 -j DROP`). Anyone who can reach the GUI can change the configured channel, pause/resume, skip and clear the queue, swap the voice, make the bot speak test phrases, and post as the bot in the configured channel (mentions limited to <=10 distinct members who can see the channel; 10 sends per 60 s plus a 2 s gap per guild).
-- Host allowlist on every request (DNS-rebinding defense) and an Origin check on writes (a cross-site `Origin` gets `403 bad_origin`, and `Sec-Fetch-Site: cross-site` is refused on writes and on all `/api/*` requests; a missing Origin, e.g. curl, is allowed). Strong CSP, no cookies. Plain HTTP: it is safe only because of the network boundary.
-- Accepted limitation: any local process or account on the server can reach `127.0.0.1:8765` and can change the configured channel, pause/resume, skip and clear the queue, swap the voice, make the bot speak test phrases, and post as the bot in the configured channel (mentions limited to <=10 distinct members who can see the channel; 10 sends per 60 s plus a 2 s gap per guild). Do not run untrusted users on this host.
+- Two layers. Application layer: session login against `users.json` with scrypt hashes, fail closed (see above), 5 failed logins per minute per IP. Network layer: who can reach the port: loopback plus Tailscale only, narrowed by your Tailscale ACLs / zero-trust proxy. Two mechanisms enforce it: the bind policy (only loopback/Tailscale addresses are listened on) and a peer-address check on every request (source must be loopback or Tailscale, else `403 bad_peer`), because Linux's weak-host model lets a LAN device route to the Tailscale IP via the LAN address. Recommended extra: host firewall rules (`iptables -I INPUT -d 100.64.0.0/10 ! -i tailscale0 -j DROP`, `ip6tables -I INPUT -d fd7a:115c:a1e0::/48 ! -i tailscale0 -j DROP`). Anyone who can reach the GUI AND sign in can change the configured channel, pause/resume, skip and clear the queue, swap the voice, make the bot speak test phrases, and post as the bot in the configured channel (mentions limited to <=10 distinct members who can see the channel; 10 sends per 60 s plus a 2 s gap per guild).
+- Host allowlist on every request (DNS-rebinding defense) and an Origin check on writes (a cross-site `Origin` gets `403 bad_origin`, and `Sec-Fetch-Site: cross-site` is refused on writes and on all `/api/*` requests; a missing Origin, e.g. curl, is allowed). Strong CSP; the only cookie is the `HttpOnly` session cookie. Plain HTTP: it is safe only because of the network boundary.
+- Accepted limitation: any local process or account on the server can reach `127.0.0.1:8765`; without a valid login it cannot use the API, but a local user who can read the users file can run the CLI against it, and one who can read a session cookie can act as that user. With `WEBUI_AUTH=off` it can change the configured channel, pause/resume, skip and clear the queue, swap the voice, make the bot speak test phrases, and post as the bot in the configured channel (mentions limited to <=10 distinct members who can see the channel; 10 sends per 60 s plus a 2 s gap per guild). Do not run untrusted users on this host.
 - If you put a proxy in front, disable response buffering for `/api/events` (SSE); the server sends `X-Accel-Buffering: no` but the proxy must honor it.
 
 ## Behavior
@@ -152,7 +163,7 @@ Local testing: each dev should create their own dev bot application and run `scr
    conda create -n tts-bot python=3.11 -y && conda activate tts-bot
    pip install -r requirements.txt
    cp .env.example .env
-   cp users.example.json users.json
+   python webui.py --users-file users.json add-user yourname --admin   # creates users.json (the example file holds only placeholders)
    ```
 2. **Local Verification:**
    Before pushing changes and opening a pull request, run the full validation suite:

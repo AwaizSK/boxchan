@@ -196,6 +196,38 @@ class HardCodedAdmin(_Quiet):
         self.assertFalse(mgr.is_admin("admin"))
 
 
+class ExampleFile(_Quiet):
+    EXAMPLE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "users.example.json")
+
+    def test_example_ships_no_usable_credentials(self):
+        with open(self.EXAMPLE, encoding="utf-8") as f:
+            text = f.read()
+        data = json.loads(text)
+        self.assertTrue(data)
+        for known in ("changeme", "testerpassword"):
+            self.assertNotIn(known, text)
+        for rec in data:
+            self.assertTrue(rec["password"].startswith("scrypt$"), rec["username"])
+            self.assertFalse(webui.verify_hash(rec["password"], rec["password"]))
+
+    def test_copy_of_example_logs_nobody_in_with_old_defaults_or_anything(self):
+        with open(self.EXAMPLE, encoding="utf-8") as f:
+            data = json.load(f)
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        mgr = AuthManager(self.path)
+        self.assertTrue(mgr.enabled)
+        self.assertEqual({u["username"] for u in mgr.list_users()}, {r["username"] for r in data})
+        guesses = ("changeme", "testerpassword", "password", "admin", "REPLACE_ME", PW,
+                   "scrypt$16384$8$1$REPLACE_ME$REPLACE_ME", "")
+        with self.assertLogs("webui", "ERROR"):  # known defaults are logged as refused
+            for rec in data:
+                for g in guesses:
+                    self.assertFalse(mgr.verify_password(rec["username"], g), (rec["username"], g))
+        with open(self.path, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), data)  # nothing "upgraded"
+
+
 class FailClosedRoutes(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         from test_webui import FakeController
