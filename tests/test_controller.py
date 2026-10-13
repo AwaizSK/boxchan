@@ -216,6 +216,27 @@ class SendMessageTests(unittest.IsolatedAsyncioTestCase):
         # Verify message content is NOT in logs
         self.assertFalse(any("secret" in msg for msg in log_ctx.output))
 
+    async def test_guild_me_is_none_returns_no_channel_for_send(self):
+        """When guild.me is None during outage, send_message raises no_channel."""
+        from messages import MessageError
+
+        ch = mock.MagicMock(spec=discord.TextChannel)
+        ch.id = 100
+
+        guild = mock.MagicMock(spec=discord.Guild)
+        guild.id = 1
+        guild.me = None  # During outage
+        guild.get_member.return_value = mock.MagicMock()  # Mentioned user exists
+        guild.get_channel.return_value = ch
+        ch.permissions_for.return_value = mock.MagicMock(view_channel=True)
+
+        with mock.patch.object(bot.bot, "get_guild", return_value=guild):
+            with mock.patch.object(bot.config, "channel_for", return_value=100):
+                with self.assertRaises(MessageError) as cm:
+                    await bot.controller.send_message(1, "hi", "alice")
+
+        self.assertEqual(cm.exception.code, "no_channel")
+
 
 class MembersForTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):

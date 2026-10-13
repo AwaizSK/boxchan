@@ -593,7 +593,9 @@ class Controller:
             member = guild.get_member(uid)
             if member is None or not ch.permissions_for(member).view_channel:
                 raise MessageError("bad_mention")
-        if guild.me is None or not ch.permissions_for(guild.me).send_messages:
+        if guild.me is None:
+            raise MessageError("no_channel")  # Outage: can't determine permissions
+        if not ch.permissions_for(guild.me).send_messages:
             raise MessageError("missing_permission")
         allowed = discord.AllowedMentions(everyone=False, roles=False, replied_user=False,
                                           users=[discord.Object(id=i) for i in ids])
