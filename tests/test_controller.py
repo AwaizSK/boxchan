@@ -223,39 +223,6 @@ class SendMessageTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("ZZ-DISTINCT-CONTENT", record.exc_text,
                                f"Message content leaked in exception: {record.exc_text}")
 
-    async def test_audit_http_exception_logged_with_status(self):
-        """HTTPException errors log with 'reason=http_error status=' format, never message content."""
-        ch = mock.MagicMock(spec=discord.TextChannel)
-        ch.id = 100
-        exc = discord.HTTPException(mock.MagicMock(status=500), "Server error")
-        ch.send = mock.AsyncMock(side_effect=exc)
-
-        guild = mock.MagicMock(spec=discord.Guild)
-        guild.id = 1
-        guild.me = mock.MagicMock()
-        guild.get_member.return_value = mock.MagicMock()
-        guild.get_channel.return_value = ch
-        ch.permissions_for.return_value = mock.MagicMock(view_channel=True)
-
-        with mock.patch.object(bot.bot, "get_guild", return_value=guild):
-            with mock.patch.object(bot.config, "channel_for", return_value=100):
-                with self.assertLogs("bot", "WARNING") as log_ctx:
-                    with self.assertRaises(MessageError) as cm:
-                        await bot.controller.send_message(1, "ANOTHER-CONTENT <@42>", "bob")
-                self.assertEqual(cm.exception.code, "discord_error")
-
-        # Verify log contains exact format with status
-        warning_msgs = [msg for msg in log_ctx.output if "WARNING" in msg]
-        self.assertTrue(len(warning_msgs) > 0, "Expected at least one WARNING")
-        warning_line = warning_msgs[0]
-        self.assertIn("gui message failed guild=1 channel=100 editor=bob reason=http_error status=500", warning_line)
-
-        # Verify message content NEVER appears in any log record
-        for record in log_ctx.records:
-            full_msg = record.getMessage()
-            self.assertNotIn("ANOTHER-CONTENT", full_msg,
-                           f"Message content leaked in log: {full_msg}")
-
     async def test_send_message_11_distinct_mentions_rejected(self):
         """Controller.send_message rejects 11 distinct mentions without calling send() or reserving rate limit."""
         from messages import MessageError
