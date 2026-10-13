@@ -96,6 +96,14 @@ assert.deepStrictEqual(segmentText('prefix@Bob', [bob]), [{ text: 'prefix@Bob', 
 assert.deepStrictEqual(segmentText('5@Bob', [bob]), [{ text: '5@Bob', tag: null }]);
 // glued to underscore - should NOT match
 assert.deepStrictEqual(segmentText('_@Bob', [bob]), [{ text: '_@Bob', tag: null }]);
+// astral code point (math bold A: U+1D400) should NOT tag
+assert.deepStrictEqual(segmentText('𝐀@Bob', [bob]), [{ text: '𝐀@Bob', tag: null }]);
+// astral code point (CJK 𠮷: U+20BBF) should NOT tag
+assert.deepStrictEqual(segmentText('𠮷@Bob', [bob]), [{ text: '𠮷@Bob', tag: null }]);
+// space before astral should tag (space is not a word char)
+assert.deepStrictEqual(segmentText(' 𝐀 @Bob', [bob]), [{ text: ' 𝐀 ', tag: null }, { text: '@Bob', tag: bob }]);
+// accented char (é: composed) should NOT tag
+assert.deepStrictEqual(segmentText('café@Bob', [bob]), [{ text: 'café@Bob', tag: null }]);
 // test that lookbehind patterns are not in app.js source
 const fs = require('fs');
 const appSource = fs.readFileSync(__dirname + '/../static/app.js', 'utf8');

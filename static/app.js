@@ -120,6 +120,16 @@ const MSG_MAX = 2000;
 const READY_PRESET = "The voice bot is ready to use! Join a voice channel, type !join here, and I'll read watched users' messages aloud.";
 const cpLen = (s) => Array.from(String(s)).length;
 
+// Get the preceding code point (accounting for surrogates). Returns the code point string or empty string.
+function getPrevCodePoint(text, idx) {
+  if (idx <= 0) return '';
+  const code = text.charCodeAt(idx - 1);
+  // Low surrogate: previous code point is a surrogate pair (2 units)
+  if (code >= 0xDC00 && code <= 0xDFFF && idx >= 2) return text.slice(idx - 2, idx);
+  // Single unit or high surrogate
+  return text.slice(idx - 1, idx);
+}
+
 // Split text into plain and tagged parts. Only the exact "@label" of a tagged chip matches
 // (longest label first, single pass, not glued to word characters); nothing is ever guessed.
 // Uses manual preceding-character check instead of lookbehind for Safari < 16.4 compatibility.
@@ -135,8 +145,8 @@ function segmentText(text, tags) {
   const out = [];
   let last = 0, m;
   while ((m = re.exec(text))) {
-    // Check preceding character: match is valid only if not glued to a word character or at start
-    if (m.index > 0 && isWord(text[m.index - 1])) continue;
+    // Check preceding code point: match is valid only if not glued to a word character or at start
+    if (m.index > 0 && isWord(getPrevCodePoint(text, m.index))) continue;
     if (m.index > last) out.push({ text: text.slice(last, m.index), tag: null });
     out.push({ text: m[0], tag: by.get(m[0]) });
     last = m.index + m[0].length;
