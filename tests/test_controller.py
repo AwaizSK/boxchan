@@ -229,6 +229,32 @@ class SendMessageTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("ZZ-DISTINCT-CONTENT", record.exc_text,
                                f"Message content leaked in exception: {record.exc_text}")
 
+    async def test_audit_http_exception_logged_with_status_never_content(self):
+        """HTTPException logs reason=http_error status=500, never content; caller sees discord_error."""
+        ch = mock.MagicMock(spec=discord.TextChannel)
+        ch.id = 100
+        ch.send = mock.AsyncMock(side_effect=discord.HTTPException(mock.MagicMock(status=500, reason="ISE"), "boom"))
+
+        guild = mock.MagicMock(spec=discord.Guild)
+        guild.id = 1
+        guild.me = mock.MagicMock()
+        guild.get_member.return_value = mock.MagicMock()
+        guild.get_channel.return_value = ch
+        ch.permissions_for.return_value = mock.MagicMock(view_channel=True)
+
+        with mock.patch.object(bot.bot, "get_guild", return_value=guild), \
+                mock.patch.object(bot.config, "channel_for", return_value=100):
+            with self.assertLogs("bot", "WARNING") as log_ctx:
+                with self.assertRaises(MessageError) as cm:
+                    await self.fresh_controller().send_message(1, "ZZ-DISTINCT-CONTENT <@42>", "alice")
+        self.assertEqual(cm.exception.code, "discord_error")
+        self.assertTrue(any("gui message failed guild=1 channel=100 editor=alice reason=http_error status=500" in m
+                            for m in log_ctx.output), log_ctx.output)
+        for record in log_ctx.records:
+            self.assertNotIn("ZZ-DISTINCT-CONTENT", record.getMessage())
+            if record.exc_text:
+                self.assertNotIn("ZZ-DISTINCT-CONTENT", record.exc_text)
+
     async def test_send_message_11_distinct_mentions_rejected(self):
         """Controller.send_message rejects 11 distinct mentions without calling send() or reserving rate limit."""
         ch = mock.MagicMock(spec=discord.TextChannel)
