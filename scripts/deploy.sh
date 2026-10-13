@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Admin-only (needs real sudo, not in the devteam sudoers rule).
 # Copies reviewed code from the repo into root-owned /opt/tts-bot and restarts the service.
+# Prunes stale *.py and static/ files; never prunes models/.
 set -euo pipefail
 
 [ "$EUID" -eq 0 ] || { echo "Run with sudo."; exit 1; }
@@ -39,10 +40,9 @@ for f in "$APP"/static/*; do
   [ -e "$f" ] || continue
   [ -e "$snap/static/$(basename "$f")" ] || { echo "removing stale $f"; rm -rf "$f"; }
 done
-for f in "$APP"/models/*; do
-  [ -e "$f" ] || continue
-  [ -e "$snap/models/$(basename "$f")" ] || { echo "removing stale $f"; rm -rf "$f"; }
-done
+# models/ is deliberately NOT pruned: voices added with scripts/install_voice.sh are not in the repo and
+# must survive a deploy. (Repo models are copied/updated above; a repo model with the same name as an
+# installed voice replaces it.)
 rm -rf "$APP/__pycache__"
 
 systemctl restart tts_bot
