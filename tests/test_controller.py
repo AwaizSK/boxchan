@@ -1,22 +1,15 @@
 import asyncio
-import os
-import sys
-import tempfile
 import unittest
 from unittest import mock
 
-# Must be set before importing bot: no real token, state/config in a temp dir.
-_TMP = tempfile.mkdtemp(prefix="tts-bot-test-")
-os.environ.pop("DISCORD_TOKEN", None)
-os.environ.pop("CREDENTIALS_DIRECTORY", None)
-os.environ["DISCORD_TOKEN_FILE"] = os.path.join(_TMP, "no-such-token")
-os.environ["STATE_FILE"] = os.path.join(_TMP, "state.json")
-os.environ["CONFIG_FILE"] = os.path.join(_TMP, "config.json")
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import os
+import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import botimport  # noqa: F401,E402  (hermetic env + import of bot; must come first)
 import discord  # noqa: E402
 
-import bot  # noqa: E402
+bot = botimport.bot
 
 
 def make_channel(cid, name, position, category=None, can_view=True):

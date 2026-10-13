@@ -277,6 +277,8 @@ async def on_ready():
                 except Exception:
                     log.exception("channel seed failed for guild %s", guild.id)
                 break
+    # GUI tabs that connected before the guild cache filled (restart window) must refetch.
+    config.hub.publish({"type": "channels", "guild_id": None})
     log.info("Logged in as %s (id=%s) prefix=%r channels=%s tts_ready=%s cuda=%s",
              bot.user, bot.user.id, PREFIX,
              {g: c for g, e in config.snapshot()["guilds"].items() if (c := e["channel_id"])},
@@ -528,6 +530,11 @@ async def on_guild_join(guild):
 
 @bot.event
 async def on_guild_remove(guild):
+    _publish_channels(guild)
+
+
+@bot.event
+async def on_guild_available(guild):  # guild (re)appeared after an outage or late cache fill
     _publish_channels(guild)
 
 
