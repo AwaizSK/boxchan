@@ -1,7 +1,7 @@
 const assert = require('assert');
 const { shouldApplySnapshot, normalizeEditor, shouldRollback, createSSEParser, matchChannel, relTime, backoffDelay, groupChannels,
   voiceTitle, voiceWarning, sayBlocker, voiceSwitchText, mergeVoiceSummary,
-  segmentText, substituteTags, activeTagIds, uniqueLabel, insertAtCursor, counterText, counterState, shouldApplyMembers, pingTargets, pingSummary, chipText, messageBlocker,
+  segmentText, substituteTags, activeTagIds, uniqueLabel, insertAtCursor, counterText, counterState, shouldApplyMembers, resetMemberCache, channelChanged, pingTargets, pingSummary, chipText, messageBlocker,
   cpLen, READY_PRESET } = require('../static/app.js');
 
 const got = [];
@@ -160,6 +160,21 @@ assert.strictEqual(shouldApplyMembers('gid1', 'gid1', 1, 1), true);
 assert.strictEqual(shouldApplyMembers('gid1', 'gid2', 1, 1), false);
 assert.strictEqual(shouldApplyMembers('gid1', 'gid1', 1, 2), false);
 assert.strictEqual(shouldApplyMembers('gid1', 'gid1', 2, 1), false);
+// channel change detection: pure helper
+assert.strictEqual(channelChanged('123', '123'), false);
+assert.strictEqual(channelChanged('123', '456'), true);
+assert.strictEqual(channelChanged(null, '123'), true);
+assert.strictEqual(channelChanged('123', null), true);
+// resetMemberCache: pure helper
+{
+  const M = { members: ['a', 'b'], hi: 5, gid: 'gid123', q: 'test', memberSeq: 3 };
+  resetMemberCache(M);
+  assert.deepStrictEqual(M.members, []);
+  assert.strictEqual(M.hi, -1);
+  assert.strictEqual(M.gid, '');
+  assert.strictEqual(M.q, null);
+  assert.strictEqual(M.memberSeq, 4);  // incremented
+}
 {
   const prev = { list: [{ name: 'old' }], current: 'b', configured: 'b', loading: true, cuda: true };
   const incoming = { voices: [{ name: 'a' }, { name: 'b' }], current: 'a', configured: null, loading: false, cuda: false };

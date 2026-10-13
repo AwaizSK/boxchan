@@ -194,6 +194,20 @@ function shouldApplyMembers(reqGid, curGid, reqSeq, curSeq) {
   return reqGid === curGid && reqSeq === curSeq;
 }
 
+// Reset member cache state (called when channel changes or request is stale).
+function resetMemberCache(M) {
+  M.members = [];
+  M.hi = -1;
+  M.gid = '';
+  M.q = null;
+  M.memberSeq++;
+}
+
+// Detect if channel id changed between old and new guild config (used for SSE-triggered cache reset).
+function channelChanged(oldChannelId, newChannelId) {
+  return oldChannelId !== newChannelId;
+}
+
 function pingTargets(finalText, chips) {
   const byId = new Map((chips || []).map((c) => [c.id, c]));
   const result = [];
@@ -262,7 +276,7 @@ function mergeVoiceSummary(prev, incoming, { seqAtRequest, seqNow, live }) {
 if (typeof module !== 'undefined') {
   module.exports = { shouldApplySnapshot, normalizeEditor, shouldRollback, createSSEParser, matchChannel, relTime, backoffDelay, groupChannels,
     voiceTitle, voiceWarning, sayBlocker, voiceSwitchText, mergeVoiceSummary,
-    segmentText, substituteTags, activeTagIds, uniqueLabel, insertAtCursor, counterText, counterState, shouldApplyMembers, pingTargets, pingSummary, chipText, messageBlocker, cpLen, MSG_MAX, READY_PRESET };
+    segmentText, substituteTags, activeTagIds, uniqueLabel, insertAtCursor, counterText, counterState, shouldApplyMembers, resetMemberCache, channelChanged, pingTargets, pingSummary, chipText, messageBlocker, cpLen, MSG_MAX, READY_PRESET };
 }
 
 /* ---------- app ---------- */
@@ -380,7 +394,14 @@ if (typeof document !== 'undefined') (function () {
 
   function applySnapshot(snap, force) {
     if (!shouldApplySnapshot(S.cfg, snap, force)) return;
+    const oldChanId = S.cfg && S.cfg.guilds[S.gid] && S.cfg.guilds[S.gid].channel_id;
     S.cfg = snap;
+    const newChanId = S.cfg && S.cfg.guilds[S.gid] && S.cfg.guilds[S.gid].channel_id;
+    // Reset member cache if the channel changed for the current guild
+    if (channelChanged(oldChanId, newChanId)) {
+      resetMemberCache(M);
+      if (S.tab === 'messages') renderMessages();
+    }
     renderConfig();
   }
 
@@ -876,7 +897,7 @@ if (typeof document !== 'undefined') (function () {
     try {
       const d = await api('PUT', '/api/guilds/' + gid + '/channel', { channel_id: id, rev: prevRev });
       applySnapshot(d.snapshot, false);
-      M.members = []; M.hi = -1; M.gid = ''; M.q = null;
+      resetMemberCache(M);
       if (!opts.silent) {
         toast('Switched to ' + (chName(id) || 'channel') + (prev && chName(prev) ? ' (was ' + chName(prev) + ')' : ''),
           prev && chName(prev) ? { undo: () => selectChannel(prev, { silent: true }) } : null);

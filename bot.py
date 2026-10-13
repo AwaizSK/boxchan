@@ -51,6 +51,7 @@ if TOKEN and not TOKEN_RE.match(TOKEN):
     raise SystemExit(f"Token malformed (len={len(TOKEN)}): expected '<id>.<ts>.<hmac>'. "
                      "No quotes, 'Bot ' prefix, or newline. Re-run scripts/install_token.sh")
 PREFIX = os.getenv("COMMAND_PREFIX", "!")
+MAX_PERM_CHECKS = 2000  # Cap for permission checks in member scan
 MODEL_PATH = os.getenv("PIPER_MODEL_PATH", "models/en_US-lessac-medium.onnx")
 CONFIG_PATH = os.getenv("PIPER_CONFIG_PATH") or None
 MODELS_DIR = os.getenv("PIPER_MODELS_DIR") or os.path.dirname(MODEL_PATH) or "."
@@ -574,7 +575,6 @@ class Controller:
                  if not needle or any(n and needle in n.casefold() for n in names(m))]
         cands.sort(key=lambda m: (bool(m.bot), m.display_name.casefold(), m.id))
         out, truncated, perm_checks = [], False, 0
-        MAX_PERM_CHECKS = 2000
         for idx, m in enumerate(cands):
             if idx > 0 and idx % 250 == 0:
                 await asyncio.sleep(0)
@@ -615,7 +615,8 @@ class Controller:
             log.warning("gui message failed guild=%s channel=%s editor=%s reason=forbidden", guild_id, ch.id, editor)
             raise MessageError("missing_permission") from None
         except discord.HTTPException as e:
-            log.warning("gui message failed guild=%s channel=%s editor=%s reason=http_error", guild_id, ch.id, editor)
+            log.warning("gui message failed guild=%s channel=%s editor=%s reason=http_error status=%s",
+                       guild_id, ch.id, editor, getattr(e, "status", "?"))
             raise MessageError("discord_error") from None
         log.info("gui message sent guild=%s channel=%s editor=%s chars=%d mentions=%d",
                  guild_id, ch.id, editor, len(content), len(ids))

@@ -92,6 +92,20 @@ class SendRouteTests(Routes):
             self.ctl.send_exc = MessageError(code)
             await self.assert_error(await self.send({"content": "hi"}), status, code)
 
+    async def test_route_rejects_11_distinct_mentions_with_bad_mention(self):
+        """Route rejects 11 distinct mentions, HTTP 400 bad_mention."""
+        content = " ".join(f"<@{i}>" for i in range(11))
+        self.ctl.send_exc = MessageError("bad_mention")
+        r = await self.send({"content": content})
+        await self.assert_error(r, 400, "bad_mention")
+
+    async def test_route_accepts_exactly_10_mentions(self):
+        """Route accepts exactly 10 distinct mentions."""
+        content = " ".join(f"<@{i}>" for i in range(10))
+        r = await self.send({"content": content})
+        self.assertEqual(r.status, 200)
+        self.assertEqual(await r.json(), {"ok": True, "message_id": "123456789012345678"})
+
     async def test_rate_limited_has_retry_after(self):
         self.ctl.send_exc = MessageError("rate_limited", retry_after=7)
         await self.assert_error(await self.send({"content": "hi"}), 429, "rate_limited", retry_after=7)

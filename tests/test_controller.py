@@ -9,6 +9,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import botimport  # noqa: F401,E402  (hermetic env + import of bot; must come first)
 import discord  # noqa: E402
 
+from messages import MessageError  # noqa: E402
+
 bot = botimport.bot
 
 
@@ -185,12 +187,9 @@ class ConfigWatcherTest(unittest.IsolatedAsyncioTestCase):
 
 
 class SendMessageTests(unittest.IsolatedAsyncioTestCase):
-    def setUp(self):
-        self.addCleanup(lambda: mock.patch.object(bot.bot, "get_guild").stop())
-        self.addCleanup(lambda: mock.patch.object(bot.config, "channel_for").stop())
 
     async def test_audit_forbidden_logged_with_reason_format(self):
-        """Forbidden errors log in 'reason=forbidden' format."""
+        """Forbidden errors log with 'reason=forbidden' format, never message content."""
         ch = mock.MagicMock(spec=discord.TextChannel)
         ch.id = 100
         ch.send = mock.AsyncMock(side_effect=discord.Forbidden(mock.MagicMock(status=403), "Forbidden"))
@@ -198,23 +197,120 @@ class SendMessageTests(unittest.IsolatedAsyncioTestCase):
         guild = mock.MagicMock(spec=discord.Guild)
         guild.id = 1
         guild.me = mock.MagicMock()
-        guild.get_member.return_value = mock.MagicMock()  # All mentioned users exist and can view
+        guild.get_member.return_value = mock.MagicMock()
         guild.get_channel.return_value = ch
         ch.permissions_for.return_value = mock.MagicMock(view_channel=True)
 
         with mock.patch.object(bot.bot, "get_guild", return_value=guild):
             with mock.patch.object(bot.config, "channel_for", return_value=100):
                 with self.assertLogs("bot", "WARNING") as log_ctx:
-                    try:
-                        await bot.controller.send_message(1, "hi <@42>", "alice")
-                    except Exception:
-                        pass  # Expected to raise MessageError
+                    with self.assertRaises(MessageError) as cm:
+                        await bot.controller.send_message(1, "ZZ-DISTINCT-CONTENT <@42>", "alice")
+                self.assertEqual(cm.exception.code, "missing_permission")
 
-        # Verify log contains the reason format
-        self.assertTrue(any("reason=forbidden" in msg for msg in log_ctx.output),
-                       f"Expected 'reason=forbidden' in logs, got: {log_ctx.output}")
-        # Verify message content is NOT in logs
-        self.assertFalse(any("secret" in msg for msg in log_ctx.output))
+        # Verify log contains exact format
+        warning_msgs = [msg for msg in log_ctx.output if "WARNING" in msg]
+        self.assertTrue(len(warning_msgs) > 0, "Expected at least one WARNING")
+        warning_line = warning_msgs[0]
+        self.assertIn("gui message failed guild=1 channel=100 editor=alice reason=forbidden", warning_line)
+
+        # Verify message content NEVER appears in any log record
+        for record in log_ctx.records:
+            full_msg = record.getMessage()
+            self.assertNotIn("ZZ-DISTINCT-CONTENT", full_msg,
+                           f"Message content leaked in log: {full_msg}")
+            if record.exc_text:
+                self.assertNotIn("ZZ-DISTINCT-CONTENT", record.exc_text,
+                               f"Message content leaked in exception: {record.exc_text}")
+
+    async def test_audit_http_exception_logged_with_status(self):
+        """HTTPException errors log with 'reason=http_error status=' format, never message content."""
+        ch = mock.MagicMock(spec=discord.TextChannel)
+        ch.id = 100
+        exc = discord.HTTPException(mock.MagicMock(status=500), "Server error")
+        ch.send = mock.AsyncMock(side_effect=exc)
+
+        guild = mock.MagicMock(spec=discord.Guild)
+        guild.id = 1
+        guild.me = mock.MagicMock()
+        guild.get_member.return_value = mock.MagicMock()
+        guild.get_channel.return_value = ch
+        ch.permissions_for.return_value = mock.MagicMock(view_channel=True)
+
+        with mock.patch.object(bot.bot, "get_guild", return_value=guild):
+            with mock.patch.object(bot.config, "channel_for", return_value=100):
+                with self.assertLogs("bot", "WARNING") as log_ctx:
+                    with self.assertRaises(MessageError) as cm:
+                        await bot.controller.send_message(1, "ANOTHER-CONTENT <@42>", "bob")
+                self.assertEqual(cm.exception.code, "discord_error")
+
+        # Verify log contains exact format with status
+        warning_msgs = [msg for msg in log_ctx.output if "WARNING" in msg]
+        self.assertTrue(len(warning_msgs) > 0, "Expected at least one WARNING")
+        warning_line = warning_msgs[0]
+        self.assertIn("gui message failed guild=1 channel=100 editor=bob reason=http_error status=500", warning_line)
+
+        # Verify message content NEVER appears in any log record
+        for record in log_ctx.records:
+            full_msg = record.getMessage()
+            self.assertNotIn("ANOTHER-CONTENT", full_msg,
+                           f"Message content leaked in log: {full_msg}")
+
+    async def test_send_message_11_distinct_mentions_rejected(self):
+        """Controller.send_message rejects 11 distinct mentions without calling send() or reserving rate limit."""
+        from messages import MessageError
+
+        ch = mock.MagicMock(spec=discord.TextChannel)
+        ch.id = 100
+
+        guild = mock.MagicMock(spec=discord.Guild)
+        guild.id = 1
+        guild.me = mock.MagicMock()
+        # Mock get_member to return valid members
+        guild.get_member.return_value = mock.MagicMock()
+        guild.get_channel.return_value = ch
+        ch.permissions_for.return_value = mock.MagicMock(view_channel=True)
+
+        # 11 distinct mentions
+        content = " ".join(f"<@{i}>" for i in range(11))
+
+        # Create a spy on the limiter to verify reserve was not called
+        limiter_mock = mock.MagicMock()
+        controller = bot.Controller(limiter=limiter_mock)
+
+        with mock.patch.object(bot.bot, "get_guild", return_value=guild):
+            with mock.patch.object(bot.config, "channel_for", return_value=100):
+                with self.assertRaises(MessageError) as cm:
+                    await controller.send_message(1, content, "alice")
+
+        self.assertEqual(cm.exception.code, "bad_mention")
+        # Verify send() was never awaited
+        ch.send.assert_not_awaited()
+        # Verify rate limiter was never called (no slot consumed)
+        limiter_mock.reserve.assert_not_called()
+
+    async def test_send_message_exactly_10_distinct_mentions_succeeds(self):
+        """Controller.send_message succeeds with exactly 10 distinct mentions."""
+        ch = mock.MagicMock(spec=discord.TextChannel)
+        ch.id = 100
+        ch.send = mock.AsyncMock(return_value=mock.MagicMock(id=999))
+
+        guild = mock.MagicMock(spec=discord.Guild)
+        guild.id = 1
+        guild.me = mock.MagicMock()
+        guild.get_member.return_value = mock.MagicMock()
+        guild.get_channel.return_value = ch
+        ch.permissions_for.return_value = mock.MagicMock(view_channel=True)
+
+        # Exactly 10 distinct mentions
+        content = " ".join(f"<@{i}>" for i in range(10))
+
+        with mock.patch.object(bot.bot, "get_guild", return_value=guild):
+            with mock.patch.object(bot.config, "channel_for", return_value=100):
+                result = await bot.controller.send_message(1, content, "alice")
+
+        self.assertEqual(result["ok"], True)
+        ch.send.assert_awaited_once()
 
     async def test_guild_me_is_none_returns_no_channel_for_send(self):
         """When guild.me is None during outage, send_message raises no_channel."""
@@ -239,8 +335,6 @@ class SendMessageTests(unittest.IsolatedAsyncioTestCase):
 
 
 class MembersForTests(unittest.IsolatedAsyncioTestCase):
-    def setUp(self):
-        self.addCleanup(lambda: mock.patch.object(bot.bot, "get_guild").stop())
 
     async def test_permission_check_cap_at_2000(self):
         """Scan stops at 2000 permission checks and returns truncated=true."""
@@ -279,18 +373,19 @@ class MembersForTests(unittest.IsolatedAsyncioTestCase):
         # Should have capped at 2000 permission checks (all without view), so 0 results
         self.assertEqual(len(result["members"]), 0)
         self.assertTrue(result["truncated"])
-        # Verify that we stopped after checking 2000 permissions
+        # Verify that we stopped after checking exactly 2000 permissions
         perm_check_count = ch.permissions_for.call_count
-        self.assertLessEqual(perm_check_count, 2001)
+        self.assertEqual(perm_check_count, 2000)
 
     async def test_yields_to_event_loop(self):
-        """Scan yields to event loop every ~250 members (other tasks can run)."""
+        """Scan yields to event loop every ~250 members via asyncio.sleep(0)."""
         ch = mock.MagicMock(spec=discord.TextChannel)
         ch.id = 100
 
-        # Create many members that all can view
+        # Create 5000 members where NONE can view the channel
+        # This forces the scan to run through the permission check cap (2000)
         members = []
-        for i in range(1000):
+        for i in range(5000):
             m = mock.MagicMock(spec=discord.Member)
             m.id = i
             m.bot = False
@@ -299,10 +394,10 @@ class MembersForTests(unittest.IsolatedAsyncioTestCase):
             m.global_name = None
             members.append(m)
 
-        # All members can view
+        # Nobody can view
         def perm_for(member):
             perm = mock.MagicMock()
-            perm.view_channel = True
+            perm.view_channel = False
             return perm
 
         guild = mock.MagicMock(spec=discord.Guild)
@@ -313,23 +408,35 @@ class MembersForTests(unittest.IsolatedAsyncioTestCase):
         guild.get_channel.return_value = ch
         ch.permissions_for.side_effect = perm_for
 
-        task_ran = []
-        async def other_task():
-            await asyncio.sleep(0.01)
-            task_ran.append(True)
+        # Ticker task that runs every time the event loop yields
+        ticker_count = []
+        ticker_cancelled = asyncio.Event()
+        async def ticker():
+            try:
+                while True:
+                    await asyncio.sleep(0)
+                    ticker_count.append(1)
+            except asyncio.CancelledError:
+                ticker_cancelled.set()
 
         with mock.patch.object(bot.bot, "get_guild", return_value=guild):
             with mock.patch.object(bot.config, "channel_for", return_value=100):
-                search_task = asyncio.create_task(bot.controller.members_for(1, ""))
-                other = asyncio.create_task(other_task())
-                result = await search_task
-                await other
+                ticker_task = asyncio.create_task(ticker())
+                result = await bot.controller.members_for(1, "")
+                ticker_task.cancel()
+                try:
+                    await ticker_task
+                except asyncio.CancelledError:
+                    pass
 
-        # If the search yields, the other task should have run
-        self.assertTrue(task_ran, "other task should have run during scan")
-        # Scan should have returned truncated=true (capped at 25 results)
+        # Scan should stop at 2000 permission checks with truncated=true
+        self.assertEqual(len(result["members"]), 0)
         self.assertTrue(result["truncated"])
-        self.assertEqual(len(result["members"]), 25)
+        # Ticker should have run ~2000/250 = ~8 times (within reasonable bounds)
+        self.assertGreaterEqual(len(ticker_count), 6,
+                               f"ticker should have run ~8 times, got {len(ticker_count)}")
+        self.assertLessEqual(len(ticker_count), 15,
+                            f"ticker ran too many times: {len(ticker_count)}")
 
     async def test_guild_me_is_none_returns_empty(self):
         """When guild.me is None (outage), return empty member list."""
@@ -348,11 +455,15 @@ class MembersForTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["members"], [])
         self.assertFalse(result["truncated"])
 
-    async def test_chunk_timeout_cache_concurrent_calls(self):
-        """Two simultaneous searches on unchunked guild call chunk() exactly once."""
+    async def test_chunk_timeout_cache_concurrent_and_memo(self):
+        """Two concurrent searches call chunk() once; within 60s no retry; after 60s retry."""
+        from tests.test_messages import Clock
+
+        clk = Clock()
         ch = mock.MagicMock(spec=discord.TextChannel)
         ch.id = 100
 
+        # Create members that all can view
         members = []
         for i in range(10):
             m = mock.MagicMock(spec=discord.Member)
@@ -368,36 +479,68 @@ class MembersForTests(unittest.IsolatedAsyncioTestCase):
             perm.view_channel = True
             return perm
 
-        chunk_event = asyncio.Event()
-        async def slow_chunk():
-            await chunk_event.wait()
+        # chunk_events to control when chunk() completes
+        chunk_events = [asyncio.Event() for _ in range(3)]
+        chunk_count = [0]
+        async def hanging_chunk():
+            call_num = chunk_count[0]
+            chunk_count[0] += 1
+            if call_num < len(chunk_events):
+                await chunk_events[call_num].wait()
 
         guild = mock.MagicMock(spec=discord.Guild)
         guild.id = 1
         guild.members = members
         guild.me = mock.MagicMock()
         guild.chunked = False
-        guild.chunk = mock.AsyncMock(side_effect=slow_chunk)
+        guild.chunk = mock.AsyncMock(side_effect=hanging_chunk)
         guild.get_channel.return_value = ch
         ch.permissions_for.side_effect = perm_for
 
+        # Use controller with injected clock
+        controller = bot.Controller(clock=clk)
+
         with mock.patch.object(bot.bot, "get_guild", return_value=guild):
             with mock.patch.object(bot.config, "channel_for", return_value=100):
-                # Start two searches concurrently
-                search1 = asyncio.create_task(bot.controller.members_for(1, ""))
-                search2 = asyncio.create_task(bot.controller.members_for(1, ""))
-                await asyncio.sleep(0.01)  # Let both start waiting
+                # Scenario 1: Two concurrent searches
+                search1 = asyncio.create_task(controller.members_for(1, ""))
+                search2 = asyncio.create_task(controller.members_for(1, ""))
+                await asyncio.sleep(0.01)  # Let both start waiting in chunk_lock
 
-                # Release the chunk call
-                guild.chunked = True  # Simulate chunking completed
-                chunk_event.set()
-
-                # Wait for both to complete
+                # Release chunk() - both searches return cached members
+                guild.chunked = True
+                chunk_events[0].set()
                 result1 = await search1
                 result2 = await search2
 
-        # chunk() should have been called exactly once due to the lock
-        self.assertEqual(guild.chunk.call_count, 1)
+                # chunk() should have been called exactly once
+                self.assertEqual(chunk_count[0], 1)
+                self.assertEqual(len(result1["members"]), 10)
+                self.assertEqual(len(result2["members"]), 10)
+
+                # Scenario 2: Search within 60s should not retry chunk()
+                clk.t += 30.0
+                guild.chunked = False
+                search3 = asyncio.create_task(controller.members_for(1, ""))
+                await asyncio.sleep(0.01)
+                # chunk() should not have been called again
+                self.assertEqual(chunk_count[0], 1)
+                # Search still returns results from cache
+                result3 = await search3
+                self.assertEqual(len(result3["members"]), 10)
+
+                # Scenario 3: Search after 60s should retry chunk()
+                clk.t += 31.0  # Now at 61s, past the 60s window
+                guild.chunked = False
+                search4 = asyncio.create_task(controller.members_for(1, ""))
+                await asyncio.sleep(0.01)
+                # chunk() should have been called again
+                self.assertEqual(chunk_count[0], 2)
+                # Release it
+                guild.chunked = True
+                chunk_events[1].set()
+                result4 = await search4
+                self.assertEqual(len(result4["members"]), 10)
 
     async def test_chunk_timeout_cache_prevents_retry_within_window(self):
         """After timeout, second search within 60s doesn't call chunk()."""
