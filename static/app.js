@@ -232,6 +232,9 @@ function pingTargets(finalText, chips) {
 }
 
 function chipText(chip) {
+  if (!chip.username) return '@' + chip.label;
+  // Avoid double formatting: if label already contains the username (e.g., "Bob (bob99)"), just show the label
+  if (chip.label.includes('(' + chip.username + ')')) return '@' + chip.label;
   return '@' + chip.label + ' (@' + chip.username + ')';
 }
 
@@ -839,7 +842,7 @@ if (typeof document !== 'undefined') (function () {
 
   function pickMember(m) {
     let t = M.tags.find((x) => x.id === m.id);
-    if (!t) { t = { id: m.id, label: uniqueLabel(m.name, m.username, m.id, M.tags), name: m.name, username: m.username }; M.tags.push(t); }
+    if (!t) { t = { id: m.id, label: uniqueLabel(m.name, m.username, m.id, M.tags), username: m.username }; M.tags.push(t); }
     const ta = $('m-text');
     const r = insertAtCursor(ta.value, ta.selectionStart, ta.selectionEnd, '@' + t.label);
     ta.value = r.value;

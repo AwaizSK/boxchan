@@ -147,10 +147,13 @@ assert.deepStrictEqual(pingTargets('<@123456789012345678901>', []), []);
 assert.deepStrictEqual(pingTargets('<@12345678901234567890>', chips1), [{ id: '12345678901234567890', label: null, username: null, known: false }]);
 assert.strictEqual(pingSummary([]), 'No pings');
 assert.strictEqual(pingSummary([{ id: '5', label: 'Alice', username: 'alice123', known: true }]), 'Will ping: @Alice (@alice123)');
+assert.strictEqual(pingSummary([{ id: '5', label: 'Bob (bob99)', username: 'bob99', known: true }]), 'Will ping: @Bob (bob99)');  // no double format
 assert.strictEqual(pingSummary([{ id: '5', label: 'Alice', username: 'alice123', known: true }, { id: '999', label: null, username: null, known: false }]), 'Will ping: @Alice (@alice123), unknown user 999');
-// chipText display format
+// chipText display format with missing username and disambiguated labels
 assert.strictEqual(chipText({ id: '5', label: 'Alice', username: 'alice123' }), '@Alice (@alice123)');
-assert.strictEqual(chipText({ id: '6', label: 'Bob (bob99)', username: 'bob99' }), '@Bob (bob99) (@bob99)');
+assert.strictEqual(chipText({ id: '6', label: 'Bob (bob99)', username: 'bob99' }), '@Bob (bob99)');  // no double format
+assert.strictEqual(chipText({ id: '7', label: 'Charlie', username: undefined }), '@Charlie');  // missing username
+assert.strictEqual(chipText({ id: '8', label: 'Dave', username: null }), '@Dave');  // null username
 // send blocker
 assert.strictEqual(messageBlocker(false, true, 'x', false), 'Offline');
 assert.strictEqual(messageBlocker(true, false, 'x', false), 'No channel configured');
