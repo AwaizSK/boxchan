@@ -14,5 +14,5 @@ def valid_engine(name) -> bool:
 def get(name: str):
     """Optional-engine module (None for piper, which tts_engine.py owns)."""
     if name == "kokoro":
-        return importlib.import_module("engines.kokoro_engine")
+        return importlib.import_module("kokoro_engine")
     return None

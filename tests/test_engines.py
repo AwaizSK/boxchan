@@ -9,7 +9,7 @@ from unittest import mock
 
 import engines
 from config_store import ConfigStore, ConflictError
-from engines import kokoro_engine
+import kokoro_engine
 from tts_engine import TTSEngine
 from voices import BadVoiceError, VoiceLoadError
 
