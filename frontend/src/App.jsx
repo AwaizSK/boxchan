@@ -352,7 +352,7 @@ export default function App() {
     if (vbusy) return;
     setVbusy(true);
     try {
-      const d = await api('PUT', '/api/voice', { voice: voiceName, rev: config?.rev });
+      const d = await api('PUT', '/api/voice', { name: voiceName, rev: config?.rev });
       if (d.snapshot) setConfig(d.snapshot);
       toast('Applied voice');
     } catch (e) {
