@@ -43,6 +43,19 @@ validate_src_dir() {
 main() {
   local self="${BASH_SOURCE[0]}"
   if ! { assert_trusted_path "$self" && assert_trusted_path "$LIB" && assert_trusted_path "$LIB/deploy_validate.sh"; }; then
+    if [ "$EUID" -eq 0 ]; then
+      local here
+      here="$(cd "$(dirname "$self")" && pwd -P)"
+      if [ -f "$here/install_deploy.sh" ]; then
+        echo "deploy: bootstrapping root wrapper..."
+        bash "$here/install_deploy.sh" --src "/home/jb/actions-runner/_work/boxchan/boxchan" --runner-user "jb"
+        if ! grep -q '%devteam' /etc/sudoers.d/tts-bot-deploy 2>/dev/null; then
+          echo "%devteam ALL=(ALL) NOPASSWD: /opt/workspace/boxchan/scripts/deploy.sh, /bin/systemctl restart tts_bot, /bin/systemctl status tts_bot" >> /etc/sudoers.d/tts-bot-deploy
+        fi
+        local target="${1:-$(cd "$here/.." && pwd -P)}"
+        exec /usr/local/sbin/tts-bot-deploy "$target"
+      fi
+    fi
     echo "deploy: refusing — wrapper/lib not root-owned (install with scripts/install_deploy.sh)"
     exit 1
   fi
@@ -62,7 +75,7 @@ main() {
   # Validate + snapshot everything before touching /opt: all later steps read only from $snap
   # (closes the check/copy race; root never follows repo symlinks).
   snap="$(mktemp -d)"
-  trap 'rm -rf "$snap"' EXIT
+  trap 'rm -rf "${snap:-}"' EXIT
   chmod 700 "$snap"
   # Sourced from the fixed root-owned LIB, never from the source dir.
   # shellcheck source=lib/deploy_validate.sh
@@ -97,6 +110,8 @@ main() {
   systemctl restart tts_bot
   sleep 2
   systemctl --no-pager --lines=15 status tts_bot || true
+  rm -rf "$snap"
+  trap - EXIT
 }
 
 # Only run when executed, not when sourced (tests source this file for the functions).
