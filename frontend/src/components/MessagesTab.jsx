@@ -23,6 +23,28 @@ export default function MessagesTab({
   editor,
   toast,
 }) {
+  const channels = (guild && Array.isArray(guild.channels)) ? guild.channels : [];
+  const [selectedChannelId, setSelectedChannelId] = useState(() => {
+    const saved = guild ? sessionStorage.getItem('msg_ch_' + guild.id) : null;
+    if (saved && channels.some((c) => c.id === saved)) return saved;
+    return channels[0]?.id || '';
+  });
+
+  useEffect(() => {
+    if (!channels.length) {
+      setSelectedChannelId('');
+      return;
+    }
+    const saved = guild ? sessionStorage.getItem('msg_ch_' + guild.id) : null;
+    if (saved && channels.some((c) => c.id === saved)) {
+      setSelectedChannelId(saved);
+    } else if (!channels.some((c) => c.id === selectedChannelId)) {
+      const nextId = channels[0]?.id || '';
+      setSelectedChannelId(nextId);
+      if (guild && nextId) sessionStorage.setItem('msg_ch_' + guild.id, nextId);
+    }
+  }, [guild, channels]);
+
   const [text, setText] = useState('');
   const [tags, setTags] = useState([]);
   const [searchQuery, setSearchQuery] = useState('');
@@ -34,9 +56,13 @@ export default function MessagesTab({
   const searchInputRef = useRef(null);
   const textareaRef = useRef(null);
 
+  const curChannel = channels.find((c) => c.id === selectedChannelId);
+  const targetChannelName = curChannel ? '#' + curChannel.name : (channelName || '');
+  const hasTargetChannel = Boolean(curChannel || hasChannel);
+
   const substituted = substituteTags(text, tags);
   const charCount = cpLen(substituted);
-  const blocker = messageBlocker(isLive, hasChannel, substituted, busy);
+  const blocker = messageBlocker(isLive, hasTargetChannel, substituted, busy);
   const actTags = activeTagIds(text, tags);
   const pings = pingTargets(substituted, tags);
 
@@ -46,9 +72,10 @@ export default function MessagesTab({
     async function fetchResults() {
       try {
         const q = encodeURIComponent(searchQuery);
+        const chParam = selectedChannelId ? '&channel_id=' + encodeURIComponent(selectedChannelId) : '';
         const [mRes, rRes] = await Promise.all([
-          fetch('/api/guilds/' + guild.id + '/members?q=' + q),
-          fetch('/api/guilds/' + guild.id + '/roles?q=' + q),
+          fetch('/api/guilds/' + guild.id + '/members?q=' + q + chParam),
+          fetch('/api/guilds/' + guild.id + '/roles?q=' + q + chParam),
         ]);
         const mData = mRes.ok ? await mRes.json() : null;
         const rData = rRes.ok ? await rRes.json() : null;
@@ -65,7 +92,7 @@ export default function MessagesTab({
       cancelled = true;
       clearTimeout(t);
     };
-  }, [guild, searchQuery]);
+  }, [guild, searchQuery, selectedChannelId]);
 
   function pickItem(item) {
     let label;
@@ -100,7 +127,7 @@ export default function MessagesTab({
     if (blocker) return;
     setBusy(true);
     try {
-      const ok = await onSendMessage(substituted);
+      const ok = await onSendMessage(substituted, selectedChannelId);
       if (ok) {
         setText('');
         setTags([]);
@@ -112,10 +139,35 @@ export default function MessagesTab({
 
   return (
     <div id="view-messages" role="tabpanel" aria-labelledby="tab-messages">
-      <p id="m-dest" className={'dest' + (!hasChannel ? ' off' : '')} role="status">
-        {hasChannel
-          ? 'Posting to ' + channelName + ' as the bot'
-          : 'No channel is configured — pick one in the Channel tab to enable messages'}
+      <div className="m-channel-row">
+        <label htmlFor="m-channel-select" className="m-channel-label">Send to channel:</label>
+        <select
+          id="m-channel-select"
+          className="m-channel-select"
+          aria-label="Target text channel"
+          value={selectedChannelId}
+          onChange={(e) => {
+            const next = e.target.value;
+            setSelectedChannelId(next);
+            if (guild) sessionStorage.setItem('msg_ch_' + guild.id, next);
+          }}
+        >
+          {channels.length === 0 ? (
+            <option value="">No text channels available</option>
+          ) : (
+            channels.map((c) => (
+              <option key={c.id} value={c.id}>
+                #{c.name}{c.category ? ` (${c.category})` : ''}
+              </option>
+            ))
+          )}
+        </select>
+      </div>
+
+      <p id="m-dest" className={'dest' + (!hasTargetChannel ? ' off' : '')} role="status">
+        {hasTargetChannel
+          ? 'Posting to ' + targetChannelName + ' as the bot'
+          : 'No channel selected — select a text channel above to enable messages'}
       </p>
 
       <section aria-label="Presets" className="controls">

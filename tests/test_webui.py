@@ -48,20 +48,22 @@ class FakeController:
             raise self.apply_exc
         return self.apply_result or {"rev": 1, "updated_by": editor, "updated_at": 1.0, "voice": name, "guilds": {}}
 
-    async def members_for(self, gid, q):
+    async def members_for(self, gid, q, channel_id=None):
         self.members_calls.append((gid, q))
         if self.members_exc is not None:
             raise self.members_exc
         return self.members_result
 
-    def roles_for(self, gid, q):
+    def roles_for(self, gid, q, channel_id=None):
         self.roles_calls.append((gid, q))
         if self.roles_exc is not None:
             raise self.roles_exc
         return self.roles_result
 
-    async def send_message(self, gid, content, editor):
+    async def send_message(self, gid, content, editor, channel_id=None):
         self.send_calls.append((gid, content, editor))
+        if channel_id is not None:
+            self.send_channel_id = channel_id
         if self.send_gate is not None:
             await self.send_gate.wait()
         if self.send_exc is not None:

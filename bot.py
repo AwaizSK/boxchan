@@ -384,7 +384,7 @@ async def on_message(message: discord.Message):
     if message.content.startswith(PREFIX):  # global check limits commands to the configured channel
         await bot.process_commands(message)
         return
-    if not config.is_listen_channel(message.guild.id, message.channel.id):  # paused/other channel: ignore
+    if not config.is_enabled(message.guild.id):  # paused: ignore
         return
     if not store.is_watched(message.guild.id, message.author.id):
         return
@@ -815,19 +815,21 @@ class Controller:
         return {"queued": True}
 
     # --- messages (Messages tab) ---
-    def _message_channel(self, guild_id: int):
-        """(guild, configured TextChannel) or MessageError('no_channel'). Never a caller-chosen channel."""
+    def _message_channel(self, guild_id: int, channel_id: int | None = None):
+        """(guild, TextChannel) or MessageError('no_channel'). Uses channel_id if given, else configured channel."""
         guild = bot.get_guild(guild_id)
-        cid = config.channel_for(guild_id)
-        ch = guild.get_channel(cid) if guild is not None and cid else None
+        if guild is None:
+            raise MessageError("no_channel")
+        cid = channel_id if channel_id is not None else config.channel_for(guild_id)
+        ch = guild.get_channel(cid) if cid else None
         if not isinstance(ch, discord.TextChannel):
             raise MessageError("no_channel")
         return guild, ch
 
-    async def members_for(self, guild_id: int, q: str = "") -> dict:
-        """Members who can view the configured channel, for the tag picker (max 25).
+    async def members_for(self, guild_id: int, q: str = "", channel_id: int | None = None) -> dict:
+        """Members who can view the target channel, for the tag picker (max 25).
         Caps permission checks at 2000 per request; yields to the event loop every ~250 members."""
-        guild, ch = self._message_channel(guild_id)
+        guild, ch = self._message_channel(guild_id, channel_id)
         if guild.me is None:
             # guild.me can be None during outages; return empty result
             return {"members": [], "truncated": False}
@@ -868,9 +870,9 @@ class Controller:
             out.append({"id": str(m.id), "name": m.display_name, "display_name": m.display_name, "username": m.name, "bot": bool(m.bot)})
         return {"members": out, "truncated": truncated}
 
-    def roles_for(self, guild_id: int, q: str = "") -> dict:
+    def roles_for(self, guild_id: int, q: str = "", channel_id: int | None = None) -> dict:
         """Guild roles for the tag picker (max 25, non-default)."""
-        guild, ch = self._message_channel(guild_id)
+        guild, ch = self._message_channel(guild_id, channel_id)
         needle = (q or "").strip().casefold()
         roles = []
         for r in getattr(guild, "roles", []):
@@ -897,12 +899,12 @@ class Controller:
             })
         return {"roles": out, "truncated": len(roles) > 25}
 
-    async def send_message(self, guild_id: int, content: str, editor: str) -> dict:
-        """Post `content` as the bot in the guild's configured channel. Raises MessageError."""
+    async def send_message(self, guild_id: int, content: str, editor: str, channel_id: int | None = None) -> dict:
+        """Post `content` as the bot in the guild's target channel. Raises MessageError."""
         content = content.strip() if isinstance(content, str) else ""
         if not 1 <= len(content) <= MAX_MESSAGE_CHARS:
             raise MessageError("bad_request")
-        guild, ch = self._message_channel(guild_id)
+        guild, ch = self._message_channel(guild_id, channel_id)
         user_ids, role_ids = parse_mentions(content)
         for uid in user_ids:
             member = guild.get_member(uid)

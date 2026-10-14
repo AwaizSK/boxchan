@@ -104,6 +104,15 @@ class SendRouteTests(Routes):
         self.assertEqual(await r.json(), {"ok": True, "message_id": "123456789012345678"})
         self.assertEqual(self.ctl.send_calls, [(1, "hello <@42>", "alice")])
 
+    async def test_channel_id_passthrough_and_validation(self):
+        r = await self.send({"content": "hello", "channel_id": "200"})
+        self.assertEqual(r.status, 200)
+        self.assertEqual(self.ctl.send_channel_id, 200)
+        # Invalid channel_id rejected with 400 bad_request
+        for bad in ("abc", -5, [], {}):
+            r = await self.send({"content": "hello", "channel_id": bad})
+            await self.assert_error(r, 400, "bad_request")
+
     async def test_editor_required(self):
         await self.assert_error(await self.send({"content": "hi"}, headers={}), 400, "editor_required")
         self.assertEqual(self.ctl.send_calls, [])

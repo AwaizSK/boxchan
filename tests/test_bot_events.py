@@ -82,12 +82,11 @@ class OnMessageTest(BotTestBase):
         await bot.on_message(make_message(self.guild, 10))
         self.assertEqual(self.ga.queue.qsize(), 0)
 
-    async def test_old_channel_ignored_after_swap(self):
-        await self.config.set_channel(1, 20, expected_rev=None, editor="t")
+    async def test_watched_user_queues_across_all_channels(self):
         await bot.on_message(make_message(self.guild, 10))
-        self.assertEqual(self.ga.queue.qsize(), 0)
+        self.assertEqual(self.ga.queue.get_nowait(), "spoken")
         await bot.on_message(make_message(self.guild, 20))
-        self.assertEqual(self.ga.queue.qsize(), 1)
+        self.assertEqual(self.ga.queue.get_nowait(), "spoken")
 
     async def test_unconfigured_guild_reads_nothing(self):
         await bot.on_message(make_message(make_guild(2), 10))

@@ -892,8 +892,11 @@ def make_app(config, controller, *, allowed_hosts, status_interval: float = 3.0,
     async def members(request):
         gid = known_guild(request)
         q = request.query.get("q", "")[:100]
+        cid_raw = request.query.get("channel_id")
+        cid = int(cid_raw) if cid_raw and cid_raw.isdigit() else None
+        kwargs = {"channel_id": cid} if cid is not None else {}
         try:
-            return _json(await controller.members_for(gid, q))
+            return _json(await controller.members_for(gid, q, **kwargs))
         except MessageError as e:
             return message_error(e)
         except Exception:
@@ -903,11 +906,14 @@ def make_app(config, controller, *, allowed_hosts, status_interval: float = 3.0,
     async def roles(request):
         gid = known_guild(request)
         q = request.query.get("q", "")[:100]
+        cid_raw = request.query.get("channel_id")
+        cid = int(cid_raw) if cid_raw and cid_raw.isdigit() else None
+        kwargs = {"channel_id": cid} if cid is not None else {}
         try:
             fn = getattr(controller, "roles_for", None)
             if not fn:
                 return _json({"roles": [], "truncated": False})
-            res = fn(gid, q)
+            res = fn(gid, q, **kwargs)
             if asyncio.iscoroutine(res):
                 res = await res
             return _json(res)
@@ -922,9 +928,17 @@ def make_app(config, controller, *, allowed_hosts, status_interval: float = 3.0,
         editor = editor_of(request)
         body = await body_of(request)
         content = body.get("content")
+        cid_val = body.get("channel_id")
+        if cid_val is not None:
+            if not (isinstance(cid_val, (int, str)) and str(cid_val).isascii() and str(cid_val).isdigit()):
+                return _err("bad_request", 400)
+            cid = int(cid_val)
+        else:
+            cid = None
         if not isinstance(content, str) or not 1 <= len(content.strip()) <= MAX_MESSAGE_CHARS:
             return _err("bad_request", 400)
-        task = asyncio.create_task(controller.send_message(gid, content, editor))
+        kwargs = {"channel_id": cid} if cid is not None else {}
+        task = asyncio.create_task(controller.send_message(gid, content, editor, **kwargs))
         task.add_done_callback(_make_shielded_callback("send_message", (MessageError,)))
         try:
             # shield: a client disconnect must not cancel the send (nor invite a retry-duplicate)

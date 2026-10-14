@@ -90,3 +90,15 @@ textarea{font:inherit;color:inherit;background:var(--card);border:1px solid var(
 .f-desc{margin:0 0 8px;white-space:pre-wrap;word-break:break-word}
 .f-del{color:var(--bad);background:none;border:0;padding:2px 8px;min-height:30px;font-size:.8125rem;cursor:pointer}
 .f-del:hover{text-decoration:underline}
+.m-channel-row{display:flex;align-items:center;gap:10px;margin-bottom:12px}
+.m-channel-label{font-weight:600;font-size:.875rem;white-space:nowrap;color:var(--fg)}
+.m-channel-select{flex:1;min-height:40px}
+.dashboard-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px;margin-top:16px}
+.dash-card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px;display:grid;gap:8px}
+.dash-card-header{display:flex;align-items:center;gap:8px}
+.dash-card-icon{font-size:1.25rem}
+.dash-card-title{font-size:1rem;font-weight:600}
+.dash-card-stat{font-size:1.0625rem;margin:0}
+.dash-card-stat.ok{color:var(--ok)}
+.dash-card-hint{margin:0;font-size:.8125rem;color:var(--muted);line-height:1.4}
+.dash-card-hint code{background:var(--hi);padding:2px 4px;border-radius:4px;font-size:.8125rem}

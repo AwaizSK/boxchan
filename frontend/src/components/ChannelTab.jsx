@@ -1,26 +1,17 @@
 import React from 'react';
-import { groupChannels, matchChannel } from '../utils';
 
 export default function ChannelTab({
   guilds,
   currentGid,
   config,
   status,
-  query,
-  setQuery,
-  hi,
-  setHi,
-  onSelectChannel,
   onPause,
   onSkip,
   onClear,
   busy,
-  searchInputRef,
 }) {
   const gcfg = config && config.guilds && config.guilds[currentGid] ? config.guilds[currentGid] : { channel_id: null, enabled: true };
   const currentGuild = (guilds || []).find((g) => g.id === currentGid);
-  const channels = currentGuild ? currentGuild.channels : [];
-  const groups = groupChannels(channels);
 
   // Status line calculation
   const st = status && status[currentGid];
@@ -51,71 +42,58 @@ export default function ChannelTab({
         </span>
       </section>
 
-      <input
-        ref={searchInputRef}
-        id="search"
-        type="search"
-        placeholder="Search channels ( / )"
-        aria-label="Search channels"
-        role="combobox"
-        aria-expanded="true"
-        aria-controls="list"
-        autoFocus
-        value={query}
-        onChange={(e) => setQuery(e.target.value)}
-      />
+      <div className="dashboard-grid">
+        <div className="dash-card">
+          <div className="dash-card-header">
+            <span className="dash-card-icon">🔊</span>
+            <span className="dash-card-title">Voice Connection</span>
+          </div>
+          <div className="dash-card-body">
+            {st && st.voice ? (
+              <p className="dash-card-stat ok">
+                Connected to <strong>{st.voice}</strong>
+              </p>
+            ) : (
+              <p className="dash-card-stat muted">
+                Not connected to a voice channel
+              </p>
+            )}
+            <p className="dash-card-hint">
+              Use <code>/join</code> or <code>!join</code> in Discord while in a voice channel to connect the bot.
+            </p>
+          </div>
+        </div>
 
-      <ul id="list" role="listbox" tabIndex={0} aria-label="Text channels">
-        {gcfg.channel_id && !channels.some((c) => c.id === gcfg.channel_id) && (
-          <li id="missing-row" className="opt missing" role="note">
-            Configured channel missing
-          </li>
-        )}
-        {groups.map((grp, gIdx) => {
-          const visibleChannels = grp.channels.filter((c) => matchChannel(c.name, grp.name, query));
-          if (!visibleChannels.length) return null;
-          return (
-            <React.Fragment key={gIdx}>
-              {grp.name && (
-                <li className="cat" role="presentation">
-                  {grp.name}
-                </li>
-              )}
-              {visibleChannels.map((c) => {
-                const isSelected = gcfg.channel_id === c.id;
-                const isHi = hi === c.id;
-                let cls = 'opt';
-                if (isSelected) cls += ' sel';
-                if (isHi) cls += ' hi';
-                if (!gcfg.enabled && isSelected) cls += ' paused';
+        <div className="dash-card">
+          <div className="dash-card-header">
+            <span className="dash-card-icon">👀</span>
+            <span className="dash-card-title">Watched Users</span>
+          </div>
+          <div className="dash-card-body">
+            <p className="dash-card-stat">
+              <strong>{st?.watched || 0}</strong> user{(st?.watched || 0) === 1 ? '' : 's'} being read aloud
+            </p>
+            <p className="dash-card-hint">
+              The bot monitors all channels for watched users. Use <code>/watch @user</code> in Discord to start watching, or <code>/stop @user</code> to stop.
+            </p>
+          </div>
+        </div>
 
-                return (
-                  <li
-                    key={c.id}
-                    id={'ch-' + c.id}
-                    data-id={c.id}
-                    className={cls}
-                    role="option"
-                    aria-selected={isSelected ? 'true' : 'false'}
-                    onClick={() => onSelectChannel(c.id)}
-                  >
-                    <span className="hash">#</span>
-                    <span className="nm">{c.name}</span>
-                    {isSelected && (
-                      <span className="badge">
-                        {gcfg.enabled ? 'Listening' : 'Paused'}
-                      </span>
-                    )}
-                  </li>
-                );
-              })}
-            </React.Fragment>
-          );
-        })}
-      </ul>
-      <p id="empty" className="muted" hidden={channels.some((c) => matchChannel(c.name, c.category, query))}>
-        No channels match.
-      </p>
+        <div className="dash-card">
+          <div className="dash-card-header">
+            <span className="dash-card-icon">💬</span>
+            <span className="dash-card-title">Post Messages</span>
+          </div>
+          <div className="dash-card-body">
+            <p className="dash-card-stat">
+              Available on the <strong>Messages</strong> tab
+            </p>
+            <p className="dash-card-hint">
+              Switch to the Messages tab to select any text channel in this server and post announcements with @mentions.
+            </p>
+          </div>
+        </div>
+      </div>
     </div>
   );
 }

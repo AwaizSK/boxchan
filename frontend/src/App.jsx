@@ -376,9 +376,11 @@ export default function App() {
     }
   }
 
-  async function handleSendMessage(content) {
+  async function handleSendMessage(content, channelId) {
     try {
-      await api('POST', '/api/guilds/' + gid + '/send', { content });
+      const payload = { content };
+      if (channelId) payload.channel_id = channelId;
+      await api('POST', '/api/guilds/' + gid + '/send', payload);
       toast('Message sent as the bot');
       return true;
     } catch (e) {
@@ -535,7 +537,7 @@ export default function App() {
               aria-controls="view-channel"
               onClick={() => changeTab('channel')}
             >
-              Channel
+              Controls
             </button>
             <button
               id="tab-voice"
@@ -587,16 +589,10 @@ export default function App() {
               currentGid={gid}
               config={config}
               status={status}
-              query={query}
-              setQuery={setQuery}
-              hi={hi}
-              setHi={setHi}
-              onSelectChannel={selectChannel}
               onPause={togglePause}
               onSkip={handleSkip}
               onClear={handleClear}
               busy={busy}
-              searchInputRef={searchInputRef}
             />
           )}
 
