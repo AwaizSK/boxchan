@@ -836,7 +836,13 @@ def make_app(config, controller, *, allowed_hosts, status_interval: float = 3.0,
                 return _err("bad_request", 400)
             if VOICE_NAME_RE.fullmatch(name) is None:
                 return _err("bad_voice", 400)
-        task = asyncio.create_task(controller.apply_voice(name, body.get("rev"), editor))
+        extra = {}
+        if "engine" in body:
+            eng = body["engine"]
+            if not isinstance(eng, str) or eng not in ("piper", "kokoro"):
+                return _err("bad_engine", 400)
+            extra["engine_name"] = eng
+        task = asyncio.create_task(controller.apply_voice(name, body.get("rev"), editor, **extra))
         task.add_done_callback(_make_shielded_callback("apply_voice",
                                                        (ConflictError, BadVoiceError, VoiceLoadError, OSError)))
         try:
@@ -857,7 +863,12 @@ def make_app(config, controller, *, allowed_hosts, status_interval: float = 3.0,
         return _json({"snapshot": wire_snapshot(snap)})
 
     async def list_voices(request):
-        return _json(await controller.list_voices())
+        eng = request.query.get("engine")
+        if eng is None:
+            return _json(await controller.list_voices())
+        if eng not in ("piper", "kokoro"):
+            return _err("bad_engine", 400)
+        return _json(await controller.list_voices(eng))
 
     async def say(request):
         gid = known_guild(request)

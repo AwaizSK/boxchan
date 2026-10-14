@@ -11,6 +11,7 @@ from pathlib import Path
 
 import discord
 
+import engines
 from voices import VoiceLoadError
 
 log = logging.getLogger("tts_engine")
@@ -39,6 +40,8 @@ class VoiceState:
     model_path: Path
     config_path: Path
     cuda_active: bool
+    engine: str = "piper"       # active backend
+    name: str | None = None     # non-Piper voice name (Piper uses model_path.stem)
 
 
 def _normalize(text: str, max_chars: int, user, role, channel) -> str | None:
@@ -140,8 +143,13 @@ class TTSEngine:
 
     @property
     def model_name(self) -> str:
-        """Stem of the loaded (or configured) model file."""
-        return self.model_path.stem
+        """Stem of the loaded (or configured) model file; the voice name for non-Piper engines."""
+        st = self._state
+        return st.name if st.engine != "piper" and st.name else st.model_path.stem
+
+    @property
+    def engine_name(self) -> str:
+        return self._state.engine
 
     def purge_tmp(self) -> None:
         for f in self.tmp_dir.glob("*.wav"):
@@ -203,7 +211,36 @@ class TTSEngine:
         return b"".join(voice.synthesize_stream_raw(text))
 
     def _synth(self, text: str) -> bytes:
-        return self._synth_with(self.voice, text)
+        st = self._state
+        if st.engine != "piper":
+            return engines.get(st.engine).synth(st.voice, text)
+        return self._synth_with(st.voice, text)
+
+    def _reload_engine_blocking(self, engine_name: str, models_dir: str, name: str) -> None:
+        """Worker thread. Build + warm up a non-Piper candidate; swap only on success."""
+        mod = engines.get(engine_name)
+        try:
+            handle, rate, cuda = mod.build(models_dir, name)
+        except VoiceLoadError:
+            raise
+        except Exception as e:
+            log.exception("%s load failed; keeping the current voice", engine_name)
+            raise VoiceLoadError() from e
+        if self.ready and self.cuda_active and not cuda:
+            log.warning("refusing swap: currently using CUDA but candidate would run on CPU")
+            raise VoiceLoadError("GPU unavailable for this voice")
+        old = self._state.voice
+        self._state = VoiceState(voice=handle, sample_rate=rate, model_path=Path(handle.model_path),
+                                 config_path=Path(handle.model_path), cuda_active=cuda,
+                                 engine=engine_name, name=name)
+        self.ready = True
+        del old
+        gc.collect()
+        log.info("%s voice swapped (voice=%s, cuda=%s, rate=%d)", engine_name, name, cuda, rate)
+
+    async def reload_engine(self, engine_name: str, models_dir: str, name: str) -> None:
+        """Hot-swap to a non-Piper engine voice. Same serialization and failure contract as reload()."""
+        await self._run_reload(self._reload_engine_blocking, engine_name, str(models_dir), name)
 
     def _reload_blocking(self, model_path: Path, config_path: Path) -> None:
         """Worker thread. Build + warm up the candidate; swap only on success. Refuses GPU->CPU
@@ -235,8 +272,11 @@ class TTSEngine:
         log.info("Piper voice swapped (model=%s, cuda=%s, rate=%d)", self.model_name, cuda, rate)
 
     async def reload(self, model_path, config_path) -> None:
-        """Hot-swap the voice. Serialized with synthesis (same lock, same single worker thread).
+        """Hot-swap to a Piper voice. Serialized with synthesis (same lock, same single worker thread).
         On any failure raises VoiceLoadError and the previous voice keeps serving."""
+        await self._run_reload(self._reload_blocking, Path(model_path), Path(config_path))
+
+    async def _run_reload(self, blocking, *args) -> None:
         if self._lock is None:
             self._lock = asyncio.Lock()
         self._pending_reloads += 1
@@ -244,7 +284,7 @@ class TTSEngine:
         try:
             async with self._lock:
                 fut = asyncio.get_running_loop().run_in_executor(
-                    self._pool, self._reload_blocking, Path(model_path), Path(config_path))
+                    self._pool, blocking, *args)
                 fut.add_done_callback(self._reload_done)
                 # shield: if our caller is cancelled the job still finishes (and is counted until then)
                 await asyncio.shield(fut)

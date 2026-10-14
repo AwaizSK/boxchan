@@ -33,7 +33,8 @@ export default function App() {
   const [gid, setGid] = useState(() => sessionStorage.getItem('gid') || '');
   const [config, setConfig] = useState(null);
   const [status, setStatus] = useState({});
-  const [voice, setVoice] = useState({ list: null, current: null, configured: null, loading: false, cuda: null });
+  const [voice, setVoice] = useState({ list: null, current: null, configured: null, loading: false, cuda: null, engine: null, engines: null, listEngine: null });
+  const [vengine, setVengine] = useState(null);
   const [vsel, setVsel] = useState(null);
   const [vbusy, setVbusy] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -116,11 +117,11 @@ export default function App() {
   }
 
   // Load voices
-  async function loadVoices(manual) {
+  async function loadVoices(manual, eng) {
     voiceSeqRef.current++;
     const seq = voiceSeqRef.current;
     try {
-      const d = await api('GET', '/api/voices');
+      const d = await api('GET', '/api/voices' + (eng ? '?engine=' + eng : ''));
       setVoice((prev) => mergeVoiceSummary(prev, d, { seqAtRequest: seq, seqNow: voiceSeqRef.current, live: conn === 'live' }));
       if (manual && d.voices) {
         toast('Found ' + d.voices.length + ' voice' + (d.voices.length === 1 ? '' : 's'));
@@ -208,6 +209,7 @@ export default function App() {
                   loading: !!d.loading,
                   current: 'current' in d ? d.current : prev.current,
                   cuda: 'cuda' in d ? d.cuda : prev.cuda,
+                  engine: 'engine' in d && d.engine ? d.engine : prev.engine,
                 }));
               } catch (e) {}
             } else if (evName === 'status') {
@@ -348,19 +350,26 @@ export default function App() {
     }
   }
 
-  async function handleApplyVoice(voiceName) {
+  async function handleApplyVoice(voiceName, engineName) {
     if (vbusy) return;
     setVbusy(true);
+    const eng = engineName || vengine || voice.engine || voice.listEngine || 'piper';
     try {
-      const d = await api('PUT', '/api/voice', { name: voiceName, rev: config?.rev });
+      const d = await api('PUT', '/api/voice', { name: voiceName, engine: eng, rev: config?.rev });
       if (d.snapshot) setConfig(d.snapshot);
       toast('Applied voice');
     } catch (e) {
-      toast('Failed to apply voice', { error: true });
+      toast('Failed to apply voice: ' + (e.message || 'error'), { error: true });
     } finally {
       setVbusy(false);
-      await loadVoices(false);
+      await loadVoices(false, eng);
     }
+  }
+
+  function handlePickEngine(eng) {
+    setVengine(eng);
+    setVsel(null);
+    loadVoices(false, eng);
   }
 
   async function handleSay(text) {
@@ -605,7 +614,9 @@ export default function App() {
               vsel={vsel}
               setVsel={setVsel}
               onApplyVoice={handleApplyVoice}
-              onResetVoice={() => handleApplyVoice(null)}
+              onResetVoice={() => { setVengine('piper'); handleApplyVoice(null, 'piper'); }}
+              vengine={vengine}
+              onPickEngine={handlePickEngine}
               onRescanVoices={() => loadVoices(true)}
               onSay={handleSay}
               vbusy={vbusy}

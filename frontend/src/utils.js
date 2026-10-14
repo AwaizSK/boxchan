@@ -247,10 +247,17 @@ export function messageBlocker(live, hasChannel, content, busy) {
 export function mergeVoiceSummary(prev, incoming, { seqAtRequest, seqNow, live }) {
   if (!incoming) return prev;
   const list = Array.isArray(incoming.voices) ? incoming.voices : prev.list;
+  const extra = {};
+  const engines = Array.isArray(incoming.engines) ? incoming.engines : prev.engines;
+  const listEngine = incoming.list_engine || prev.listEngine;
+  if (engines !== undefined) extra.engines = engines;
+  if (listEngine !== undefined) extra.listEngine = listEngine;
   if (live && seqNow > seqAtRequest) {
-    return { list, current: prev.current, configured: prev.configured, loading: prev.loading, cuda: prev.cuda };
+    return { list, current: prev.current, configured: prev.configured, loading: prev.loading, cuda: prev.cuda, ...(prev.engine !== undefined ? { engine: prev.engine } : {}), ...extra };
   }
   return {
+    ...extra,
+    ...((incoming.engine || prev.engine) !== undefined ? { engine: incoming.engine || prev.engine } : {}),
     list,
     current: incoming.current == null ? null : incoming.current,
     configured: incoming.configured == null ? null : incoming.configured,

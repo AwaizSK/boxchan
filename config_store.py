@@ -71,7 +71,8 @@ class ConfigStore:
         self.updated_by = None
         self.updated_at = None
         self._guilds: dict[str, dict] = {}
-        self.voice: str | None = None  # GLOBAL Piper voice (file stem); None = env default
+        self.voice: str | None = None  # GLOBAL voice (Piper file stem / Kokoro name); None = env default
+        self.engine: str = "piper"     # GLOBAL TTS engine: "piper" | "kokoro"
         self._lock = asyncio.Lock()
         self._load()
 
@@ -92,6 +93,8 @@ class ConfigStore:
             self._guilds = guilds
             voice = data.get("voice")
             self.voice = voice if isinstance(voice, str) and voice else None
+            eng = data.get("engine")
+            self.engine = eng if eng in ("piper", "kokoro") else "piper"
         except FileNotFoundError:
             pass
         except Exception:
@@ -99,6 +102,7 @@ class ConfigStore:
             self._quarantine()
             self.rev, self.updated_by, self.updated_at, self._guilds = 0, None, None, {}
             self.voice = None
+            self.engine = "piper"
 
     def _quarantine(self) -> None:
         """Best-effort: move an unreadable config aside so the next write cannot destroy it."""
@@ -115,6 +119,7 @@ class ConfigStore:
             "updated_by": self.updated_by,
             "updated_at": self.updated_at,
             "voice": self.voice,
+            "engine": self.engine,
             "guilds": {g: dict(e) for g, e in self._guilds.items()},
         }
 
@@ -142,19 +147,24 @@ class ConfigStore:
                           expected_rev: int | None, editor: str) -> dict:
         return await self._apply(guild_id, "enabled", bool(enabled), expected_rev, editor)
 
-    async def set_voice(self, name: str | None, *, expected_rev: int | None, editor: str) -> dict:
-        """Global voice (file stem or None). Same semantics as set_enabled: stale rev -> ConflictError,
-        unchanged value -> no rev bump and no event, persist failure -> rollback and re-raise."""
+    async def set_voice(self, name: str | None, *, expected_rev: int | None, editor: str,
+                        engine: str | None = None) -> dict:
+        """Global voice (file stem / Kokoro name or None), optionally with the engine, in one write.
+        Same semantics as set_enabled: stale rev -> ConflictError, unchanged -> no rev bump and no event,
+        persist failure -> rollback and re-raise."""
         if name is not None and not isinstance(name, str):
             raise TypeError("voice must be a string or None")
+        if engine is not None and engine not in ("piper", "kokoro"):
+            raise ValueError("unknown engine")
         async with self._lock:
             if expected_rev is not None and expected_rev != self.rev:
                 raise ConflictError(self.snapshot())
-            if name == self.voice:
+            new_engine = self.engine if engine is None else engine
+            if name == self.voice and new_engine == self.engine:
                 return self.snapshot()
-            old = self.voice
+            old, old_engine = self.voice, self.engine
             prev = (self.rev, self.updated_by, self.updated_at)
-            self.voice = name
+            self.voice, self.engine = name, new_engine
             self.rev += 1
             self.updated_by = editor
             self.updated_at = time.time()
@@ -163,7 +173,7 @@ class ConfigStore:
                 await asyncio.to_thread(atomic_write_json, snap, self.path)
             except BaseException:
                 self.rev, self.updated_by, self.updated_at = prev
-                self.voice = old
+                self.voice, self.engine = old, old_engine
                 raise
             self.hub.publish({
                 "type": "config",

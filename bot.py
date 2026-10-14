@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 
 from config_store import ConfigStore, ConflictError, atomic_write_json
 from messages import MAX_MESSAGE_CHARS, MessageError, SendLimiter, parse_mentions
+import engines
 from tts_engine import TTSEngine, clean_discord_text, clean_plain_text
 from voices import BadVoiceError, SayError, VoiceLoadError, discover_voices, resolve_voice
 from webui import (detect_tailscale_addrs, make_app, parse_allowed_hosts, start_webui,
@@ -741,53 +742,98 @@ class Controller:
         self._chunk_failures: dict[int, float] = {}  # guild_id -> timestamp of failure
         self._chunk_timeout_window = 60.0  # Seconds to skip chunk() retry after failure
 
+    @staticmethod
+    def _active_engine() -> str:
+        return getattr(engine, "engine_name", "piper") if engine.ready else config.engine
+
     def voice_summary(self) -> dict:
         return {"current": engine.model_name if engine.ready else None,
                 "configured": config.voice, "loading": engine.loading,
-                "cuda": engine.cuda_active if engine.ready else None}
+                "cuda": engine.cuda_active if engine.ready else None,
+                "engine": self._active_engine(),
+                "configured_engine": config.engine}
 
-    async def list_voices(self) -> dict:
+    def _engines_view(self) -> list[dict]:
+        out = [{"name": "piper", "available": True, "reason": None}]
+        for name in engines.ENGINE_NAMES:
+            if name == "piper":
+                continue
+            try:
+                ok, why = engines.get(name).available(MODELS_DIR)
+            except Exception:
+                ok, why = False, "engine unavailable"
+            out.append({"name": name, "available": ok, "reason": why})
+        return out
+
+    async def list_voices(self, engine_name: str | None = None) -> dict:
         """Rescans the models folder on every call (this is the GUI's Rescan)."""
-        voices = await asyncio.to_thread(discover_voices, MODELS_DIR)
-        return {"voices": voices, **self.voice_summary()}
+        name = engine_name or self._active_engine()
+        if not engines.valid_engine(name):
+            raise BadVoiceError("unknown engine")
+        if name == "piper":
+            voices = await asyncio.to_thread(discover_voices, MODELS_DIR)
+        else:
+            voices = await asyncio.to_thread(engines.get(name).list_voices, MODELS_DIR)
+        return {"voices": voices, "list_engine": name, "engines": self._engines_view(), **self.voice_summary()}
 
     def _publish_voice(self, loading: bool, error: str | None = None) -> None:
         ev = {"type": "voice", "loading": loading}
         if not loading:
             ev.update(current=engine.model_name if engine.ready else None, error=error,
                      cuda=engine.cuda_active if engine.ready else None)
+            if hasattr(engine, "engine_name"):
+                ev["engine"] = engine.engine_name if engine.ready else None
         config.hub.publish(ev)
 
-    async def apply_voice(self, name: str | None, expected_rev: int | None, editor: str) -> dict:
-        """Hot-swap the global voice. Raises BadVoiceError, ConflictError, VoiceLoadError, OSError."""
+    async def _reload_to(self, target_engine: str, name: str | None, target) -> None:
+        if target_engine == "piper":
+            await engine.reload(*target)
+        else:
+            await engine.reload_engine(target_engine, MODELS_DIR, name)
+
+    async def apply_voice(self, name: str | None, expected_rev: int | None, editor: str,
+                          engine_name: str | None = None) -> dict:
+        """Hot-swap the global engine+voice. Raises BadVoiceError, ConflictError, VoiceLoadError, OSError."""
         async with self._voice_lock:
-            if name is None:
-                target = default_voice_paths()
+            target_engine = engine_name or self._active_engine()
+            if not engines.valid_engine(target_engine):
+                raise BadVoiceError("unknown engine")
+            target = None
+            if target_engine == "piper":
+                if name is None:
+                    target = default_voice_paths()
+                else:
+                    target = await asyncio.to_thread(resolve_voice, MODELS_DIR, name)  # BadVoiceError
             else:
-                target = await asyncio.to_thread(resolve_voice, MODELS_DIR, name)  # BadVoiceError
+                if name is None:
+                    raise BadVoiceError("voice required")
+                await asyncio.to_thread(engines.get(target_engine).resolve, MODELS_DIR, name)  # BadVoiceError
             # Stale-client detection happens HERE, before the engine is touched. The save below uses
             # expected_rev=None on purpose: the engine has already swapped, so a rev bump from a
             # concurrent channel/pause edit during the (slow) load must not discard the swap.
             if expected_rev is not None and expected_rev != config.rev:
                 raise ConflictError(config.snapshot())
-            prev = (engine.model_path, engine.config_path) if engine.ready else None
+            prev = None
+            if engine.ready:
+                pe = getattr(engine, "engine_name", "piper")
+                prev = (pe, engine.model_name if pe != "piper" else None, (engine.model_path, engine.config_path))
             self._publish_voice(True)
             err = None
             try:
-                await engine.reload(*target)
+                await self._reload_to(target_engine, name, target)
             except VoiceLoadError:
                 err = "load_failed"
                 raise
             finally:
                 self._publish_voice(False, err)
             try:
-                return await config.set_voice(name, expected_rev=None, editor=editor)
+                return await config.set_voice(name, expected_rev=None, editor=editor, engine=target_engine)
             except OSError:
                 if prev is not None:  # best effort: keep engine and saved config in agreement
                     self._publish_voice(True)
                     err = None
                     try:
-                        await engine.reload(*prev)
+                        await self._reload_to(prev[0], prev[1], prev[2])
                     except VoiceLoadError:
                         err = "load_failed"
                         log.error("could not restore previous voice after a failed save")
@@ -1086,10 +1132,27 @@ async def shutdown(b: commands.Bot) -> None:
 
 
 async def load_engine() -> bool:
-    """Load the saved GUI voice if it still resolves (single load), else the env default.
-    A saved voice that is missing or fails to load is logged once and the default is used; the GUI
-    then shows configured != current."""
+    """Load the saved GUI engine+voice if it still resolves (single load), else the env Piper default.
+    A saved voice that is missing, unavailable or fails to load is logged once and the default is used;
+    the GUI then shows configured != current."""
     saved = config.voice
+    if config.engine != "piper" and saved:
+        mod = engines.get(config.engine)
+        try:
+            ok, why = await asyncio.to_thread(mod.available, MODELS_DIR)
+            if not ok:
+                log.warning("saved engine %r unavailable (%s); using Piper", config.engine, why)
+            else:
+                await asyncio.to_thread(mod.resolve, MODELS_DIR, saved)
+                await engine.reload_engine(config.engine, MODELS_DIR, saved)
+                return True
+        except BadVoiceError:
+            log.warning("saved voice %r not found for engine %r; using Piper", saved, config.engine)
+        except VoiceLoadError:
+            log.error("saved %s voice %r failed to load; using Piper", config.engine, saved)
+        except Exception:
+            log.exception("saved engine failed; using Piper")
+        saved = None
     if saved:
         try:
             onnx, cfg = await asyncio.to_thread(resolve_voice, MODELS_DIR, saved)
