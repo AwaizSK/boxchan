@@ -146,6 +146,39 @@ class ChannelCheckTest(BotTestBase):
             await bot.only_tts_channel(self.ctx(1, 10))
         self.assertTrue(await bot.only_tts_channel(self.ctx(1, 20)))
 
+    async def test_big_bots_role_allows_command_in_any_channel(self):
+        await self.config.set_channel(1, 10, expected_rev=None, editor="t")
+        role = mock.MagicMock()
+        role.name = "Big bots"
+        ctx = self.ctx(1, 999)  # unconfigured channel
+        ctx.author.roles = [role]
+        self.assertTrue(await bot.only_tts_channel(ctx))
+
+    async def test_big_bots_role_case_insensitive(self):
+        await self.config.set_channel(1, 10, expected_rev=None, editor="t")
+        role = mock.MagicMock()
+        role.name = "  big BOTS  "
+        ctx = self.ctx(1, 999)  # unconfigured channel
+        ctx.author.roles = [role]
+        self.assertTrue(await bot.only_tts_channel(ctx))
+
+    async def test_big_bots_role_still_fails_in_dm(self):
+        role = mock.MagicMock()
+        role.name = "Big bots"
+        ctx = self.ctx(None, 999)  # DM
+        ctx.author.roles = [role]
+        with self.assertRaises(commands.CheckFailure):
+            await bot.only_tts_channel(ctx)
+
+    async def test_other_role_fails_in_unconfigured_channel(self):
+        await self.config.set_channel(1, 10, expected_rev=None, editor="t")
+        role = mock.MagicMock()
+        role.name = "Normal role"
+        ctx = self.ctx(1, 999)
+        ctx.author.roles = [role]
+        with self.assertRaises(commands.CheckFailure):
+            await bot.only_tts_channel(ctx)
+
 
 class CommandErrorTest(BotTestBase):
     def ctx(self, gid, interaction=True):

@@ -25,9 +25,9 @@ export default function MessagesTab({
 }) {
   const [text, setText] = useState('');
   const [tags, setTags] = useState([]);
-  const [memberQuery, setMemberQuery] = useState('');
-  const [members, setMembers] = useState([]);
-  const [memberHi, setMemberHi] = useState(-1);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [items, setItems] = useState([]);
+  const [itemHi, setItemHi] = useState(-1);
   const [busy, setBusy] = useState(false);
   const [searchFocused, setSearchFocused] = useState(false);
 
@@ -43,27 +43,41 @@ export default function MessagesTab({
   useEffect(() => {
     if (!guild) return;
     let cancelled = false;
-    async function fetchMembers() {
+    async function fetchResults() {
       try {
-        const res = await fetch('/api/guilds/' + guild.id + '/members?q=' + encodeURIComponent(memberQuery));
-        if (!res.ok) return;
-        const data = await res.json();
-        if (!cancelled && data && Array.isArray(data.members)) {
-          setMembers(data.members);
-          setMemberHi(-1);
+        const q = encodeURIComponent(searchQuery);
+        const [mRes, rRes] = await Promise.all([
+          fetch('/api/guilds/' + guild.id + '/members?q=' + q),
+          fetch('/api/guilds/' + guild.id + '/roles?q=' + q),
+        ]);
+        const mData = mRes.ok ? await mRes.json() : null;
+        const rData = rRes.ok ? await rRes.json() : null;
+        if (!cancelled) {
+          const roles = (rData && Array.isArray(rData.roles)) ? rData.roles : [];
+          const members = (mData && Array.isArray(mData.members)) ? mData.members : [];
+          setItems([...roles, ...members]);
+          setItemHi(-1);
         }
       } catch (e) {}
     }
-    const t = setTimeout(fetchMembers, 200);
+    const t = setTimeout(fetchResults, 200);
     return () => {
       cancelled = true;
       clearTimeout(t);
     };
-  }, [guild, memberQuery]);
+  }, [guild, searchQuery]);
 
-  function pickMember(m) {
-    const label = uniqueLabel(m.display_name || m.username, m.username, m.id, tags);
-    const newTag = { id: m.id, label, username: m.username };
+  function pickItem(item) {
+    let label;
+    let newTag;
+    if (item.is_role) {
+      label = uniqueLabel(item.name, 'role', item.id, tags);
+      newTag = { id: item.id, label, is_role: true };
+    } else {
+      const displayName = item.display_name || item.name || item.username;
+      label = uniqueLabel(displayName, item.username, item.id, tags);
+      newTag = { id: item.id, label, username: item.username, is_role: false };
+    }
     setTags((prev) => [...prev, newTag]);
 
     // Insert @label into textarea
@@ -74,7 +88,7 @@ export default function MessagesTab({
     } else {
       setText((prev) => prev + (prev && !/\s$/.test(prev) ? ' ' : '') + '@' + label + ' ');
     }
-    setMemberQuery('');
+    setSearchQuery('');
     setSearchFocused(false);
   }
 
@@ -140,42 +154,51 @@ export default function MessagesTab({
           ref={searchInputRef}
           id="m-search"
           type="search"
-          placeholder="Search members"
-          aria-label="Search members"
+          placeholder="Search members or roles"
+          aria-label="Search members or roles"
           role="combobox"
           aria-expanded="true"
           aria-controls="m-list"
-          value={memberQuery}
+          value={searchQuery}
           onFocus={() => setSearchFocused(true)}
-          onChange={(e) => setMemberQuery(e.target.value)}
+          onChange={(e) => setSearchQuery(e.target.value)}
           onKeyDown={(e) => {
             if (e.isComposing) return;
             if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
               e.preventDefault();
-              if (members.length) {
-                setMemberHi((prev) =>
-                  Math.min(members.length - 1, Math.max(0, prev + (e.key === 'ArrowDown' ? 1 : -1)))
+              if (items.length) {
+                setItemHi((prev) =>
+                  Math.min(items.length - 1, Math.max(0, prev + (e.key === 'ArrowDown' ? 1 : -1)))
                 );
               }
             } else if (e.key === 'Enter') {
               e.preventDefault();
-              if (members[memberHi]) pickMember(members[memberHi]);
+              if (items[itemHi]) pickItem(items[itemHi]);
             } else if (e.key === 'Escape') {
               e.preventDefault();
-              setMemberQuery('');
+              setSearchQuery('');
             }
           }}
         />
-        {searchFocused && members.length > 0 && (
-          <ul id="m-list" role="listbox" aria-label="Members">
-            {members.map((m, i) => (
+        {searchFocused && items.length > 0 && (
+          <ul id="m-list" role="listbox" aria-label="Members and roles">
+            {items.map((item, i) => (
               <li
-                key={m.id}
-                className={'opt' + (memberHi === i ? ' hi' : '')}
-                onClick={() => pickMember(m)}
+                key={(item.is_role ? 'r-' : 'm-') + item.id}
+                className={'opt' + (itemHi === i ? ' hi' : '')}
+                onClick={() => pickItem(item)}
               >
-                <span className="nm">{m.display_name || m.username}</span>
-                <span className="meta">@{m.username}</span>
+                {item.is_role ? (
+                  <>
+                    <span className="nm">@{item.name}</span>
+                    <span className="meta">role</span>
+                  </>
+                ) : (
+                  <>
+                    <span className="nm">{item.display_name || item.name || item.username}</span>
+                    <span className="meta">@{item.username}</span>
+                  </>
+                )}
               </li>
             ))}
           </ul>
@@ -187,8 +210,8 @@ export default function MessagesTab({
         {tags.map((t) => {
           const on = actTags.has(t.id);
           return (
-            <span key={t.id} className={'chip' + (on ? '' : ' off')} title={chipText(t)}>
-              {t.label}
+            <span key={(t.is_role ? 'r-' : 'm-') + t.id} className={'chip' + (t.is_role ? ' role' : '') + (on ? '' : ' off')} title={chipText(t)}>
+              {t.is_role ? '@' + t.label : t.label}
               <button type="button" onClick={() => removeChip(t.id)}>×</button>
             </span>
           );

@@ -13,41 +13,44 @@ class Clock:
 
 class ParseMentionsTests(unittest.TestCase):
     def test_user_tokens_deduped_in_order(self):
-        self.assertEqual(parse_mentions("a <@5> b <@!7> c <@5>"), [5, 7])
+        self.assertEqual(parse_mentions("a <@5> b <@!7> c <@5>"), ([5, 7], []))
+
+    def test_role_tokens_deduped_in_order(self):
+        self.assertEqual(parse_mentions("hi <@&123> there <@&99> again <@&123>"), ([], [123, 99]))
+
+    def test_mixed_user_and_role_tokens(self):
+        self.assertEqual(parse_mentions("<@5> and <@&99> with <@!7>"), ([5, 7], [99]))
 
     def test_everyone_text_is_not_a_mention(self):
-        self.assertEqual(parse_mentions("@everyone @here hi"), [])
-
-    def test_role_token_rejected(self):
-        for text in ("<@&123>", "hi <@5> <@&9>"):
-            with self.assertRaises(MessageError) as cm:
-                parse_mentions(text)
-            self.assertEqual(cm.exception.code, "bad_mention")
+        self.assertEqual(parse_mentions("@everyone @here hi"), ([], []))
 
     def test_malformed_tokens_ignored(self):
-        self.assertEqual(parse_mentions("<@abc> <@> <@ 5> <#5> <@٥٥>"), [])
+        self.assertEqual(parse_mentions("<@abc> <@> <@ 5> <#5> <@٥٥> <@&> <@&abc>"), ([], []))
 
     def test_exactly_10_mentions_ok(self):
-        content = " ".join(f"<@{i}>" for i in range(10))
-        result = parse_mentions(content)
-        self.assertEqual(result, list(range(10)))
+        content = " ".join(f"<@{i}>" for i in range(7)) + " " + " ".join(f"<@&{i+100}>" for i in range(3))
+        users, roles = parse_mentions(content)
+        self.assertEqual(users, list(range(7)))
+        self.assertEqual(roles, list(range(100, 103)))
+        self.assertEqual(len(users) + len(roles), 10)
 
     def test_11_distinct_mentions_rejected(self):
-        content = " ".join(f"<@{i}>" for i in range(11))
+        content = " ".join(f"<@{i}>" for i in range(8)) + " " + " ".join(f"<@&{i+100}>" for i in range(3))
         with self.assertRaises(MessageError) as cm:
             parse_mentions(content)
         self.assertEqual(cm.exception.code, "bad_mention")
 
     def test_duplicates_count_as_one(self):
         # 10 distinct ids + duplicates = still valid if <= 10 distinct
-        content = "<@1> <@2> <@3> <@4> <@5> <@6> <@7> <@8> <@9> <@10> <@1> <@2>"
-        result = parse_mentions(content)
-        self.assertEqual(len(result), 10)
-        self.assertEqual(result, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+        content = "<@1> <@2> <@&100> <@3> <@4> <@5> <@&200> <@6> <@7> <@8> <@1> <@&100>"
+        users, roles = parse_mentions(content)
+        self.assertEqual(len(users) + len(roles), 10)
+        self.assertEqual(users, [1, 2, 3, 4, 5, 6, 7, 8])
+        self.assertEqual(roles, [100, 200])
 
     def test_11_distinct_with_duplicates_rejected(self):
         # 11 distinct ids + duplicates = rejected
-        content = "<@1> <@2> <@3> <@4> <@5> <@6> <@7> <@8> <@9> <@10> <@11> <@1> <@2>"
+        content = "<@1> <@2> <@3> <@4> <@5> <@6> <@7> <@8> <@9> <@10> <@&11> <@1> <@&11>"
         with self.assertRaises(MessageError) as cm:
             parse_mentions(content)
         self.assertEqual(cm.exception.code, "bad_mention")

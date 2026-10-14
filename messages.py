@@ -10,8 +10,7 @@ RATE_PER_WINDOW = 10    # sends per rolling window, per guild
 RATE_WINDOW = 60.0      # seconds
 RATE_MIN_GAP = 2.0      # minimum seconds between two sends, per guild
 
-USER_MENTION_RE = re.compile(r"<@!?([0-9]{1,20})>")
-ROLE_MENTION_RE = re.compile(r"<@&[0-9]+>")
+TOKEN_MENTION_RE = re.compile(r"<@(!?|&)([0-9]{1,20})>")
 
 
 class MessageError(Exception):
@@ -23,19 +22,22 @@ class MessageError(Exception):
         self.retry_after = retry_after
 
 
-def parse_mentions(content: str) -> list[int]:
-    """User ids from `<@id>` / `<@!id>` tokens, first-seen order, de-duplicated.
-    Role tokens `<@&id>` raise MessageError('bad_mention') (rejected, never silently stripped).
+def parse_mentions(content: str) -> tuple[list[int], list[int]]:
+    """User and role ids from `<@id>` / `<@!id>` and `<@&id>` tokens, first-seen order, de-duplicated.
     The literal text @everyone / @here is allowed but can never ping (allowed_mentions).
-    More than 10 distinct mentions raise MessageError('bad_mention')."""
-    if ROLE_MENTION_RE.search(content):
+    More than 10 total distinct mentions raise MessageError('bad_mention').
+    Returns (user_ids, role_ids)."""
+    user_seen: dict[int, None] = {}
+    role_seen: dict[int, None] = {}
+    for m in TOKEN_MENTION_RE.finditer(content):
+        prefix, raw_id = m.group(1), int(m.group(2))
+        if prefix == "&":
+            role_seen.setdefault(raw_id, None)
+        else:
+            user_seen.setdefault(raw_id, None)
+    if len(user_seen) + len(role_seen) > 10:
         raise MessageError("bad_mention")
-    seen: dict[int, None] = {}
-    for m in USER_MENTION_RE.finditer(content):
-        seen.setdefault(int(m.group(1)), None)
-    if len(seen) > 10:
-        raise MessageError("bad_mention")
-    return list(seen)
+    return list(user_seen), list(role_seen)
 
 
 class SendLimiter:

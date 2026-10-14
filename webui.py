@@ -900,6 +900,23 @@ def make_app(config, controller, *, allowed_hosts, status_interval: float = 3.0,
             log.exception("member lookup failed")
             return _err("internal", 500)
 
+    async def roles(request):
+        gid = known_guild(request)
+        q = request.query.get("q", "")[:100]
+        try:
+            fn = getattr(controller, "roles_for", None)
+            if not fn:
+                return _json({"roles": [], "truncated": False})
+            res = fn(gid, q)
+            if asyncio.iscoroutine(res):
+                res = await res
+            return _json(res)
+        except MessageError as e:
+            return message_error(e)
+        except Exception:
+            log.exception("role lookup failed")
+            return _err("internal", 500)
+
     async def send_message(request):
         gid = known_guild(request)
         editor = editor_of(request)
@@ -1173,6 +1190,7 @@ def make_app(config, controller, *, allowed_hosts, status_interval: float = 3.0,
     app.router.add_put("/api/voice", apply_voice)
     app.router.add_post("/api/guilds/{gid}/say", say)
     app.router.add_get("/api/guilds/{gid}/members", members)
+    app.router.add_get("/api/guilds/{gid}/roles", roles)
     app.router.add_post("/api/guilds/{gid}/send", send_message)
     app.router.add_get("/api/events", events)
     return app

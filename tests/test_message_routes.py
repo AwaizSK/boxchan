@@ -70,6 +70,33 @@ class MembersRouteTests(Routes):
         self.assertEqual((await self.client.get("/api/guilds/1/members")).status, 200)
 
 
+class RolesRouteTests(Routes):
+    async def test_roles_passthrough_and_query(self):
+        self.ctl.roles_result = {"roles": [{"id": "99", "name": "Admins", "color": "#ff0000", "is_role": True}], "truncated": False}
+        r = await self.client.get("/api/guilds/1/roles?q=adm")
+        self.assertEqual(r.status, 200)
+        self.assertEqual(r.headers["Cache-Control"], "no-store")
+        body = await r.json()
+        self.assertEqual(body["roles"][0]["name"], "Admins")
+        self.assertEqual(self.ctl.roles_calls, [(1, "adm")])
+
+    async def test_empty_and_long_query(self):
+        await self.client.get("/api/guilds/1/roles")
+        await self.client.get("/api/guilds/1/roles?q=" + "x" * 500)
+        self.assertEqual(self.ctl.roles_calls[0], (1, ""))
+        self.assertEqual(len(self.ctl.roles_calls[1][1]), 100)
+
+    async def test_errors(self):
+        self.ctl.roles_exc = MessageError("no_channel")
+        await self.assert_error(await self.client.get("/api/guilds/1/roles"), 409, "no_channel")
+        self.assertEqual((await self.client.get("/api/guilds/2/roles")).status, 404)
+        self.assertEqual((await self.client.get("/api/guilds/x/roles")).status, 404)
+        self.ctl.roles_exc = RuntimeError("boom")
+        with self.assertLogs("webui", "ERROR"):
+            r = await self.client.get("/api/guilds/1/roles")
+        await self.assert_error(r, 500, "internal")
+
+
 class SendRouteTests(Routes):
     async def test_success(self):
         r = await self.send({"content": "hello <@42>"})

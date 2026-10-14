@@ -103,7 +103,7 @@ export function voiceSwitchText(editor, name) {
 export const MSG_MAX = 2000;
 export const READY_PRESET = "The voice bot is ready to use! Join a voice channel, type !join here, and I'll read watched users' messages aloud.";
 export const cpLen = (s) => Array.from(String(s)).length;
-export const MENTION_SRC = '<@!?([0-9]{1,20})>';
+export const MENTION_SRC = '<@(?:!|&)?([0-9]{1,20})>';
 export const mentionRe = () => new RegExp(MENTION_SRC, 'g');
 
 export function tokenizeMentions(text) {
@@ -158,7 +158,10 @@ export function segmentText(text, tags) {
 }
 
 export function substituteTags(text, tags) {
-  return segmentText(text, tags).map((s) => (s.tag ? '<@' + s.tag.id + '>' : s.text)).join('').trim();
+  return segmentText(text, tags)
+    .map((s) => (s.tag ? (s.tag.is_role ? '<@&' : '<@') + s.tag.id + '>' : s.text))
+    .join('')
+    .trim();
 }
 
 export function activeTagIds(text, tags) {
@@ -206,17 +209,21 @@ export function pingTargets(finalText, chips) {
     if (part.id === null || seen.has(part.id)) continue;
     seen.add(part.id);
     const chip = byId.get(part.id);
-    targets.push({
+    const isRole = part.text.startsWith('<@&') || Boolean(chip && chip.is_role);
+    const item = {
       id: part.id,
       label: chip ? chip.label : null,
-      username: chip ? chip.username : null,
+      username: chip && chip.username ? chip.username : null,
       known: !!chip,
-    });
+    };
+    if (isRole) item.is_role = true;
+    targets.push(item);
   }
   return targets;
 }
 
 export function chipText(chip) {
+  if (chip.is_role) return '@' + chip.label;
   if (!chip.username) return '@' + chip.label;
   if (chip.label.includes('(' + chip.username + ')')) return '@' + chip.label;
   return '@' + chip.label + ' (@' + chip.username + ')';
@@ -224,7 +231,7 @@ export function chipText(chip) {
 
 export function pingSummary(targets) {
   if (!targets.length) return 'No pings';
-  const names = targets.map((t) => (t.known ? chipText(t) : 'unknown user ' + t.id));
+  const names = targets.map((t) => (t.known ? chipText(t) : (t.is_role ? 'unknown role ' : 'unknown user ') + t.id));
   return 'Will ping: ' + names.join(', ');
 }
 

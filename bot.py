@@ -288,10 +288,24 @@ async def teardown(guild: discord.Guild) -> None:
 
 
 # ---------- events ----------
+def has_big_bots_role(member) -> bool:
+    """Return True if member has the 'Big bots' role (case-insensitive)."""
+    if not member:
+        return False
+    roles = getattr(member, "roles", None)
+    if not isinstance(roles, (list, tuple, set)):
+        return False
+    return any(isinstance(getattr(r, "name", None), str) and getattr(r, "name", "").strip().casefold() == "big bots" for r in roles)
+
+
 @bot.check
 async def only_tts_channel(ctx: commands.Context) -> bool:
-    """Commands work only in the configured text channel."""
-    if not (ctx.guild and config.is_command_channel(ctx.guild.id, ctx.channel.id)):
+    """Commands work only in the configured text channel, unless caller has 'Big bots' role."""
+    if not ctx.guild:
+        raise commands.CheckFailure("wrong channel")
+    if has_big_bots_role(ctx.author):
+        return True
+    if not config.is_command_channel(ctx.guild.id, ctx.channel.id):
         raise commands.CheckFailure("wrong channel")
     return True
 
@@ -354,6 +368,12 @@ async def on_ready():
 
     if not _initial_ready:
         _initial_ready = True
+        for guild in bot.guilds:
+            if not getattr(guild, "chunked", False):
+                try:
+                    await asyncio.wait_for(guild.chunk(), timeout=10)
+                except Exception as e:
+                    log.warning("member chunk failed for guild %s (%s); using cache", guild.id, type(e).__name__)
         await reconnect_voice_channels()
 
 
@@ -845,8 +865,37 @@ class Controller:
             if len(out) == 25:
                 truncated = True
                 break
-            out.append({"id": str(m.id), "name": m.display_name, "username": m.name, "bot": bool(m.bot)})
+            out.append({"id": str(m.id), "name": m.display_name, "display_name": m.display_name, "username": m.name, "bot": bool(m.bot)})
         return {"members": out, "truncated": truncated}
+
+    def roles_for(self, guild_id: int, q: str = "") -> dict:
+        """Guild roles for the tag picker (max 25, non-default)."""
+        guild, ch = self._message_channel(guild_id)
+        needle = (q or "").strip().casefold()
+        roles = []
+        for r in getattr(guild, "roles", []):
+            is_default = getattr(r, "is_default", None)
+            if callable(is_default):
+                if is_default():
+                    continue
+            elif getattr(r, "id", None) == guild.id:
+                continue
+            r_name = getattr(r, "name", "")
+            if needle and needle not in r_name.casefold():
+                continue
+            roles.append(r)
+        roles.sort(key=lambda r: (-getattr(r, "position", 0), getattr(r, "name", "").casefold()))
+        out = []
+        for r in roles[:25]:
+            color = getattr(r, "color", None)
+            color_val = getattr(color, "value", 0) if color else 0
+            out.append({
+                "id": str(r.id),
+                "name": r.name,
+                "color": f"#{color_val:06x}" if color_val else None,
+                "is_role": True,
+            })
+        return {"roles": out, "truncated": len(roles) > 25}
 
     async def send_message(self, guild_id: int, content: str, editor: str) -> dict:
         """Post `content` as the bot in the guild's configured channel. Raises MessageError."""
@@ -854,17 +903,27 @@ class Controller:
         if not 1 <= len(content) <= MAX_MESSAGE_CHARS:
             raise MessageError("bad_request")
         guild, ch = self._message_channel(guild_id)
-        ids = parse_mentions(content)  # role tokens -> bad_mention
-        for uid in ids:
+        user_ids, role_ids = parse_mentions(content)
+        for uid in user_ids:
             member = guild.get_member(uid)
             if member is None or not ch.permissions_for(member).view_channel:
+                raise MessageError("bad_mention")
+        for rid in role_ids:
+            role = guild.get_role(rid)
+            is_default = getattr(role, "is_default", None)
+            is_def = is_default() if callable(is_default) else (role and getattr(role, "id", None) == guild.id)
+            if role is None or is_def:
                 raise MessageError("bad_mention")
         if guild.me is None:
             raise MessageError("no_channel")  # Outage: can't determine permissions
         if not ch.permissions_for(guild.me).send_messages:
             raise MessageError("missing_permission")
-        allowed = discord.AllowedMentions(everyone=False, roles=False, replied_user=False,
-                                          users=[discord.Object(id=i) for i in ids])
+        allowed = discord.AllowedMentions(
+            everyone=False,
+            roles=[discord.Object(id=i) for i in role_ids] if role_ids else False,
+            users=[discord.Object(id=i) for i in user_ids],
+            replied_user=False,
+        )
         self._limiter.reserve(guild_id)  # bookkeeping BEFORE the await (cancel/duplicate safe)
         try:
             msg = await ch.send(content, allowed_mentions=allowed)
@@ -873,10 +932,10 @@ class Controller:
             raise MessageError("missing_permission") from None
         except discord.HTTPException as e:
             log.warning("gui message failed guild=%s channel=%s editor=%s reason=http_error status=%s",
-                       guild_id, ch.id, editor, getattr(e, "status", "?"))
+                        guild_id, ch.id, editor, getattr(e, "status", "?"))
             raise MessageError("discord_error") from None
         log.info("gui message sent guild=%s channel=%s editor=%s chars=%d mentions=%d",
-                 guild_id, ch.id, editor, len(content), len(ids))
+                 guild_id, ch.id, editor, len(content), len(user_ids) + len(role_ids))
         return {"ok": True, "message_id": str(msg.id)}
 
     def guilds_view(self) -> list[dict]:

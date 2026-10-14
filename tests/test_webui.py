@@ -31,6 +31,7 @@ class FakeController:
         self.apply_calls, self.apply_exc, self.apply_gate, self.apply_result = [], None, None, None
         self.say_calls, self.say_exc = [], None
         self.members_calls, self.members_result, self.members_exc = [], {"members": [], "truncated": False}, None
+        self.roles_calls, self.roles_result, self.roles_exc = [], {"roles": [], "truncated": False}, None
         self.send_calls, self.send_exc, self.send_gate = [], None, None
 
     def voice_summary(self):
@@ -52,6 +53,12 @@ class FakeController:
         if self.members_exc is not None:
             raise self.members_exc
         return self.members_result
+
+    def roles_for(self, gid, q):
+        self.roles_calls.append((gid, q))
+        if self.roles_exc is not None:
+            raise self.roles_exc
+        return self.roles_result
 
     async def send_message(self, gid, content, editor):
         self.send_calls.append((gid, content, editor))

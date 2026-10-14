@@ -70,7 +70,9 @@ assert.strictEqual(voiceSwitchText('bob', null), 'bob switched voice to the defa
 
 // --- Messages tab helpers ---
 const bob = { id: '11', label: 'Bob' }, al = { id: '12', label: 'Al' }, alice = { id: '13', label: 'Alice' };
+const mods = { id: '99', label: 'Mods', is_role: true };
 assert.strictEqual(substituteTags('hi @Bob!', [bob]), 'hi <@11>!');
+assert.strictEqual(substituteTags('alert @Mods now', [mods]), 'alert <@&99> now');
 assert.strictEqual(substituteTags('@Bob and @Bob', [bob]), '<@11> and <@11>');
 assert.strictEqual(substituteTags('hi @Bob', []), 'hi @Bob');                 // never guessed
 assert.strictEqual(substituteTags('hi @Carl', [bob]), 'hi @Carl');
@@ -148,15 +150,20 @@ assert.deepStrictEqual(pingTargets('x@<@5> hi', chips1), [{ id: '5', label: 'Ali
 assert.deepStrictEqual(pingTargets('<@123456789012345678901>', []), []);
 // 20-digit token should match
 assert.deepStrictEqual(pingTargets('<@12345678901234567890>', chips1), [{ id: '12345678901234567890', label: null, username: null, known: false }]);
+assert.deepStrictEqual(pingTargets('<@&99>', [{ id: '99', label: 'Mods', is_role: true }]), [{ id: '99', label: 'Mods', username: null, known: true, is_role: true }]);
+assert.deepStrictEqual(pingTargets('<@&888>', []), [{ id: '888', label: null, username: null, known: false, is_role: true }]);
 assert.strictEqual(pingSummary([]), 'No pings');
 assert.strictEqual(pingSummary([{ id: '5', label: 'Alice', username: 'alice123', known: true }]), 'Will ping: @Alice (@alice123)');
 assert.strictEqual(pingSummary([{ id: '5', label: 'Bob (bob99)', username: 'bob99', known: true }]), 'Will ping: @Bob (bob99)');  // no double format
 assert.strictEqual(pingSummary([{ id: '5', label: 'Alice', username: 'alice123', known: true }, { id: '999', label: null, username: null, known: false }]), 'Will ping: @Alice (@alice123), unknown user 999');
+assert.strictEqual(pingSummary([{ id: '99', label: 'Mods', is_role: true, known: true }]), 'Will ping: @Mods');
+assert.strictEqual(pingSummary([{ id: '888', label: null, username: null, known: false, is_role: true }]), 'Will ping: unknown role 888');
 // chipText display format with missing username and disambiguated labels
 assert.strictEqual(chipText({ id: '5', label: 'Alice', username: 'alice123' }), '@Alice (@alice123)');
 assert.strictEqual(chipText({ id: '6', label: 'Bob (bob99)', username: 'bob99' }), '@Bob (bob99)');  // no double format
 assert.strictEqual(chipText({ id: '7', label: 'Charlie', username: undefined }), '@Charlie');  // missing username
 assert.strictEqual(chipText({ id: '8', label: 'Dave', username: null }), '@Dave');  // null username
+assert.strictEqual(chipText({ id: '99', label: 'Mods', is_role: true }), '@Mods');
 // send blocker
 assert.strictEqual(messageBlocker(false, true, 'x', false), 'Offline');
 assert.strictEqual(messageBlocker(true, false, 'x', false), 'No channel configured');
@@ -214,7 +221,8 @@ assert.deepStrictEqual(idsOf('<@7'), []);
 assert.deepStrictEqual(tokenizeMentions('hi <@5>!'), [{ text: 'hi ', id: null }, { text: '<@5>', id: '5' }, { text: '!', id: null }]);
 assert.deepStrictEqual(tokenizeMentions(''), []);
 assert.deepStrictEqual(tokenizeMentions('<@5><@!6>'), [{ text: '<@5>', id: '5' }, { text: '<@!6>', id: '6' }]);
-assert.strictEqual(MENTION_SRC, '<@!?([0-9]{1,20})>');
+assert.deepStrictEqual(tokenizeMentions('<@&99>'), [{ text: '<@&99>', id: '99' }]);
+assert.strictEqual(MENTION_SRC, '<@(?:!|&)?([0-9]{1,20})>');
 assert.strictEqual(tokenizeMentions('<@5> <@5>').map((p) => p.text).join(''), '<@5> <@5>');  // no shared regex state across calls
 
 // channelChanged(prevCfg, nextCfg, gid)

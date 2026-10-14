@@ -28,11 +28,22 @@ def make_member(uid, display, name=None, bot_=False, global_name=None, can_view=
     return m
 
 
+def make_role(rid, name, position=1, is_default=False, color_val=0):
+    r = mock.MagicMock()
+    r.id = rid
+    r.name = name
+    r.position = position
+    r.is_default.return_value = is_default
+    r.color.value = color_val
+    return r
+
+
 class Base(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.clock = Clock()
         self.ctl = bot.Controller(limiter=SendLimiter(clock=self.clock))
         self.members = {}
+        self.roles = {}
         self.me = mock.MagicMock()
         self.me.can_send = True
         self.ch = mock.MagicMock(spec=discord.TextChannel)
@@ -46,7 +57,9 @@ class Base(unittest.IsolatedAsyncioTestCase):
         self.guild.chunk = mock.AsyncMock(side_effect=self._chunked)
         self.guild.get_channel.side_effect = lambda cid: self.ch if cid == CID else None
         self.guild.get_member.side_effect = lambda uid: self.members.get(uid)
+        self.guild.get_role.side_effect = lambda rid: self.roles.get(rid)
         type(self.guild).members = mock.PropertyMock(side_effect=lambda: list(self.members.values()))
+        type(self.guild).roles = mock.PropertyMock(side_effect=lambda: list(self.roles.values()))
         self.channel_id = CID
         for p in (mock.patch.object(bot.bot, "get_guild", side_effect=lambda g: self.guild if g == GID else None),
                   mock.patch.object(bot.config, "channel_for", side_effect=lambda g: self.channel_id)):
@@ -64,6 +77,10 @@ class Base(unittest.IsolatedAsyncioTestCase):
     def add(self, *members):
         for m in members:
             self.members[m.id] = m
+
+    def add_role(self, *roles):
+        for r in roles:
+            self.roles[r.id] = r
 
 
 class SendTests(Base):
@@ -106,10 +123,21 @@ class SendTests(Base):
         await self.send("y" * 2000)
         self.ch.send.assert_awaited_once()
 
-    async def test_role_mention_rejected(self):
-        with self.assertRaises(MessageError) as cm:
-            await self.ctl.send_message(GID, "hi <@&99>", "a")
-        self.assertEqual(cm.exception.code, "bad_mention")
+    async def test_role_mention_allowed(self):
+        self.add_role(make_role(99, "Moderators"))
+        await self.send("hi <@&99>")
+        self.ch.send.assert_awaited_once()
+        _, kw = self.ch.send.call_args
+        allowed = kw.get("allowed_mentions")
+        self.assertIsNotNone(allowed)
+        self.assertEqual([r.id for r in allowed.roles], [99])
+
+    async def test_unknown_or_default_role_rejected(self):
+        self.add_role(make_role(GID, "@everyone", is_default=True))
+        for text in ("hi <@&404>", f"hi <@&{GID}>"):
+            with self.assertRaises(MessageError) as cm:
+                await self.ctl.send_message(GID, text, "a")
+            self.assertEqual(cm.exception.code, "bad_mention")
         self.ch.send.assert_not_awaited()
 
     async def test_unknown_or_hidden_user_rejected(self):
@@ -218,7 +246,7 @@ class MembersTests(Base):
                  make_member(10**18 + 5, "Carl"))
         res = await self.ctl.members_for(GID, "")
         self.assertEqual([m["name"] for m in res["members"]], ["bob", "Carl", "zed", "Amy"])
-        self.assertEqual(res["members"][1], {"id": str(10**18 + 5), "name": "Carl", "username": "carl", "bot": False})
+        self.assertEqual(res["members"][1], {"id": str(10**18 + 5), "name": "Carl", "display_name": "Carl", "username": "carl", "bot": False})
         self.assertIs(res["members"][3]["bot"], True)
         self.assertIs(res["truncated"], False)
 
@@ -261,6 +289,22 @@ class MembersTests(Base):
         with self.assertLogs("bot", "WARNING"):
             res = await self.ctl.members_for(GID, "")
         self.assertEqual(len(res["members"]), 1)
+
+
+class RolesForTests(Base):
+    async def test_sorted_by_position_and_wire_shape(self):
+        self.add_role(make_role(1, "Member", position=1), make_role(2, "Admin", position=10, color_val=0xFF0000),
+                      make_role(GID, "@everyone", is_default=True, position=0))
+        res = self.ctl.roles_for(GID, "")
+        self.assertEqual([r["name"] for r in res["roles"]], ["Admin", "Member"])
+        self.assertEqual(res["roles"][0], {"id": "2", "name": "Admin", "color": "#ff0000", "is_role": True})
+        self.assertEqual(res["roles"][1], {"id": "1", "name": "Member", "color": None, "is_role": True})
+        self.assertIs(res["truncated"], False)
+
+    async def test_filter_case_insensitive(self):
+        self.add_role(make_role(1, "Moderator"), make_role(2, "Admin"))
+        res = self.ctl.roles_for(GID, "mod")
+        self.assertEqual([r["id"] for r in res["roles"]], ["1"])
 
 
 if __name__ == "__main__":
