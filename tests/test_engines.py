@@ -136,3 +136,42 @@ class EngineSwapTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class IdleUnloadTests(unittest.IsolatedAsyncioTestCase):
+    def make(self):
+        e = TTSEngine("/m/a.onnx")
+        e.ready = True
+        e._state = type(e._state)(voice=object(), sample_rate=22050, model_path=Path("/m/a.onnx"),
+                                  config_path=Path("/m/a.onnx.json"), cuda_active=True)
+        return e
+
+    async def test_unload_then_resume_on_synth(self):
+        e = self.make()
+        built = []
+        e._build = lambda m, c: (built.append(m) or object(), True)
+        e._synth_with = staticmethod(lambda v, t: b"\x01\x00" * 4)
+        e._unload_blocking()
+        self.assertTrue(e.idle)
+        self.assertIsNone(e.state.voice)
+        self.assertEqual(e.model_name, "a")  # state survives for the GUI
+        self.assertEqual(e._synth("hi"), b"\x01\x00" * 4)
+        self.assertFalse(e.idle)
+        self.assertEqual(built, [Path("/m/a.onnx")])
+        e.close()
+
+    async def test_loop_unloads_only_after_timeout(self):
+        e = self.make()
+        task = asyncio.create_task(e.idle_unload_loop(timeout=0.05))
+        await asyncio.sleep(0.01)
+        self.assertFalse(e.idle)
+        await asyncio.sleep(0.2)
+        self.assertTrue(e.idle)
+        task.cancel()
+        e.close()
+
+    async def test_zero_disables(self):
+        e = self.make()
+        await asyncio.wait_for(e.idle_unload_loop(timeout=0), 1)
+        self.assertFalse(e.idle)
+        e.close()

@@ -24,6 +24,7 @@ export default function VoiceTab({
 
   const curVoiceTitle = voiceState.current ? voiceTitle(voiceState.current) : 'default';
   let statusText = voiceState.loading ? 'Loading voice…' : 'Active: ' + (voiceState.engine ? voiceState.engine + ' · ' : '') + curVoiceTitle;
+  if (voiceState.idle && !voiceState.loading) statusText += ' — idle, unloaded';
   if (voiceState.cuda != null) {
     statusText += ' (' + (voiceState.cuda ? 'CUDA' : 'CPU') + ')';
   }

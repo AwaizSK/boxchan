@@ -187,6 +187,7 @@ audio: dict[int, GuildAudio] = {}
 _shutting_down = False
 _initial_ready = False
 _watcher_task: asyncio.Task | None = None
+_idle_task: asyncio.Task | None = None
 _webui_runner = None
 
 
@@ -749,6 +750,7 @@ class Controller:
     def voice_summary(self) -> dict:
         return {"current": engine.model_name if engine.ready else None,
                 "configured": config.voice, "loading": engine.loading,
+                "idle": bool(getattr(engine, "idle", False)),
                 "cuda": engine.cuda_active if engine.ready else None,
                 "engine": self._active_engine(),
                 "configured_engine": config.engine}
@@ -1119,6 +1121,8 @@ async def shutdown(b: commands.Bot) -> None:
     log.info("Shutting down")
     if _watcher_task:
         _watcher_task.cancel()
+    if _idle_task:
+        _idle_task.cancel()
     for guild in list(b.guilds):
         if guild.voice_client or guild.id in audio:
             await teardown(guild)
@@ -1177,6 +1181,8 @@ async def main() -> None:
         loop.add_signal_handler(sig, lambda: asyncio.create_task(shutdown(bot)))
     global _watcher_task
     _watcher_task = asyncio.create_task(config_watcher(), name="config-watcher")
+    global _idle_task
+    _idle_task = asyncio.create_task(engine.idle_unload_loop(), name="idle-unload")
     global _webui_runner
     _webui_runner = await maybe_start_webui(config, controller, WEBUI_PORT)
     async with bot:

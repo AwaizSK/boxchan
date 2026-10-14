@@ -2,11 +2,13 @@
 import asyncio
 import gc
 import logging
+import os
 import re
 import tempfile
+import time
 import wave
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import discord
@@ -15,6 +17,11 @@ import engines
 from voices import VoiceLoadError
 
 log = logging.getLogger("tts_engine")
+
+try:
+    IDLE_UNLOAD_SECONDS = float(os.getenv("IDLE_UNLOAD_SECONDS", "300"))  # 0 disables
+except ValueError:
+    IDLE_UNLOAD_SECONDS = 300.0
 
 RE_URL = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
 RE_CUSTOM_EMOJI = re.compile(r"<a?:([a-zA-Z0-9_]+):\d+>")
@@ -105,6 +112,9 @@ class TTSEngine:
                                 cuda_active=False)
         self.ready = False
         self._pending_reloads = 0
+        self._idle = False          # voice unloaded after idle; next synthesis reloads it
+        self._last_use = time.monotonic()
+        self._models_dir: str | None = None
         self.tmp_dir = Path(tempfile.gettempdir()) / "tts_bot"
         self.tmp_dir.mkdir(parents=True, exist_ok=True)
         self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="piper")
@@ -146,6 +156,11 @@ class TTSEngine:
         """Stem of the loaded (or configured) model file; the voice name for non-Piper engines."""
         st = self._state
         return st.name if st.engine != "piper" and st.name else st.model_path.stem
+
+    @property
+    def idle(self) -> bool:
+        """True while the voice is unloaded to save power; the next synthesis reloads it."""
+        return self._idle
 
     @property
     def engine_name(self) -> str:
@@ -210,7 +225,52 @@ class TTSEngine:
     def _synth_with(voice, text: str) -> bytes:
         return b"".join(voice.synthesize_stream_raw(text))
 
+    def _unload_blocking(self) -> None:
+        """Worker thread. Drop the loaded voice (frees GPU memory); paths/name stay in the state."""
+        if not self.ready or self._idle or self._state.voice is None:
+            return
+        old = self._state.voice
+        self._state = replace(self._state, voice=None)
+        self._idle = True
+        del old
+        gc.collect()
+        log.info("Voice unloaded after idle (%s)", self.model_name)
+
+    def _resume_blocking(self) -> None:
+        """Worker thread. Rebuild the voice that _unload_blocking dropped. Raises on failure."""
+        st = self._state
+        if st.engine == "piper":
+            voice, cuda = self._build(st.model_path, st.config_path)
+        else:
+            voice, _rate, cuda = engines.get(st.engine).build(self._models_dir, st.name)
+        self._state = replace(st, voice=voice, cuda_active=cuda)
+        self._idle = False
+        log.info("Voice reloaded after idle (%s, cuda=%s)", self.model_name, cuda)
+
+    async def idle_unload_loop(self, timeout: float | None = None) -> None:
+        """Unload the voice after `timeout` seconds without synthesis or reload. Runs forever."""
+        timeout = IDLE_UNLOAD_SECONDS if timeout is None else timeout
+        if timeout <= 0:
+            return
+        while True:
+            await asyncio.sleep(min(30.0, timeout))
+            if (not self.ready or self._idle or self._pending_reloads
+                    or time.monotonic() - self._last_use < timeout):
+                continue
+            if self._lock is None:
+                self._lock = asyncio.Lock()
+            if self._lock.locked():
+                continue
+            async with self._lock:
+                if time.monotonic() - self._last_use >= timeout:
+                    try:
+                        await asyncio.get_running_loop().run_in_executor(self._pool, self._unload_blocking)
+                    except Exception:
+                        log.exception("idle unload failed")
+
     def _synth(self, text: str) -> bytes:
+        if self._idle:
+            self._resume_blocking()
         st = self._state
         if st.engine != "piper":
             return engines.get(st.engine).synth(st.voice, text)
@@ -234,6 +294,9 @@ class TTSEngine:
                                  config_path=Path(handle.model_path), cuda_active=cuda,
                                  engine=engine_name, name=name)
         self.ready = True
+        self._idle = False
+        self._models_dir = models_dir
+        self._last_use = time.monotonic()
         del old
         gc.collect()
         log.info("%s voice swapped (voice=%s, cuda=%s, rate=%d)", engine_name, name, cuda, rate)
@@ -267,6 +330,8 @@ class TTSEngine:
         self._state = VoiceState(voice=voice, sample_rate=rate, model_path=model_path,
                                 config_path=config_path, cuda_active=cuda)
         self.ready = True
+        self._idle = False
+        self._last_use = time.monotonic()
         del old
         gc.collect()  # drop the old ORT session now so its (GPU) memory is released
         log.info("Piper voice swapped (model=%s, cuda=%s, rate=%d)", self.model_name, cuda, rate)
@@ -326,7 +391,10 @@ class TTSEngine:
         if self._lock is None:
             self._lock = asyncio.Lock()
         async with self._lock:
-            return await asyncio.get_running_loop().run_in_executor(self._pool, self._synth_to_wav, text)
+            try:
+                return await asyncio.get_running_loop().run_in_executor(self._pool, self._synth_to_wav, text)
+            finally:
+                self._last_use = time.monotonic()
 
     def close(self) -> None:
         self._pool.shutdown(wait=False, cancel_futures=True)

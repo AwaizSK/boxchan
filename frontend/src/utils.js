@@ -250,6 +250,7 @@ export function mergeVoiceSummary(prev, incoming, { seqAtRequest, seqNow, live }
   const extra = {};
   const engines = Array.isArray(incoming.engines) ? incoming.engines : prev.engines;
   const listEngine = incoming.list_engine || prev.listEngine;
+  if (incoming.idle !== undefined) extra.idle = !!incoming.idle;
   if (engines !== undefined) extra.engines = engines;
   if (listEngine !== undefined) extra.listEngine = listEngine;
   if (live && seqNow > seqAtRequest) {
