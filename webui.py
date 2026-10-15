@@ -145,6 +145,15 @@ def _groups_of(rec: dict) -> set[str]:
     return groups
 
 
+def _guilds_of(rec: dict) -> set[str]:
+    """Server ids a non-admin account may manage (decimal strings); anything else is dropped."""
+    raw = rec.get("guilds")
+    if not isinstance(raw, list):
+        return set()
+    return {str(g) for g in raw if isinstance(g, (str, int)) and not isinstance(g, bool)
+            and str(g).isascii() and str(g).isdigit() and len(str(g)) <= 25}
+
+
 def _is_user_rec(rec, name_lower: str) -> bool:
     return isinstance(rec, dict) and str(rec.get("username", "")).strip().lower() == name_lower
 
@@ -169,6 +178,7 @@ class AuthManager:
         self._cached_users: dict[str, str] = {}
         self._cached_admins: set[str] = set()
         self._cached_groups: dict[str, set[str]] = {}
+        self._cached_guilds: dict[str, set[str]] = {}
         self._cached_mtime: tuple | float = -1.0
         self._reported: set[str] = set()
         self._lock = threading.RLock()
@@ -213,6 +223,7 @@ class AuthManager:
                 return self._cached_users
             users: dict[str, str] = {}
             groups_map: dict[str, set[str]] = {}
+            guilds_map: dict[str, set[str]] = {}
             for rec in records:
                 if isinstance(rec, dict) and "username" in rec and "password" in rec:
                     uname = str(rec["username"]).strip()
@@ -220,6 +231,7 @@ class AuthManager:
                         continue
                     users[uname] = str(rec["password"])
                     groups_map[uname.lower()] = _groups_of(rec)
+                    guilds_map[uname.lower()] = _guilds_of(rec)
             for u in users:
                 u_lower = u.lower()
                 # Legacy files: an account literally named "admin" with no group info was the admin.
@@ -229,6 +241,7 @@ class AuthManager:
                     groups_map[u_lower] = {"user"}
             self._cached_users = users
             self._cached_groups = groups_map
+            self._cached_guilds = guilds_map
             self._cached_admins = {u for u, grps in groups_map.items() if "admin" in grps}
             self._cached_mtime = stamp
             self._reported.clear()
@@ -260,12 +273,23 @@ class AuthManager:
     def is_admin(self, username: str | None) -> bool:
         return self.in_group(username, "admin")
 
+    def allowed_guilds(self, username: str | None) -> set[str] | None:
+        """None = every server (platform admin, or auth off). Otherwise the account's server ids
+        (empty set = none; fail closed for unknown users)."""
+        if not self.enabled or self.is_admin(username):
+            return None
+        if not username:
+            return set()
+        self.load_users()
+        return set(self._cached_guilds.get(username.strip().lower(), set()))
+
     def list_users(self) -> list[dict]:
         self.load_users()
         result = []
         for uname in sorted(self._cached_users.keys()):
             grps = sorted(list(self.get_user_groups(uname)))
-            result.append({"username": uname, "groups": grps})
+            result.append({"username": uname, "groups": grps,
+                           "guilds": sorted(self._cached_guilds.get(uname.lower(), set()))})
         return result
 
     def _read_records(self):
@@ -279,7 +303,8 @@ class AuthManager:
         self._cached_mtime = -1.0
         self.load_users()
 
-    def save_user(self, username: str, password: str | None, groups: list[str]) -> bool:
+    def save_user(self, username: str, password: str | None, groups: list[str],
+                  guilds: list[str] | None = None) -> bool:
         """Create/update a user. `password` is PLAINTEXT here and is stored only as a scrypt hash;
         None/"" keeps the existing hash (a new user needs one). Callers enforce the password policy."""
         if not self.users_file:
@@ -297,11 +322,16 @@ class AuthManager:
                     item.pop("role", None)
                     item.pop("is_admin", None)
                     item["groups"] = grps
+                    if guilds is not None:
+                        item["guilds"] = sorted(set(guilds))
                     break
             else:
                 if not new_hash:
                     raise PasswordRequired("a password is required for a new user")
-                records.append({"username": uname, "password": new_hash, "groups": grps})
+                new_rec = {"username": uname, "password": new_hash, "groups": grps}
+                if guilds is not None:
+                    new_rec["guilds"] = sorted(set(guilds))
+                records.append(new_rec)
             self._write_records(rebuild, records)
         return True
 
@@ -775,12 +805,31 @@ def make_app(config, controller, *, allowed_hosts, status_interval: float = 3.0,
         app.router.add_get(path, static_handler(name, ctype))
 
     # --- helpers ---
+    def scope_of(request):
+        """None = all servers; else the set of server ids this session may touch."""
+        return auth_mgr.allowed_guilds(request.get(USER_KEY))
+
+    def require_platform_admin(request):
+        if auth_mgr.enabled and not auth_mgr.is_admin(request.get(USER_KEY)):
+            raise web.HTTPForbidden(text=json.dumps({"error": "forbidden"}), content_type="application/json")
+
+    def scoped_snapshot(snap, scope):
+        if scope is None:
+            return snap
+        return {**snap, "guilds": {g: e for g, e in snap["guilds"].items() if g in scope}}
+
+    def scoped_guilds(guilds, scope):
+        return guilds if scope is None else [g for g in guilds if g["id"] in scope]
+
     def known_guild(request):
         gid = request.match_info["gid"]
         if not (gid.isascii() and gid.isdigit()):
             raise web.HTTPNotFound()
         if gid not in {g["id"] for g in controller.guilds_view()}:
             raise web.HTTPNotFound()
+        scope = scope_of(request)
+        if scope is not None and gid not in scope:
+            raise web.HTTPNotFound()  # same answer as an unknown server: no existence leak
         return int(gid)
 
     def editor_of(request):
@@ -826,6 +875,7 @@ def make_app(config, controller, *, allowed_hosts, status_interval: float = 3.0,
         return fn() if fn else None
 
     async def apply_voice(request):
+        require_platform_admin(request)  # the voice/engine is global: affects every server
         editor = editor_of(request)
         body = await body_of(request)
         if "name" not in body:
@@ -962,7 +1012,9 @@ def make_app(config, controller, *, allowed_hosts, status_interval: float = 3.0,
 
     # --- API ---
     async def state(request):
-        return _json({"config": wire_snapshot(config.snapshot()), "guilds": controller.guilds_view()})
+        scope = scope_of(request)
+        return _json({"config": wire_snapshot(scoped_snapshot(config.snapshot(), scope)),
+                      "guilds": scoped_guilds(controller.guilds_view(), scope)})
 
     async def put_channel(request):
         gid = known_guild(request)
@@ -1007,13 +1059,14 @@ def make_app(config, controller, *, allowed_hosts, status_interval: float = 3.0,
         await resp.prepare(request)
         q = config.hub.subscribe()
         streams.add(asyncio.current_task())
+        scope = scope_of(request)
 
         async def send(event, data):
             await resp.write(f"event: {event}\ndata: {json.dumps(data)}\n\n".encode())
 
         try:
-            await send("hello", {"snapshot": wire_snapshot(config.snapshot()),
-                                 "guilds": controller.guilds_view(),
+            await send("hello", {"snapshot": wire_snapshot(scoped_snapshot(config.snapshot(), scope)),
+                                 "guilds": scoped_guilds(controller.guilds_view(), scope),
                                  "voices": voice_summary()})
             loop = asyncio.get_running_loop()
             next_status = loop.time() + status_interval
@@ -1027,12 +1080,21 @@ def make_app(config, controller, *, allowed_hosts, status_interval: float = 3.0,
                 except asyncio.TimeoutError:
                     ev = None
                 if ev is not None:
+                    if scope is not None and ev.get("type") == "config":
+                        gid_ev = ev["change"].get("guild_id")
+                        if gid_ev is not None and str(gid_ev) not in scope:
+                            ev = None
+                        else:
+                            ev = {**ev, "snapshot": scoped_snapshot(ev["snapshot"], scope)}
+                if ev is not None:
                     ev = wire_event(ev)
                     await send(ev.get("type", "config"), ev)
                 now = loop.time()
                 if now >= next_status:
                     next_status = now + status_interval
                     st = controller.status_view()
+                    if scope is not None:
+                        st = {g: v for g, v in st.items() if g in scope}
                     if st != last_status:
                         last_status = st
                         await send("status", st)
@@ -1156,13 +1218,20 @@ def make_app(config, controller, *, allowed_hosts, status_interval: float = 3.0,
         elif not isinstance(raw_groups, list):
             raw_groups = [str(raw_groups)]
         groups = [str(g).strip().lower() for g in raw_groups if str(g).strip()]
+        raw_guilds = body.get("guilds")
+        guilds = None
+        if raw_guilds is not None:
+            if not isinstance(raw_guilds, list) or len(raw_guilds) > 200 or not all(
+                    isinstance(g, str) and g.isascii() and g.isdigit() and len(g) <= 25 for g in raw_guilds):
+                return _err("bad_request", 400)
+            guilds = list(raw_guilds)
         if not (1 <= len(uname) <= 40) or not re.match(r"^[A-Za-z0-9_.-]+$", uname):
             return _err("bad_request", 400)
         try:
             loop = asyncio.get_running_loop()
             async with hash_slots:
-                await loop.run_in_executor(None, auth_mgr.save_user, uname, passw, groups)
-            return _json({"ok": True, "username": uname, "groups": groups})
+                await loop.run_in_executor(None, auth_mgr.save_user, uname, passw, groups, guilds)
+            return _json({"ok": True, "username": uname, "groups": groups, "guilds": guilds or []})
         except PasswordRequired:
             return _err("password_required", 400)
         except Exception:

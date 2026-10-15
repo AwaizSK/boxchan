@@ -55,7 +55,7 @@ class StaticContentTests(unittest.TestCase):
 
     def test_admin_tab_ids_are_wired(self):
         js = read("app.js")
-        for ident in ("tab-admin", "view-admin", "u-form", "u-name", "u-pass", "u-groups", "u-submit", "u-list", "u-empty"):
+        for ident in ("tab-admin", "view-admin", "u-form", "u-name", "u-pass", "u-role", "u-submit", "u-list", "u-empty"):
             self.assertIn(ident, js, ident)
         self.assertIn("admin", js)
 

@@ -2,13 +2,15 @@ import React, { useState } from 'react';
 
 export default function AdminTab({
   users,
+  guilds,
   currentEditor,
   onSaveUser,
   onDeleteUser,
 }) {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
-  const [groups, setGroups] = useState('');
+  const [role, setRole] = useState('server');
+  const [picked, setPicked] = useState([]);
   const [msg, setMsg] = useState('');
   const [busy, setBusy] = useState(false);
 
@@ -19,12 +21,16 @@ export default function AdminTab({
     setBusy(true);
     setMsg('Saving…');
     try {
-      const grpList = groups.split(',').map((x) => x.trim()).filter(Boolean);
-      const ok = await onSaveUser(uname, password, grpList);
+      if (role === 'server' && picked.length === 0) {
+        setMsg('Pick at least one server.');
+        setBusy(false);
+        return;
+      }
+      const ok = await onSaveUser(uname, password, [role === 'platform' ? 'admin' : 'user'], role === 'platform' ? [] : picked);
       if (ok) {
         setUsername('');
         setPassword('');
-        setGroups('');
+        setPicked([]);
         setMsg('');
       } else {
         setMsg('Failed to save user.');
@@ -57,14 +63,26 @@ export default function AdminTab({
           value={password}
           onChange={(e) => setPassword(e.target.value)}
         />
-        <label htmlFor="u-groups" className="visually">Groups</label>
-        <input
-          id="u-groups"
-          type="text"
-          placeholder="Groups (e.g. admin, tester)"
-          value={groups}
-          onChange={(e) => setGroups(e.target.value)}
-        />
+        <label htmlFor="u-role" className="visually">Account type</label>
+        <select id="u-role" value={role} onChange={(e) => setRole(e.target.value)}>
+          <option value="server">Server admin (selected servers only)</option>
+          <option value="platform">Platform admin (all servers, voice, users)</option>
+        </select>
+        {role === 'server' && (
+          <fieldset id="u-guilds" className="f-form">
+            <legend className="muted">Servers this account can manage</legend>
+            {(guilds || []).map((g) => (
+              <label key={g.id} className="row">
+                <input
+                  type="checkbox"
+                  checked={picked.includes(g.id)}
+                  onChange={(e) => setPicked((prev) => (e.target.checked ? [...prev, g.id] : prev.filter((x) => x !== g.id)))}
+                />
+                {g.name}
+              </label>
+            ))}
+          </fieldset>
+        )}
         <div className="row">
           <button id="u-submit" type="submit" className="primary" disabled={busy}>
             Save user
@@ -75,7 +93,11 @@ export default function AdminTab({
 
       <div id="u-list" className="f-list" role="feed" aria-label="Users">
         {(users || []).map((u) => {
-          const grpStr = Array.isArray(u.groups) ? u.groups.join(', ') : '';
+          const isPlat = Array.isArray(u.groups) && u.groups.includes('admin');
+          const names = (u.guilds || []).map((id) => {
+            const g = (guilds || []).find((x) => x.id === id);
+            return g ? g.name : id;
+          });
           const canDelete = u.username !== 'admin' && u.username !== currentEditor;
           return (
             <article key={u.username} className="f-card">
@@ -92,7 +114,7 @@ export default function AdminTab({
                   </button>
                 )}
               </div>
-              <p className="f-desc">Groups: {grpStr || 'none'}</p>
+              <p className="f-desc">{isPlat ? 'Platform admin (all servers)' : 'Server admin: ' + (names.join(', ') || 'no servers')}</p>
             </article>
           );
         })}

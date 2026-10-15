@@ -6,6 +6,7 @@ import VoiceTab from './components/VoiceTab';
 import MessagesTab from './components/MessagesTab';
 import FeaturesTab from './components/FeaturesTab';
 import AdminTab from './components/AdminTab';
+import GuildPicker from './components/GuildPicker';
 import {
   createSSEParser,
   normalizeEditor,
@@ -30,7 +31,9 @@ export default function App() {
   // Live state
   const [conn, setConn] = useState('connecting');
   const [guilds, setGuilds] = useState([]);
-  const [gid, setGid] = useState(() => sessionStorage.getItem('gid') || '');
+  const [gid, setGid] = useState(() => {
+    try { return localStorage.getItem('gid') || sessionStorage.getItem('gid') || ''; } catch (e) { return ''; }
+  });
   const [config, setConfig] = useState(null);
   const [status, setStatus] = useState({});
   const [voice, setVoice] = useState({ list: null, current: null, configured: null, loading: false, cuda: null, engine: null, engines: null, listEngine: null });
@@ -107,6 +110,10 @@ export default function App() {
     boot();
   }, []);
 
+  function rememberGid(id) {
+    try { localStorage.setItem('gid', id); sessionStorage.setItem('gid', id); } catch (e) {}
+  }
+
   // Update tab in session storage
   function changeTab(nextTab) {
     setTab(nextTab);
@@ -181,7 +188,7 @@ export default function App() {
                   setGuilds(d.guilds);
                   if (!d.guilds.some((g) => g.id === gid) && d.guilds.length) {
                     setGid(d.guilds[0].id);
-                    sessionStorage.setItem('gid', d.guilds[0].id);
+                    rememberGid(d.guilds[0].id);
                   }
                 }
                 if (d.voices) setVoice((prev) => mergeVoiceSummary(prev, d.voices, { seqAtRequest: 0, seqNow: 0, live: true }));
@@ -252,7 +259,7 @@ export default function App() {
           setGuilds(d.guilds);
           if (!d.guilds.some((g) => g.id === gid) && d.guilds.length) {
             setGid(d.guilds[0].id);
-            sessionStorage.setItem('gid', d.guilds[0].id);
+            rememberGid(d.guilds[0].id);
           }
         }
         if (d.config) setConfig(d.config);
@@ -429,9 +436,9 @@ export default function App() {
     }
   }
 
-  async function handleSaveUser(uname, pass, groups) {
+  async function handleSaveUser(uname, pass, groups, userGuilds) {
     try {
-      const body = { username: uname, groups };
+      const body = { username: uname, groups, guilds: userGuilds || [] };
       if (pass) body.password = pass;
       const res = await fetch('/api/admin/users', {
         method: 'POST',
@@ -513,19 +520,14 @@ export default function App() {
             </div>
             <div className="row">
               {guilds.length > 1 && (
-                <select
-                  id="guild"
-                  aria-label="Server"
-                  value={gid}
-                  onChange={(e) => {
-                    setGid(e.target.value);
-                    sessionStorage.setItem('gid', e.target.value);
+                <GuildPicker
+                  guilds={guilds}
+                  gid={gid}
+                  onPick={(id) => {
+                    setGid(id);
+                    rememberGid(id);
                   }}
-                >
-                  {guilds.map((g) => (
-                    <option key={g.id} value={g.id}>{g.name}</option>
-                  ))}
-                </select>
+                />
               )}
               <span id="meta" className="muted"></span>
               <button id="who" type="button" className="link" title="Change your name" onClick={() => setEditor('')}>
@@ -548,6 +550,7 @@ export default function App() {
             >
               Controls
             </button>
+            {isAdmin && (
             <button
               id="tab-voice"
               type="button"
@@ -558,6 +561,7 @@ export default function App() {
             >
               Voice
             </button>
+            )}
             <button
               id="tab-messages"
               type="button"
@@ -605,7 +609,7 @@ export default function App() {
             />
           )}
 
-          {tab === 'voice' && (
+          {tab === 'voice' && isAdmin && (
             <VoiceTab
               voiceState={voice}
               configVoice={config?.voice}
@@ -648,6 +652,7 @@ export default function App() {
             <AdminTab
               users={users}
               currentEditor={editor}
+              guilds={guilds}
               onSaveUser={handleSaveUser}
               onDeleteUser={handleDeleteUser}
             />
