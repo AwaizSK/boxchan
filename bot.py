@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 from config_store import ConfigStore, ConflictError, atomic_write_json
 from messages import MAX_MESSAGE_CHARS, MessageError, SendLimiter, parse_mentions
 import engines
+import nag
 from tts_engine import TTSEngine, clean_discord_text, clean_plain_text
 from voices import BadVoiceError, SayError, VoiceLoadError, discover_voices, resolve_voice
 from webui import (detect_tailscale_addrs, make_app, parse_allowed_hosts, start_webui,
@@ -188,6 +189,7 @@ _shutting_down = False
 _initial_ready = False
 _watcher_task: asyncio.Task | None = None
 _idle_task: asyncio.Task | None = None
+_nag_task: asyncio.Task | None = None
 _webui_runner = None
 
 
@@ -1028,6 +1030,37 @@ class Controller:
 controller = Controller()
 
 
+async def nag_loop() -> None:
+    """Easter egg. Needs NAG_USER_IDS (two user ids) and NAG_CHANNEL_ID; otherwise does nothing.
+    Posts at most once per stale week, mentioning only those users."""
+    ids = nag.parse_ids(os.getenv("NAG_USER_IDS"))
+    ch_raw = os.getenv("NAG_CHANNEL_ID", "")
+    if not ids or not (ch_raw.isascii() and ch_raw.isdigit()):
+        return
+    channel_id = int(ch_raw)
+    state_path = os.path.join(os.path.dirname(STATE_FILE), "nag.json")
+    app_dir = os.path.dirname(os.path.abspath(__file__))
+    await bot.wait_until_ready()
+    while True:
+        try:
+            now = time.time()
+            newest = await asyncio.to_thread(nag.newest_mtime, app_dir)
+            last = await asyncio.to_thread(nag.load_last, state_path)
+            if nag.due(newest, last, now):
+                ch = bot.get_channel(channel_id)
+                if isinstance(ch, discord.TextChannel) and ch.permissions_for(ch.guild.me).send_messages:
+                    days = int((now - newest) // 86400)
+                    await ch.send(nag.build_message(ids, days),
+                                  allowed_mentions=discord.AllowedMentions(
+                                      users=[discord.Object(id=i) for i in ids], roles=False, everyone=False))
+                    await asyncio.to_thread(atomic_write_json, {"last_nag": now}, state_path)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("nag loop failed")
+        await asyncio.sleep(3600)
+
+
 async def config_watcher() -> None:
     """On a listen-channel change, drop that guild's pending clips (the playing one finishes)."""
     q = config.hub.subscribe()
@@ -1123,6 +1156,8 @@ async def shutdown(b: commands.Bot) -> None:
         _watcher_task.cancel()
     if _idle_task:
         _idle_task.cancel()
+    if _nag_task:
+        _nag_task.cancel()
     for guild in list(b.guilds):
         if guild.voice_client or guild.id in audio:
             await teardown(guild)
@@ -1181,8 +1216,9 @@ async def main() -> None:
         loop.add_signal_handler(sig, lambda: asyncio.create_task(shutdown(bot)))
     global _watcher_task
     _watcher_task = asyncio.create_task(config_watcher(), name="config-watcher")
-    global _idle_task
+    global _idle_task, _nag_task
     _idle_task = asyncio.create_task(engine.idle_unload_loop(), name="idle-unload")
+    _nag_task = asyncio.create_task(nag_loop(), name="nag")
     global _webui_runner
     _webui_runner = await maybe_start_webui(config, controller, WEBUI_PORT)
     async with bot:
