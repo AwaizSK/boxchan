@@ -106,9 +106,11 @@ def clean_plain_text(text: str, max_chars: int = 300) -> str | None:
 class TTSEngine:
     """Single GPU context: one worker thread + asyncio.Lock serialize all inference."""
 
-    def __init__(self, model_path: str, config_path: str | None = None):
-        self._state = VoiceState(voice=None, sample_rate=22050, model_path=Path(model_path),
-                                config_path=Path(config_path) if config_path else Path(str(model_path) + ".json"),
+    def __init__(self, model_path: str = "/models/default.onnx", config_path: str | None = None):
+        mp = Path(model_path) if model_path else Path("/models/default.onnx")
+        cp = Path(config_path) if config_path else Path(str(mp) + ".json")
+        self._state = VoiceState(voice=None, sample_rate=22050, model_path=mp,
+                                config_path=cp,
                                 cuda_active=False)
         self.ready = False
         self._pending_reloads = 0
@@ -117,6 +119,8 @@ class TTSEngine:
         self._models_dir: str | None = None
         self.tmp_dir = Path(tempfile.gettempdir()) / "tts_bot"
         self.tmp_dir.mkdir(parents=True, exist_ok=True)
+        self._voice_cache: dict[str, VoiceState] = {}
+        self.MAX_CACHED_VOICES = 3
         self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="piper")
         self._lock: asyncio.Lock | None = None
 
@@ -222,8 +226,16 @@ class TTSEngine:
         return True
 
     @staticmethod
-    def _synth_with(voice, text: str) -> bytes:
-        return b"".join(voice.synthesize_stream_raw(text))
+    def _synth_with(voice, text: str, length_scale: float = 1.0) -> bytes:
+        if length_scale == 1.0:
+            try:
+                return b"".join(voice.synthesize_stream_raw(text))
+            except TypeError:
+                pass
+        try:
+            return b"".join(voice.synthesize_stream_raw(text, length_scale=length_scale))
+        except TypeError:
+            return b"".join(voice.synthesize_stream_raw(text))
 
     def _unload_blocking(self) -> None:
         """Worker thread. Drop the loaded voice (frees GPU memory); paths/name stay in the state."""
@@ -247,6 +259,58 @@ class TTSEngine:
         self._idle = False
         log.info("Voice reloaded after idle (%s, cuda=%s)", self.model_name, cuda)
 
+    def _get_voice_for_synth(self, voice_name: str | None) -> tuple[VoiceState, bool]:
+        """Worker thread. (VoiceState, is_secondary). Falls back to self._state on failure."""
+        if not voice_name or voice_name == self.model_name:
+            return self._state, False
+        if voice_name in self._voice_cache:
+            return self._voice_cache[voice_name], True
+
+        st = self._state
+        if st.engine == "piper":
+            models_dir = Path(self._models_dir) if self._models_dir else (st.model_path.parent if st.model_path else Path("models"))
+            target_model = models_dir / f"{voice_name}.onnx"
+            target_config = models_dir / f"{voice_name}.onnx.json"
+            if not (target_model.is_file() and target_config.is_file()):
+                log.warning("Secondary voice %s not found; using active voice %s", voice_name, self.model_name)
+                return self._state, False
+            try:
+                voice, cuda = self._build(target_model, target_config)
+                rate = getattr(getattr(voice, "config", None), "sample_rate", self.sample_rate)
+                cached = VoiceState(voice=voice, sample_rate=rate, model_path=target_model,
+                                    config_path=target_config, cuda_active=cuda, engine="piper", name=voice_name)
+                if len(self._voice_cache) >= self.MAX_CACHED_VOICES:
+                    evict_k, evict_v = next(iter(self._voice_cache.items()))
+                    del self._voice_cache[evict_k]
+                    del evict_v
+                    gc.collect()
+                self._voice_cache[voice_name] = cached
+                return cached, False
+            except Exception:
+                log.exception("Failed to load secondary voice %s; using active voice", voice_name)
+                return self._state, False
+        elif st.engine == "kokoro":
+            if st.voice is not None and hasattr(st.voice, "kokoro"):
+                from kokoro_engine import Handle, lang_for
+                try:
+                    mod = engines.get("kokoro")
+                    mod.resolve(self._models_dir or "models", voice_name)
+                    k_handle = Handle(st.voice.kokoro, voice_name, lang_for(voice_name), st.voice.model_path)
+                    cached = VoiceState(voice=k_handle, sample_rate=24000, model_path=st.model_path,
+                                        config_path=st.config_path, cuda_active=st.cuda_active,
+                                        engine="kokoro", name=voice_name)
+                    if len(self._voice_cache) >= self.MAX_CACHED_VOICES:
+                        evict_k, evict_v = next(iter(self._voice_cache.items()))
+                        del self._voice_cache[evict_k]
+                        del evict_v
+                        gc.collect()
+                    self._voice_cache[voice_name] = cached
+                    return cached, False
+                except Exception:
+                    log.warning("Kokoro voice %s invalid; using active voice", voice_name)
+                    return self._state, False
+        return self._state, False
+
     async def idle_unload_loop(self, timeout: float | None = None) -> None:
         """Unload the voice after `timeout` seconds without synthesis or reload. Runs forever."""
         timeout = IDLE_UNLOAD_SECONDS if timeout is None else timeout
@@ -268,13 +332,26 @@ class TTSEngine:
                     except Exception:
                         log.exception("idle unload failed")
 
-    def _synth(self, text: str) -> bytes:
+    def _synth(self, text: str, length_scale: float = 1.0, voice_state: VoiceState | None = None) -> bytes:
         if self._idle:
             self._resume_blocking()
-        st = self._state
+        st = voice_state or self._state
         if st.engine != "piper":
-            return engines.get(st.engine).synth(st.voice, text)
-        return self._synth_with(st.voice, text)
+            mod = engines.get(st.engine)
+            speed = 1.0 / length_scale if length_scale > 0 else 1.0
+            try:
+                return mod.synth(st.voice, text, speed=speed)
+            except TypeError:
+                return mod.synth(st.voice, text)
+        if length_scale == 1.0:
+            try:
+                return self._synth_with(st.voice, text)
+            except TypeError:
+                pass
+        try:
+            return self._synth_with(st.voice, text, length_scale=length_scale)
+        except TypeError:
+            return self._synth_with(st.voice, text)
 
     def _reload_engine_blocking(self, engine_name: str, models_dir: str, name: str) -> None:
         """Worker thread. Build + warm up a non-Piper candidate; swap only on success."""
@@ -298,6 +375,7 @@ class TTSEngine:
         self._models_dir = models_dir
         self._last_use = time.monotonic()
         del old
+        self._voice_cache.clear()
         gc.collect()
         log.info("%s voice swapped (voice=%s, cuda=%s, rate=%d)", engine_name, name, cuda, rate)
 
@@ -333,6 +411,7 @@ class TTSEngine:
         self._idle = False
         self._last_use = time.monotonic()
         del old
+        self._voice_cache.clear()
         gc.collect()  # drop the old ORT session now so its (GPU) memory is released
         log.info("Piper voice swapped (model=%s, cuda=%s, rate=%d)", self.model_name, cuda, rate)
 
@@ -367,9 +446,12 @@ class TTSEngine:
         if not fut.cancelled():
             fut.exception()  # mark retrieved when nobody awaits it any more
 
-    def _synth_to_wav(self, text: str) -> str | None:
+    def _synth_to_wav(self, text: str, speed: float = 1.0, voice_name: str | None = None) -> str | None:
         try:
-            pcm = self._synth(text)
+            target_st, _ = self._get_voice_for_synth(voice_name)
+            clamped_speed = max(0.5, min(2.0, float(speed))) if speed else 1.0
+            length_scale = 1.0 / clamped_speed
+            pcm = self._synth(text, length_scale=length_scale, voice_state=target_st)
             if not pcm:
                 return None
             with tempfile.NamedTemporaryFile(dir=self.tmp_dir, suffix=".wav", delete=False) as tf:
@@ -377,14 +459,14 @@ class TTSEngine:
             with wave.open(path, "wb") as w:
                 w.setnchannels(1)
                 w.setsampwidth(2)
-                w.setframerate(self.sample_rate)
+                w.setframerate(target_st.sample_rate)
                 w.writeframes(pcm)
             return path
         except Exception:
             log.exception("synthesis failed")
             return None
 
-    async def synthesize(self, text: str) -> str | None:
+    async def synthesize(self, text: str, speed: float = 1.0, voice_name: str | None = None) -> str | None:
         """Off-loop, strictly serialized. Returns temp .wav path (caller deletes) or None."""
         if not self.ready or not text.strip():
             return None
@@ -392,10 +474,12 @@ class TTSEngine:
             self._lock = asyncio.Lock()
         async with self._lock:
             try:
-                return await asyncio.get_running_loop().run_in_executor(self._pool, self._synth_to_wav, text)
+                return await asyncio.get_running_loop().run_in_executor(
+                    self._pool, self._synth_to_wav, text, speed, voice_name)
             finally:
                 self._last_use = time.monotonic()
 
     def close(self) -> None:
         self._pool.shutdown(wait=False, cancel_futures=True)
+        self._voice_cache.clear()
         self.purge_tmp()
